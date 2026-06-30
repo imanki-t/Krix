@@ -37,7 +37,10 @@ const formatError = (error: any) => ({
  * 1. SEARCH CODE
  */
 server.registerTool('search_code', { 
-  q: z.string().describe('Query strings like "functionName repo:owner/repo"') 
+  description: 'Search code snippets inside GitHub repositories',
+  inputSchema: {
+    q: z.string().describe('Query strings like "functionName repo:owner/repo"') 
+  }
 }, async ({ q }) => {
   try {
     const res = await octokit.search.code({ q, per_page: 10 });
@@ -49,9 +52,12 @@ server.registerTool('search_code', {
  * 2. GET REPO TREE
  */
 server.registerTool('get_repo_tree', {
-  owner: z.string(),
-  repo: z.string(),
-  tree_sha: z.string().describe('Branch name or commit SHA to map recursively')
+  description: 'Look up the full recursive directory hierarchy map of a repository',
+  inputSchema: {
+    owner: z.string(),
+    repo: z.string(),
+    tree_sha: z.string().describe('Branch name or commit SHA to map recursively')
+  }
 }, async ({ owner, repo, tree_sha }) => {
   try {
     const res = await octokit.git.getTree({ owner, repo, tree_sha, recursive: 'true' });
@@ -63,10 +69,13 @@ server.registerTool('get_repo_tree', {
  * 3. GET FILE CONTENTS
  */
 server.registerTool('get_file_contents', {
-  owner: z.string(),
-  repo: z.string(),
-  path: z.string(),
-  ref: z.string().default('main').describe('Branch or target commit SHA')
+  description: 'Fetch the raw contents of a specific file',
+  inputSchema: {
+    owner: z.string(),
+    repo: z.string(),
+    path: z.string(),
+    ref: z.string().default('main').describe('Branch or target commit SHA')
+  }
 }, async ({ owner, repo, path, ref }) => {
   try {
     const res = await octokit.repos.getContent({ owner, repo, path, ref });
@@ -81,13 +90,16 @@ server.registerTool('get_file_contents', {
  * 4. CREATE OR UPDATE FILE
  */
 server.registerTool('create_or_update_file', {
-  owner: z.string(),
-  repo: z.string(),
-  path: z.string(),
-  content: z.string().describe('Full string value contents of the file'),
-  message: z.string().describe('Commit message statement'),
-  branch: z.string(),
-  sha: z.string().optional().describe('Crucial if updating an existing file structure')
+  description: 'Write, append, or modify code content within a designated file path',
+  inputSchema: {
+    owner: z.string(),
+    repo: z.string(),
+    path: z.string(),
+    content: z.string().describe('Full string value contents of the file'),
+    message: z.string().describe('Commit message statement'),
+    branch: z.string(),
+    sha: z.string().optional().describe('Crucial if updating an existing file structure')
+  }
 }, async ({ owner, repo, path, content, message, branch, sha }) => {
   try {
     const res = await octokit.repos.createOrUpdateFileContents({
@@ -101,7 +113,15 @@ server.registerTool('create_or_update_file', {
  * 5. DELETE FILE
  */
 server.registerTool('delete_file', {
-  owner: z.string(), repo: z.string(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string()
+  description: 'Remove a file from a branch workspace context completely',
+  inputSchema: {
+    owner: z.string(), 
+    repo: z.string(), 
+    path: z.string(), 
+    message: z.string(), 
+    sha: z.string(), 
+    branch: z.string()
+  }
 }, async ({ owner, repo, path, message, sha, branch }) => {
   try {
     const res = await octokit.repos.deleteFile({ owner, repo, path, message, sha, branch });
@@ -113,7 +133,13 @@ server.registerTool('delete_file', {
  * 6. CREATE BRANCH
  */
 server.registerTool('create_branch', {
-  owner: z.string(), repo: z.string(), branch: z.string(), refSha: z.string().describe('The base target commit SHA hash')
+  description: 'Isolate agentic edits by creating a new reference branch off a base SHA',
+  inputSchema: {
+    owner: z.string(), 
+    repo: z.string(), 
+    branch: z.string(), 
+    refSha: z.string().describe('The base target commit SHA hash')
+  }
 }, async ({ owner, repo, branch, refSha }) => {
   try {
     await octokit.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: refSha });
@@ -124,7 +150,14 @@ server.registerTool('create_branch', {
 /**
  * 7. DELETE BRANCH
  */
-server.registerTool('delete_branch', { owner: z.string(), repo: z.string(), branch: z.string() }, async ({ owner, repo, branch }) => {
+server.registerTool('delete_branch', {
+  description: 'Wipe out an old or merged working branch reference key',
+  inputSchema: {
+    owner: z.string(), 
+    repo: z.string(), 
+    branch: z.string()
+  }
+}, async ({ owner, repo, branch }) => {
   try {
     await octokit.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
     return formatSuccess(`Wiped branch 'heads/${branch}' cleanly.`);
@@ -135,7 +168,15 @@ server.registerTool('delete_branch', { owner: z.string(), repo: z.string(), bran
  * 8. CREATE PULL REQUEST
  */
 server.registerTool('create_pull_request', {
-  owner: z.string(), repo: z.string(), title: z.string(), body: z.string().optional(), head: z.string(), base: z.string().default('main')
+  description: 'Open a pull request for human review and integration tracking',
+  inputSchema: {
+    owner: z.string(), 
+    repo: z.string(), 
+    title: z.string(), 
+    body: z.string().optional(), 
+    head: z.string(), 
+    base: z.string().default('main')
+  }
 }, async ({ owner, repo, title, body, head, base }) => {
   try {
     const res = await octokit.pulls.create({ owner, repo, title, body, head, base });
@@ -146,7 +187,14 @@ server.registerTool('create_pull_request', {
 /**
  * 9. GET COMMIT STATUS
  */
-server.registerTool('get_commit_status', { owner: z.string(), repo: z.string(), ref: z.string() }, async ({ owner, repo, ref }) => {
+server.registerTool('get_commit_status', {
+  description: 'Look up live CI/CD and checking statuses for a specific reference pointer',
+  inputSchema: {
+    owner: z.string(), 
+    repo: z.string(), 
+    ref: z.string()
+  }
+}, async ({ owner, repo, ref }) => {
   try {
     const res = await octokit.repos.getCombinedStatusForRef({ owner, repo, ref });
     return formatSuccess({ state: res.data.state, statuses: res.data.statuses.map(s => ({ context: s.context, state: s.state })) });
@@ -191,3 +239,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Lean GitHub MCP Server operational on port ${PORT}`);
 });
+  
