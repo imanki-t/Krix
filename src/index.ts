@@ -7,12 +7,13 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const GITHUB_PAT = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || process.env.GITHUB_PAT;
-if (!GITHUB_PAT) {
+const DEFAULT_GITHUB_PAT = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || process.env.GITHUB_PAT;
+if (!DEFAULT_GITHUB_PAT) {
   console.warn("⚠️ Warning: GITHUB_PAT/GITHUB_PERSONAL_ACCESS_TOKEN env variable is missing.");
 }
 
-const octokit = new Octokit({ auth: GITHUB_PAT });
+// Global baseline client matching default token configurations
+const globalOctokit = new Octokit({ auth: DEFAULT_GITHUB_PAT });
 
 const server = new McpServer({
   name: 'github-lean-agent',
@@ -29,6 +30,11 @@ const formatError = (error: any) => ({
   content: [{ type: 'text' as const, text: error?.message || String(error) }]
 });
 
+// Helper to determine whether to use request-scoped or global Octokit context
+const getClient = (extraContext: any): Octokit => {
+  return (extraContext as any)?.scopedOctokit || globalOctokit;
+};
+
 // ============================================================================
 // 🎯 THE CORE 9 AGENTIC TOOLS
 // ============================================================================
@@ -41,9 +47,10 @@ server.registerTool('search_code', {
   inputSchema: {
     q: z.string().describe('Query strings like "functionName repo:owner/repo"') 
   }
-}, async ({ q }) => {
+}, async ({ q }, extra) => {
   try {
-    const res = await octokit.search.code({ q, per_page: 10 });
+    const client = getClient(extra);
+    const res = await client.search.code({ q, per_page: 10 });
     return formatSuccess(res.data.items.map(i => ({ name: i.name, path: i.path, repo: i.repository.full_name, url: i.html_url })));
   } catch (err) { return formatError(err); }
 });
@@ -58,9 +65,10 @@ server.registerTool('get_repo_tree', {
     repo: z.string(),
     tree_sha: z.string().describe('Branch name or commit SHA to map recursively')
   }
-}, async ({ owner, repo, tree_sha }) => {
+}, async ({ owner, repo, tree_sha }, extra) => {
   try {
-    const res = await octokit.git.getTree({ owner, repo, tree_sha, recursive: 'true' });
+    const client = getClient(extra);
+    const res = await client.git.getTree({ owner, repo, tree_sha, recursive: 'true' });
     return formatSuccess(res.data.tree.map(t => ({ path: t.path, type: t.type, sha: t.sha })));
   } catch (err) { return formatError(err); }
 });
@@ -76,9 +84,10 @@ server.registerTool('get_file_contents', {
     path: z.string(),
     ref: z.string().default('main').describe('Branch or target commit SHA')
   }
-}, async ({ owner, repo, path, ref }) => {
+}, async ({ owner, repo, path, ref }, extra) => {
   try {
-    const res = await octokit.repos.getContent({ owner, repo, path, ref });
+    const client = getClient(extra);
+    const res = await client.repos.getContent({ owner, repo, path, ref });
     if ('content' in res.data && typeof res.data.content === 'string') {
       return formatSuccess(Buffer.from(res.data.content, 'base64').toString('utf-8'));
     }
@@ -100,9 +109,10 @@ server.registerTool('create_or_update_file', {
     branch: z.string(),
     sha: z.string().optional().describe('Crucial if updating an existing file structure')
   }
-}, async ({ owner, repo, path, content, message, branch, sha }) => {
+}, async ({ owner, repo, path, content, message, branch, sha }, extra) => {
   try {
-    const res = await octokit.repos.createOrUpdateFileContents({
+    const client = getClient(extra);
+    const res = await client.repos.createOrUpdateFileContents({
       owner, repo, path, message, content: Buffer.from(content).toString('base64'), branch, sha
     });
     return formatSuccess(`Commit successful. New blob SHA: ${res.data.commit.sha}`);
@@ -122,9 +132,10 @@ server.registerTool('delete_file', {
     sha: z.string(), 
     branch: z.string()
   }
-}, async ({ owner, repo, path, message, sha, branch }) => {
+}, async ({ owner, repo, path, message, sha, branch }, extra) => {
   try {
-    const res = await octokit.repos.deleteFile({ owner, repo, path, message, sha, branch });
+    const client = getClient(extra);
+    const res = await client.repos.deleteFile({ owner, repo, path, message, sha, branch });
     return formatSuccess(`Deleted ${path}. Commit transaction: ${res.data.commit.sha}`);
   } catch (err) { return formatError(err); }
 });
@@ -140,9 +151,10 @@ server.registerTool('create_branch', {
     branch: z.string(), 
     refSha: z.string().describe('The base target commit SHA hash')
   }
-}, async ({ owner, repo, branch, refSha }) => {
+}, async ({ owner, repo, branch, refSha }, extra) => {
   try {
-    await octokit.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: refSha });
+    const client = getClient(extra);
+    await client.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: refSha });
     return formatSuccess(`Branch refs/heads/${branch} created accurately.`);
   } catch (err) { return formatError(err); }
 });
@@ -157,9 +169,10 @@ server.registerTool('delete_branch', {
     repo: z.string(), 
     branch: z.string()
   }
-}, async ({ owner, repo, branch }) => {
+}, async ({ owner, repo, branch }, extra) => {
   try {
-    await octokit.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
+    const client = getClient(extra);
+    await client.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
     return formatSuccess(`Wiped branch 'heads/${branch}' cleanly.`);
   } catch (err) { return formatError(err); }
 });
@@ -177,9 +190,10 @@ server.registerTool('create_pull_request', {
     head: z.string(), 
     base: z.string().default('main')
   }
-}, async ({ owner, repo, title, body, head, base }) => {
+}, async ({ owner, repo, title, body, head, base }, extra) => {
   try {
-    const res = await octokit.pulls.create({ owner, repo, title, body, head, base });
+    const client = getClient(extra);
+    const res = await client.pulls.create({ owner, repo, title, body, head, base });
     return formatSuccess(`PR open: ${res.data.html_url} [#${res.data.number}]`);
   } catch (err) { return formatError(err); }
 });
@@ -194,9 +208,10 @@ server.registerTool('get_commit_status', {
     repo: z.string(), 
     ref: z.string()
   }
-}, async ({ owner, repo, ref }) => {
+}, async ({ owner, repo, ref }, extra) => {
   try {
-    const res = await octokit.repos.getCombinedStatusForRef({ owner, repo, ref });
+    const client = getClient(extra);
+    const res = await client.repos.getCombinedStatusForRef({ owner, repo, ref });
     return formatSuccess({ state: res.data.state, statuses: res.data.statuses.map(s => ({ context: s.context, state: s.state })) });
   } catch (err) { return formatError(err); }
 });
@@ -211,17 +226,18 @@ const activeTransports = new Map<string, SSEServerTransport>();
 
 app.post('/mcp', async (req, res) => {
   const sessionId = Math.random().toString(36).substring(7);
-  
-  const customPat = req.headers['x-github-token'] as string;
-  if (customPat) {
-    octokit.auth = customPat;
-  }
-
   const transport = new SSEServerTransport(`/messages?id=${sessionId}`, res);
   activeTransports.set(sessionId, transport);
   
   req.on('close', () => { activeTransports.delete(sessionId); });
-  await server.connect(transport);
+  
+  // Custom multi-user support injection passed down cleanly inside server options context
+  const customPat = req.headers['x-github-token'] as string;
+  const requestExtra = customPat 
+    ? { scopedOctokit: new Octokit({ auth: customPat }) }
+    : { scopedOctokit: globalOctokit };
+
+  await server.connect(transport, requestExtra);
 });
 
 app.post('/messages', async (req, res) => {
@@ -239,4 +255,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Lean GitHub MCP Server operational on port ${PORT}`);
 });
-  
+      
