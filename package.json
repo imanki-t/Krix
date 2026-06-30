@@ -5,6 +5,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
+    "build": "echo \"no build step\"",
     "start": "node server.js"
   },
   "dependencies": {
