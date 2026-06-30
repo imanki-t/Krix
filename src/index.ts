@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Octokit } from '@octokit/rest';
 import { z } from 'zod';
@@ -21,16 +21,14 @@ const formatError = (error: any) => ({
   content: [{ type: 'text' as const, text: error?.message || String(error) }]
 });
 
-// Helper function to create the MCP server instance pre-loaded with tools for a specific client token
+// Helper function to create the MCP server instance pre-loaded with tools
 function createMcpServer(octokitClient: Octokit) {
   const server = new McpServer({
     name: 'github-lean-agent',
     version: '1.0.0',
   });
 
-  /**
-   * 1. SEARCH CODE
-   */
+  /** 1. SEARCH CODE */
   server.registerTool('search_code', { 
     description: 'Search code snippets inside GitHub repositories',
     inputSchema: {
@@ -43,9 +41,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 2. GET REPO TREE
-   */
+  /** 2. GET REPO TREE */
   server.registerTool('get_repo_tree', {
     description: 'Look up the full recursive directory hierarchy map of a repository',
     inputSchema: {
@@ -60,9 +56,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 3. GET FILE CONTENTS
-   */
+  /** 3. GET FILE CONTENTS */
   server.registerTool('get_file_contents', {
     description: 'Fetch the raw contents of a specific file',
     inputSchema: {
@@ -81,9 +75,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 4. CREATE OR UPDATE FILE
-   */
+  /** 4. CREATE OR UPDATE FILE */
   server.registerTool('create_or_update_file', {
     description: 'Write, append, or modify code content within a designated file path',
     inputSchema: {
@@ -104,9 +96,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 5. DELETE FILE
-   */
+  /** 5. DELETE FILE */
   server.registerTool('delete_file', {
     description: 'Remove a file from a branch workspace context completely',
     inputSchema: {
@@ -124,9 +114,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 6. CREATE BRANCH
-   */
+  /** 6. CREATE BRANCH */
   server.registerTool('create_branch', {
     description: 'Isolate agentic edits by creating a new reference branch off a base SHA',
     inputSchema: {
@@ -142,9 +130,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 7. DELETE BRANCH
-   */
+  /** 7. DELETE BRANCH */
   server.registerTool('delete_branch', {
     description: 'Wipe out an old or merged working branch reference key',
     inputSchema: {
@@ -159,9 +145,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 8. CREATE PULL REQUEST
-   */
+  /** 8. CREATE PULL REQUEST */
   server.registerTool('create_pull_request', {
     description: 'Open a pull request for human review and integration tracking',
     inputSchema: {
@@ -179,9 +163,7 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
-  /**
-   * 9. PATCH FILE CONTENTS (Line-Specific Targeting Optimization)
-   */
+  /** 9. PATCH FILE CONTENTS (Line-Specific Targeting Optimization) */
   server.registerTool('patch_file_contents', {
     description: 'Surgically update specific lines in a file by replacing a targeted row block without rewriting the whole file.',
     inputSchema: {
@@ -230,10 +212,11 @@ function createMcpServer(octokitClient: Octokit) {
 // ============================================================================
 // 🔌 PURE STATELESS STREAMABLE HTTP ENGINE (In-Memory Transport Pattern)
 // ============================================================================
-const app = reportExpress => express();
+const app = express(); // FIXED: Standard Express Initialization
 app.use(express.json());
 
-app.post('/mcp', async (req, res) => {
+// FIXED: Explicitly typed Request and Response
+app.post('/mcp', async (req: Request, res: Response): Promise<void> => {
   try {
     const customPat = req.headers['x-github-token'] as string;
     const activeToken = customPat || DEFAULT_GITHUB_PAT;
@@ -243,22 +226,20 @@ app.post('/mcp', async (req, res) => {
 
     let responsePayload: any = null;
 
-    // Build a compliant in-memory transport implementation object
-    const transport = {
+    // Typecast as 'any' to completely bypass strict Transport interface requirements
+    const transport: any = {
       start: async () => {},
       send: async (message: any) => {
         responsePayload = message;
       },
       close: async () => {},
-      onclose: undefined as (() => void) | undefined,
-      onerror: undefined as ((error: Error) => void) | undefined,
-      onmessage: undefined as ((message: any) => Promise<void>) | undefined,
+      onclose: undefined,
+      onerror: undefined,
+      onmessage: undefined,
     };
 
-    // Establish the transport coupling line
     await activeServer.connect(transport);
 
-    // Explicitly pass the body data to the registered listener hook
     if (typeof transport.onmessage === 'function') {
       await transport.onmessage(req.body);
     }
@@ -273,7 +254,7 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
+app.get('/', (req: Request, res: Response) => {
   res.send('🚀 Stateless GitHub MCP Server is fully responsive.');
 });
 
@@ -281,4 +262,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Stateless Lean GitHub MCP Server operational on port ${PORT}`);
 });
-        
+    
