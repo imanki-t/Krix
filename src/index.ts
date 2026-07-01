@@ -131,11 +131,11 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   server.registerTool('get_tree', {
     description: 'Get file tree. Slices to 50 items. Use offset to paginate. Use q to search/filter files by keyword (e.g. "memoryService") to find paths instantly.',
     inputSchema: {
-      owner: z.string(),
-      repo: z.string(),
-      tree_sha: z.string().default('main'),
-      offset: z.number().optional().default(0),
-      q: z.string().optional()
+      owner: z.string().describe('Repository owner/organization'),
+      repo: z.string().describe('Repository name'),
+      tree_sha: z.string().default('main').describe('Git branch, tag, or commit SHA'),
+      offset: z.number().optional().default(0).describe('Index offset for paginating deep trees (increments of 50)'),
+      q: z.string().optional().describe('Search keyword to filter files by path/name')
     }
   }, async ({ owner, repo, tree_sha, offset, q }) => {
     try {
@@ -156,14 +156,14 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('get_contents', {
-    description: 'Read file lines. Max 300 lines limit. ALWAYS specify startLine and endLine (e.g. startLine: 1, endLine: 150) on your first read to avoid errors on large files.',
+    description: 'Read file lines. Automatically slices content to safe 300-line windows if the range is omitted or exceeds the max limit.',
     inputSchema: {
-      owner: z.string(),
-      repo: z.string(),
-      path: z.string(),
-      ref: z.string().default('main'),
-      startLine: z.number().optional(),
-      endLine: z.number().optional()
+      owner: z.string().describe('Repository owner/organization'),
+      repo: z.string().describe('Repository name'),
+      path: z.string().describe('Path to the file'),
+      ref: z.string().default('main').describe('Git branch, tag, or commit SHA'),
+      startLine: z.number().optional().describe('First line to read (1-based, inclusive). Defaults to 1.'),
+      endLine: z.number().optional().describe('Last line to read (inclusive). Sliced up to (startLine + 299) to protect memory window.')
     }
   }, async ({ owner, repo, path, ref, startLine, endLine }) => {
     try {
@@ -172,12 +172,27 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
         let lines = raw.split('\n');
         const total = lines.length;
-        const start = startLine ? Math.max(1, startLine) : 1;
-        const end = endLine ? Math.min(total, endLine) : total;
-        if (end - start > 300) return formatError(new Error('Max 300 lines. Please request a smaller line range (e.g. startLine: 1, endLine: 150) to stay within limits.'));
+        
+        let start = startLine ? Math.max(1, startLine) : 1;
+        let end = endLine ? Math.min(total, endLine) : total;
+        
+        if (start > total) {
+          return formatError(new Error(`Invalid startLine: ${startLine}. Total lines in file: ${total}`));
+        }
+        
+        let truncated = false;
+        if (end - start >= 300) {
+          end = start + 299;
+          truncated = true;
+        }
+        
         lines = lines.slice(start - 1, end);
         let out = lines.join('\n');
-        if (total > end) out += `\n... (truncated, total lines: ${total})`;
+        
+        if (truncated || total > end) {
+          out += `\n\n... (truncated. Displaying lines ${start}-${end} of ${total} total lines. To read subsequent lines, invoke get_contents with startLine: ${end + 1})`;
+        }
+        
         return formatSuccess(out);
       }
       return formatSuccess('Not a file');
