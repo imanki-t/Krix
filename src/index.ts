@@ -545,8 +545,6 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   return server;
 }
 
-const transports = new Map<string, SessionEntry>();
-
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
