@@ -11,30 +11,6 @@ const DEFAULT_GITHUB_PAT = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || process.e
 const DEFAULT_RENDER_API_KEY = process.env.RENDER_API_KEY || process.env.RENDER_PAT;
 const MCP_API_KEY = process.env.MCP_API_KEY;
 
-const GITHUB_TOOLS = new Set([
-  'get_viewer',
-  'list_repos',
-  'search_repos',
-  'list_branches',
-  'search_code',
-  'get_tree',
-  'get_contents',
-  'put_contents',
-  'patch_contents',
-  'delete_contents',
-  'create_ref',
-  'delete_ref',
-  'create_pull'
-]);
-
-const ALLOWED_RENDER_TOOLS = new Set([
-  'list_services',
-  'get_service',
-  'list_deploys',
-  'get_deploy',
-  'list_logs'
-]);
-
 const formatSuccess = (data: any) => ({
   content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data) }]
 });
@@ -44,7 +20,44 @@ const formatError = (error: any) => ({
   content: [{ type: 'text' as const, text: error?.message || String(error) }]
 });
 
-function createMcpServer(octokitClient: Octokit) {
+async function callRenderTool(toolName: string, args: any, renderToken: string | undefined) {
+  if (!renderToken) {
+    return formatError(new Error('Missing Render API key. Please check your RENDER_API_KEY environment variable or headers.'));
+  }
+  try {
+    const response = await fetch('https://mcp.render.com/mcp', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${renderToken}`
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: {
+          name: toolName,
+          arguments: args
+        },
+        id: `proxy-${toolName}`
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return formatError(new Error(`Render MCP Error: ${errText}`));
+    }
+
+    const data = await response.json() as any;
+    if (data?.error) {
+      return formatError(new Error(data.error.message || JSON.stringify(data.error)));
+    }
+    return data?.result || data;
+  } catch (err: any) {
+    return formatError(err);
+  }
+}
+
+function createMcpServer(octokitClient: Octokit, renderToken: string | undefined) {
   const server = new McpServer({
     name: 'github-lean-agent',
     version: '1.2.0',
@@ -256,6 +269,54 @@ function createMcpServer(octokitClient: Octokit) {
     } catch (err) { return formatError(err); }
   });
 
+  server.registerTool('list_services', {
+    description: 'List all services in your Render account.',
+    inputSchema: {
+      includePreviews: z.boolean().optional().default(false)
+    }
+  }, async (args) => {
+    return callRenderTool('list_services', args, renderToken);
+  });
+
+  server.registerTool('get_service', {
+    description: 'Get details about a specific service.',
+    inputSchema: {
+      serviceId: z.string()
+    }
+  }, async (args) => {
+    return callRenderTool('get_service', args, renderToken);
+  });
+
+  server.registerTool('list_deploys', {
+    description: 'List deploy history.',
+    inputSchema: {
+      serviceId: z.string(),
+      limit: z.number().optional().default(10)
+    }
+  }, async (args) => {
+    return callRenderTool('list_deploys', args, renderToken);
+  });
+
+  server.registerTool('get_deploy', {
+    description: 'Get deployment details.',
+    inputSchema: {
+      serviceId: z.string(),
+      deployId: z.string()
+    }
+  }, async (args) => {
+    return callRenderTool('get_deploy', args, renderToken);
+  });
+
+  server.registerTool('list_logs', {
+    description: 'Get service logs.',
+    inputSchema: {
+      serviceId: z.string(),
+      limit: z.number().optional().default(100)
+    }
+  }, async (args) => {
+    return callRenderTool('list_logs', args, renderToken);
+  });
+
   return server;
 }
 
@@ -290,155 +351,8 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     || (req.headers['x-render-api-key'] as string)
     || DEFAULT_RENDER_API_KEY;
 
-  const isRenderMethod = req.body?.method === 'tools/call' && ALLOWED_RENDER_TOOLS.has(req.body.params?.name);
-
-  if (isRenderMethod) {
-    if (!renderToken) {
-      res.status(401).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Missing Render API key.' },
-        id: req.body?.id || null
-      });
-      return;
-    }
-
-    try {
-      const response = await fetch('https://mcp.render.com/mcp', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${renderToken}`
-        },
-        body: JSON.stringify(req.body)
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        res.status(response.status).json({
-          jsonrpc: '2.0',
-          error: { code: -32603, message: `Render MCP Error: ${errText}` },
-          id: req.body?.id || null
-        });
-        return;
-      }
-
-      const data = await response.json();
-      res.json(data);
-      return;
-    } catch (error: any) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: `Render Proxy Error: ${error?.message || String(error)}` },
-        id: req.body?.id || null
-      });
-      return;
-    }
-  }
-
-  const isGitHubToolCall = req.body?.method === 'tools/call' && GITHUB_TOOLS.has(req.body.params?.name);
-  if (isGitHubToolCall && !githubToken) {
-    res.status(401).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Missing GitHub token.' },
-      id: req.body?.id || null
-    });
-    return;
-  }
-
-  let renderTools: any[] = [];
-  if (req.body?.method === 'tools/list' && renderToken) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
-
-      const response = await fetch('https://mcp.render.com/mcp', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${renderToken}`
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'tools/list',
-          id: req.body.id || 'render-tools-list'
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-
-      if (response.ok) {
-        const data = await response.json() as any;
-        if (data?.result?.tools && Array.isArray(data.result.tools)) {
-          renderTools = data.result.tools
-            .filter((t: any) => ALLOWED_RENDER_TOOLS.has(t.name))
-            .map((t: any) => {
-              if (t.name === 'list_services') {
-                t.description = 'List all services.';
-              } else if (t.name === 'get_service') {
-                t.description = 'Get service configuration/status.';
-              } else if (t.name === 'list_deploys') {
-                t.description = 'List deploy history.';
-              } else if (t.name === 'get_deploy') {
-                t.description = 'Get deployment details.';
-              } else if (t.name === 'list_logs') {
-                t.description = 'Get service logs.';
-              }
-              return t;
-            });
-        }
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  }
-
-  if (req.body?.method === 'tools/list' && renderTools.length > 0) {
-    const chunks: Buffer[] = [];
-    const originalWrite = res.write;
-    const originalEnd = res.end;
-
-    res.write = function (chunk: any, encoding?: any, callback?: any) {
-      if (typeof encoding === 'function') {
-        callback = encoding;
-        encoding = undefined;
-      }
-      if (chunk) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, (typeof encoding === 'string' ? encoding : 'utf8') as BufferEncoding));
-      }
-      return true;
-    } as any;
-
-    res.end = function (chunk: any, encoding?: any, callback?: any) {
-      if (typeof encoding === 'function') {
-        callback = encoding;
-        encoding = undefined;
-      }
-      if (chunk) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, (typeof encoding === 'string' ? encoding : 'utf8') as BufferEncoding));
-      }
-      const body = Buffer.concat(chunks).toString('utf8');
-      try {
-        const json = JSON.parse(body);
-        if (json?.result?.tools) {
-          json.result.tools = [...json.result.tools, ...renderTools];
-        }
-        const newBody = JSON.stringify(json);
-        res.write = originalWrite;
-        res.end = originalEnd;
-        if (!res.headersSent) {
-          res.setHeader('content-length', Buffer.byteLength(newBody));
-        }
-        return res.end(newBody, 'utf8', callback);
-      } catch (e) {
-        res.write = originalWrite;
-        res.end = originalEnd;
-        return res.end(body, 'utf8', callback);
-      }
-    } as any;
-  }
-
   const octokit = new Octokit({ auth: githubToken || '' });
-  const server = createMcpServer(octokit);
+  const server = createMcpServer(octokit, renderToken);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as any });
 
   res.on('close', () => {
