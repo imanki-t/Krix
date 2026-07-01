@@ -508,7 +508,8 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       level: z.array(z.string()).optional().describe('Filter logs by their severity level (array of strings, optional)'),
       type: z.array(z.string()).optional().describe('Filter logs by their type (array of strings, optional)'),
       instance: z.array(z.string()).optional().describe('Filter logs by the instance they were emitted from (array of strings, optional)'),
-      host: z.array(z.string()).optional().describe('Filter request logs by their host (array of strings, optional)')
+      host: z.array(z.string()).optional().describe('Filter request logs by their host (array of strings, optional)'),
+      limit: z.number().optional().describe('Maximum number of log lines to return (number, optional)')
     }
   }, async (args) => {
     return callRenderTool('list_logs', args, renderToken);
