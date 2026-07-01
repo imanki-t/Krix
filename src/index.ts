@@ -81,7 +81,7 @@ function createMcpServer(octokitClient: Octokit) {
     try {
       const res = await octokitClient.repos.listForAuthenticatedUser({ per_page: 100 });
       const regex = new RegExp(q, 'i');
-      const matched = res.data.filter(r => regex.test(r.name) || regex.test(r.full_name));
+      const matched = res.data.filter(r => regex.test(r.name) || regex.test(r.full_name)).slice(0, 10);
       if (matched.length === 0) {
         const globalRes = await octokitClient.search.repos({ q: `${q} in:name`, per_page: 5 });
         return formatSuccess(globalRes.data.items.map(r => `${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''}`).join('\n'));
@@ -125,8 +125,8 @@ function createMcpServer(octokitClient: Octokit) {
   }, async ({ owner, repo, tree_sha }) => {
     try {
       const res = await octokitClient.git.getTree({ owner, repo, tree_sha, recursive: 'true' });
-      const items = res.data.tree.slice(0, 150).map(t => `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`);
-      if (res.data.tree.length > 150) items.push(`... truncated ${res.data.tree.length - 150} files`);
+      const items = res.data.tree.slice(0, 100).map(t => `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`);
+      if (res.data.tree.length > 100) items.push(`... truncated ${res.data.tree.length - 100} files`);
       return formatSuccess(items.join('\n'));
     } catch (err) { return formatError(err); }
   });
@@ -150,7 +150,7 @@ function createMcpServer(octokitClient: Octokit) {
         const total = lines.length;
         const start = startLine ? Math.max(1, startLine) : 1;
         const end = endLine ? Math.min(total, endLine) : total;
-        if (end - start > 500) return formatError(new Error('Max 500 lines'));
+        if (end - start > 300) return formatError(new Error('Max 300 lines'));
         lines = lines.slice(start - 1, end);
         let out = lines.join('\n');
         if (total > end) out += `\n... (truncated, total lines: ${total})`;
@@ -345,63 +345,96 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  if (req.body?.method === 'tools/list') {
-    let renderTools: any[] = [];
-    if (renderToken) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 4000);
+  let renderTools: any[] = [];
+  if (req.body?.method === 'tools/list' && renderToken) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 4000);
 
-        const response = await fetch('https://mcp.render.com/mcp', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${renderToken}`
-          },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            method: 'tools/list',
-            id: req.body.id || 'render-tools-list'
-          }),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
+      const response = await fetch('https://mcp.render.com/mcp', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${renderToken}`
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'tools/list',
+          id: req.body.id || 'render-tools-list'
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-        if (response.ok) {
-          const data = await response.json() as any;
-          if (data?.result?.tools && Array.isArray(data.result.tools)) {
-            renderTools = data.result.tools
-              .filter((t: any) => ALLOWED_RENDER_TOOLS.has(t.name))
-              .map((t: any) => {
-                if (t.name === 'list_services') {
-                  t.description = 'List all services.';
-                } else if (t.name === 'get_service') {
-                  t.description = 'Get service configuration/status.';
-                } else if (t.name === 'list_deploys') {
-                  t.description = 'List deploy history.';
-                } else if (t.name === 'get_deploy') {
-                  t.description = 'Get deployment details.';
-                } else if (t.name === 'list_logs') {
-                  t.description = 'Get service logs.';
-                }
-                return t;
-              });
-          }
+      if (response.ok) {
+        const data = await response.json() as any;
+        if (data?.result?.tools && Array.isArray(data.result.tools)) {
+          renderTools = data.result.tools
+            .filter((t: any) => ALLOWED_RENDER_TOOLS.has(t.name))
+            .map((t: any) => {
+              if (t.name === 'list_services') {
+                t.description = 'List all services.';
+              } else if (t.name === 'get_service') {
+                t.description = 'Get service configuration/status.';
+              } else if (t.name === 'list_deploys') {
+                t.description = 'List deploy history.';
+              } else if (t.name === 'get_deploy') {
+                t.description = 'Get deployment details.';
+              } else if (t.name === 'list_logs') {
+                t.description = 'Get service logs.';
+              }
+              return t;
+            });
         }
-      } catch (err) {
-        console.error(err);
       }
+    } catch (err) {
+      console.error(err);
     }
+  }
 
-    if (renderTools.length > 0) {
-      const originalJson = res.json.bind(res);
-      res.json = (body: any) => {
-        if (body?.result?.tools) {
-          body.result.tools = [...body.result.tools, ...renderTools];
+  if (req.body?.method === 'tools/list' && renderTools.length > 0) {
+    const chunks: Buffer[] = [];
+    const originalWrite = res.write;
+    const originalEnd = res.end;
+
+    res.write = function (chunk: any, encoding?: any, callback?: any) {
+      if (typeof encoding === 'function') {
+        callback = encoding;
+        encoding = undefined;
+      }
+      if (chunk) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, typeof encoding === 'string' ? encoding : 'utf8'));
+      }
+      return true;
+    } as any;
+
+    res.end = function (chunk: any, encoding?: any, callback?: any) {
+      if (typeof encoding === 'function') {
+        callback = encoding;
+        encoding = undefined;
+      }
+      if (chunk) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, typeof encoding === 'string' ? encoding : 'utf8'));
+      }
+      const body = Buffer.concat(chunks).toString('utf8');
+      try {
+        const json = JSON.parse(body);
+        if (json?.result?.tools) {
+          json.result.tools = [...json.result.tools, ...renderTools];
         }
-        return originalJson(body);
-      };
-    }
+        const newBody = JSON.stringify(json);
+        res.write = originalWrite;
+        res.end = originalEnd;
+        if (!res.headersSent) {
+          res.setHeader('content-length', Buffer.byteLength(newBody));
+        }
+        return res.end(newBody, 'utf8', callback);
+      } catch (e) {
+        res.write = originalWrite;
+        res.end = originalEnd;
+        return res.end(body, 'utf8', callback);
+      }
+    } as any;
   }
 
   const octokit = new Octokit({ auth: githubToken || '' });
