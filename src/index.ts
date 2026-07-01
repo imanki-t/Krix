@@ -20,7 +20,18 @@ const formatError = (error: any) => ({
   content: [{ type: 'text' as const, text: error?.message || String(error) }]
 });
 
-const renderSessions = new Map<string, string>();
+interface SessionEntry {
+  transport: StreamableHTTPServerTransport;
+  lastActive: number;
+}
+
+interface RenderSessionEntry {
+  sessionId: string;
+  lastActive: number;
+}
+
+const transports = new Map<string, SessionEntry>();
+const renderSessions = new Map<string, RenderSessionEntry>();
 
 async function initializeRenderSession(renderToken: string): Promise<string> {
   const response = await fetch('https://mcp.render.com/mcp', {
@@ -75,10 +86,11 @@ async function initializeRenderSession(renderToken: string): Promise<string> {
 async function getOrInitializeRenderSession(renderToken: string): Promise<string> {
   const cached = renderSessions.get(renderToken);
   if (cached) {
-    return cached;
+    cached.lastActive = Date.now();
+    return cached.sessionId;
   }
   const session = await initializeRenderSession(renderToken);
-  renderSessions.set(renderToken, session);
+  renderSessions.set(renderToken, { sessionId: session, lastActive: Date.now() });
   return session;
 }
 
@@ -121,7 +133,13 @@ async function callRenderTool(toolName: string, args: any, renderToken: string |
         return formatError(new Error(`Render MCP Error: ${errText}`));
       }
 
-      const data = await response.json() as any;
+      let data: any;
+      try {
+        data = await response.json();
+      } catch {
+        return formatError(new Error(`Render MCP returned invalid JSON: ${response.status}`));
+      }
+
       if (data?.error) {
         const errMsg = data.error.message || JSON.stringify(data.error);
         if (errMsg.includes('session') || errMsg.includes('Session')) {
@@ -179,8 +197,8 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   }, async ({ q }) => {
     try {
       const res = await octokitClient.repos.listForAuthenticatedUser({ per_page: 100 });
-      const regex = new RegExp(q, 'i');
-      const matched = res.data.filter(r => regex.test(r.name) || regex.test(r.full_name)).slice(0, 10);
+      const lowerQ = q.toLowerCase();
+      const matched = res.data.filter(r => r.name.toLowerCase().includes(lowerQ) || r.full_name.toLowerCase().includes(lowerQ)).slice(0, 10);
       if (matched.length === 0) {
         const globalRes = await octokitClient.search.repos({ q: `${q} in:name`, per_page: 5 });
         return formatSuccess(globalRes.data.items.map(r => `${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''}`).join('\n'));
@@ -253,13 +271,22 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       if ('content' in res.data && typeof res.data.content === 'string') {
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
         const lines = raw.split('\n');
-        const regex = new RegExp(query, 'i');
         const matches: string[] = [];
-        lines.forEach((line, index) => {
-          if (regex.test(line)) {
-            matches.push(`Line ${index + 1}: ${line.trim()}`);
-          }
-        });
+        try {
+          const regex = new RegExp(query, 'i');
+          lines.forEach((line, index) => {
+            if (regex.test(line)) {
+              matches.push(`Line ${index + 1}: ${line.trim()}`);
+            }
+          });
+        } catch {
+          const lowerQuery = query.toLowerCase();
+          lines.forEach((line, index) => {
+            if (line.toLowerCase().includes(lowerQuery)) {
+              matches.push(`Line ${index + 1}: ${line.trim()}`);
+            }
+          });
+        }
         if (matches.length === 0) {
           return formatSuccess('No matching lines found.');
         }
@@ -287,8 +314,8 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       const res = await octokitClient.git.getTree({ owner, repo, tree_sha, recursive: 'true' });
       let tree = res.data.tree;
       if (q) {
-        const regex = new RegExp(q, 'i');
-        tree = tree.filter(t => regex.test(t.path || ''));
+        const lowerQ = q.toLowerCase();
+        tree = tree.filter(t => (t.path || '').toLowerCase().includes(lowerQ));
       }
       const total = tree.length;
       const items = tree.slice(offset, offset + 50).map(t => `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`);
@@ -358,7 +385,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   }, async ({ owner, repo, path, content, message, branch, sha }) => {
     try {
       const res = await octokitClient.repos.createOrUpdateFileContents({
-        owner, repo, path, message, content: Buffer.from(content).toString('base64'), branch, sha
+        owner, repo, path, message, content: Buffer.from(content, 'utf-8').toString('base64'), branch, sha
       });
       return formatSuccess(`Success: ${res.data.commit.sha}`);
     } catch (err) { return formatError(err); }
@@ -386,7 +413,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       }
       lines.splice(startLine - 1, endLine - startLine + 1, ...newContent.split('\n'));
       const res = await octokitClient.repos.createOrUpdateFileContents({
-        owner, repo, path, message, content: Buffer.from(lines.join('\n')).toString('base64'), branch, sha: fileData.data.sha
+        owner, repo, path, message, content: Buffer.from(lines.join('\n'), 'utf-8').toString('base64'), branch, sha: fileData.data.sha
       });
       return formatSuccess(`Success: ${res.data.commit.sha}`);
     } catch (err) { return formatError(err); }
@@ -518,10 +545,10 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   return server;
 }
 
-const transports = new Map<string, StreamableHTTPServerTransport>();
+const transports = new Map<string, SessionEntry>();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   if (!MCP_API_KEY) {
@@ -554,9 +581,10 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
   if (sessionId && transports.has(sessionId)) {
-    const transport = transports.get(sessionId)!;
+    const entry = transports.get(sessionId)!;
+    entry.lastActive = Date.now();
     try {
-      await transport.handleRequest(req, res, req.body);
+      await entry.transport.handleRequest(req, res, req.body);
     } catch (error: any) {
       if (!res.headersSent) {
         res.status(500).json({
@@ -572,7 +600,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => Math.random().toString(36).substring(2, 15),
     onsessioninitialized: (id) => {
-      transports.set(id, transport);
+      transports.set(id, { transport, lastActive: Date.now() });
     }
   });
 
@@ -602,6 +630,31 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
 app.get('/', (req: Request, res: Response) => {
   res.send('🚀 Stateless Unified MCP Server active.');
 });
+
+setInterval(() => {
+  const now = Date.now();
+  const maxIdleTime = 15 * 60 * 1000;
+  
+  for (const [id, entry] of transports.entries()) {
+    if (now - entry.lastActive > maxIdleTime) {
+      try {
+        if (typeof entry.transport.close === 'function') {
+          entry.transport.close();
+        }
+      } catch {}
+      transports.delete(id);
+    }
+  }
+
+  for (const [token, entry] of renderSessions.entries()) {
+    if (now - entry.lastActive > maxIdleTime) {
+      renderSessions.delete(token);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
