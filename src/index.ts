@@ -161,6 +161,29 @@ async function callRenderTool(toolName: string, args: any, renderToken: string |
   return formatError(new Error('Render MCP call failed.'));
 }
 
+function extractJsonResult(rawResult: any): any {
+  if (rawResult.isError) return null;
+  
+  let contentText = '';
+  if (rawResult.content && Array.isArray(rawResult.content)) {
+    contentText = rawResult.content[0]?.text || '';
+  } else {
+    contentText = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
+  }
+
+  try {
+    return JSON.parse(contentText);
+  } catch {
+    const match = contentText.match(/(\[([\s\S]*?)\]|\{([\s\S]*?)\})/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch {}
+    }
+  }
+  return null;
+}
+
 function createMcpServer(octokitClient: Octokit, renderToken: string | undefined) {
   const server = new McpServer({
     name: 'github-lean-agent',
@@ -178,138 +201,229 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('list_repos', {
-    description: 'List recent repos',
+    description: 'List recent repositories. High-efficiency summary.',
     inputSchema: {
-      limit: z.number().optional().default(10)
+      limit: z.number().optional().default(5).describe('Number of repos to return (default 5, max 100)'),
+      page: z.number().optional().default(1).describe('Page number for pagination')
     }
-  }, async ({ limit }) => {
+  }, async ({ limit, page }) => {
     try {
-      const res = await octokitClient.repos.listForAuthenticatedUser({ sort: 'updated', per_page: limit });
-      return formatSuccess(res.data.map(r => `${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''}`).join('\n'));
+      const targetLimit = Math.min(limit, 100);
+      const res = await octokitClient.repos.listForAuthenticatedUser({ 
+        sort: 'updated', 
+        per_page: targetLimit,
+        page: page
+      });
+      
+      if (res.data.length === 0) {
+        return formatSuccess('No repositories found.');
+      }
+
+      const formatted = res.data.map(r => 
+        `- ${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''} (Updated: ${r.updated_at ? r.updated_at.split('T')[0] : 'N/A'})`
+      ).join('\n');
+
+      const meta = `Page ${page}. Displaying ${res.data.length} repos. Request next page for more.`;
+      return formatSuccess(`${meta}\n\n${formatted}`);
     } catch (err) { return formatError(err); }
   });
 
   server.registerTool('search_repos', {
-    description: 'Search repos by keyword',
+    description: 'Search authenticated user repos or global repos. Concise summary format.',
     inputSchema: {
-      q: z.string()
+      q: z.string().describe('Search keyword or pattern'),
+      limit: z.number().optional().default(5).describe('Max matches to display (default 5, max 50)')
     }
-  }, async ({ q }) => {
+  }, async ({ q, limit }) => {
     try {
+      const targetLimit = Math.min(limit, 50);
       const res = await octokitClient.repos.listForAuthenticatedUser({ per_page: 100 });
       const lowerQ = q.toLowerCase();
-      const matched = res.data.filter(r => r.name.toLowerCase().includes(lowerQ) || r.full_name.toLowerCase().includes(lowerQ)).slice(0, 10);
+      
+      let matched = res.data.filter(r => 
+        r.name.toLowerCase().includes(lowerQ) || r.full_name.toLowerCase().includes(lowerQ)
+      ).slice(0, targetLimit);
+
       if (matched.length === 0) {
-        const globalRes = await octokitClient.search.repos({ q: `${q} in:name`, per_page: 5 });
-        return formatSuccess(globalRes.data.items.map(r => `${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''}`).join('\n'));
+        const globalRes = await octokitClient.search.repos({ q: `${q} in:name`, per_page: targetLimit });
+        matched = globalRes.data.items as any[];
       }
-      return formatSuccess(matched.map(r => `${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''}`).join('\n'));
+
+      if (matched.length === 0) {
+        return formatSuccess('No matching repositories found.');
+      }
+
+      const formatted = matched.map(r => 
+        `- ${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''}`
+      ).join('\n');
+
+      return formatSuccess(formatted);
     } catch (err) { return formatError(err); }
   });
 
   server.registerTool('list_branches', {
-    description: 'List branches with full 40-character commit SHAs (needed for branch creation).',
+    description: 'List branches with abbreviated and full commit SHAs. Optimized summary.',
     inputSchema: {
       owner: z.string(),
-      repo: z.string()
+      repo: z.string(),
+      limit: z.number().optional().default(5).describe('Number of branches to fetch (default 5, max 50)'),
+      page: z.number().optional().default(1).describe('Page number for pagination')
     }
-  }, async ({ owner, repo }) => {
+  }, async ({ owner, repo, limit, page }) => {
     try {
-      const res = await octokitClient.repos.listBranches({ owner, repo, per_page: 30 });
-      return formatSuccess(res.data.map(b => `${b.name} (${b.commit.sha})`).join('\n'));
+      const targetLimit = Math.min(limit, 50);
+      const res = await octokitClient.repos.listBranches({ 
+        owner, 
+        repo, 
+        per_page: targetLimit,
+        page: page
+      });
+      
+      if (res.data.length === 0) {
+        return formatSuccess('No branches found.');
+      }
+
+      const listWithShas = res.data.map(b => `${b.name}: ${b.commit.sha}`).join('\n');
+      const meta = `Page ${page}. Showing ${res.data.length} branches. Query next page for more.`;
+      
+      return formatSuccess(`${meta}\n\n${listWithShas}`);
     } catch (err) { return formatError(err); }
   });
 
   server.registerTool('search_code', {
-    description: 'Search for code patterns across repositories. Returns matching file paths and the code fragments containing the matches.',
+    description: 'Search for code patterns across repositories. Returns highly condensed context chunks.',
     inputSchema: {
       q: z.string().describe('Search query keyword or code pattern'),
       owner: z.string().optional().describe('Optional repository owner to restrict search scope'),
-      repo: z.string().optional().describe('Optional repository name to restrict search scope (requires owner)')
+      repo: z.string().optional().describe('Optional repository name to restrict search scope'),
+      limit: z.number().optional().default(3).describe('Max code match files to return (default 3, max 20)'),
+      fragmentLines: z.number().optional().default(8).describe('Number of lines of matching context fragment to display (default 8, max 50)')
     }
-  }, async ({ q, owner, repo }) => {
+  }, async ({ q, owner, repo, limit, fragmentLines }) => {
     try {
       let query = q;
       if (owner && repo) {
         query += ` repo:${owner}/${repo}`;
       }
+      const targetLimit = Math.min(limit, 20);
+      const targetFragmentLines = Math.min(fragmentLines, 50);
       const res = await octokitClient.search.code({
         q: query,
-        per_page: 5,
+        per_page: targetLimit,
         headers: {
           accept: 'application/vnd.github.v3.text-match+json'
         }
       });
       
+      if (!res.data.items || res.data.items.length === 0) {
+        return formatSuccess('No code matches found.');
+      }
+
       const results = res.data.items.map(item => {
         let text = `File: ${item.repository.full_name}:${item.path}\n`;
         const matches = (item as any).text_matches;
         if (matches && Array.isArray(matches) && matches.length > 0) {
-          matches.forEach(match => {
-            text += `Match Context:\n${match.fragment}\n`;
-          });
+          const match = matches[0];
+          const fragmented = match.fragment.split('\n');
+          const slicedFragment = fragmented.slice(0, targetFragmentLines).join('\n');
+          text += `Match Context (showing first ${targetFragmentLines} lines):\n${slicedFragment}\n`;
+          if (fragmented.length > targetFragmentLines) {
+            text += `... (+${fragmented.length - targetFragmentLines} lines omitted)\n`;
+          }
+        } else {
+          text += `(No fragment match details returned; file exists)\n`;
         }
         return text;
       }).join('\n---\n\n');
       
-      return formatSuccess(results || 'No code matches found.');
+      return formatSuccess(results);
     } catch (err) { return formatError(err); }
   });
 
   server.registerTool('grep_file', {
-    description: 'Search for a keyword or regex within a specific file to find matching lines and their line numbers. Extremely useful for navigating large files.',
+    description: 'Search for a keyword or regex within a specific file to find matching lines and surrounding code context.',
     inputSchema: {
       owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
       path: z.string().describe('Path to the file'),
       query: z.string().describe('Keyword or text to search for'),
-      ref: z.string().default('main').describe('Git branch, tag, or commit SHA')
+      ref: z.string().default('main').describe('Git branch, tag, or commit SHA'),
+      limit: z.number().optional().default(15).describe('Maximum matching lines to return (default 15, max 100)'),
+      offset: z.number().optional().default(0).describe('Starting match index for pagination'),
+      contextLines: z.number().optional().default(0).describe('Number of surrounding context lines to show before and after each match (default 0, max 5).')
     }
-  }, async ({ owner, repo, path, query, ref }) => {
+  }, async ({ owner, repo, path, query, ref, limit, offset, contextLines }) => {
     try {
       const res = await octokitClient.repos.getContent({ owner, repo, path, ref });
       if ('content' in res.data && typeof res.data.content === 'string') {
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
         const lines = raw.split('\n');
-        const matches: string[] = [];
-        try {
-          const regex = new RegExp(query, 'i');
-          lines.forEach((line, index) => {
-            if (regex.test(line)) {
-              matches.push(`Line ${index + 1}: ${line.trim()}`);
-            }
-          });
-        } catch {
-          const lowerQuery = query.toLowerCase();
-          lines.forEach((line, index) => {
-            if (line.toLowerCase().includes(lowerQuery)) {
-              matches.push(`Line ${index + 1}: ${line.trim()}`);
-            }
-          });
-        }
-        if (matches.length === 0) {
+        
+        const matchedIndices: number[] = [];
+        const targetLimit = Math.min(limit, 100);
+        const targetContext = Math.min(contextLines, 5);
+        
+        const testMatch = (line: string): boolean => {
+          try {
+            const regex = new RegExp(query, 'i');
+            return regex.test(line);
+          } catch {
+            return line.toLowerCase().includes(query.toLowerCase());
+          }
+        };
+
+        lines.forEach((line, index) => {
+          if (testMatch(line)) {
+            matchedIndices.push(index);
+          }
+        });
+        
+        if (matchedIndices.length === 0) {
           return formatSuccess('No matching lines found.');
         }
-        let out = matches.slice(0, 50).join('\n');
-        if (matches.length > 50) {
-          out += `\n... truncated. Total matches: ${matches.length}`;
+        
+        const total = matchedIndices.length;
+        const slicedIndices = matchedIndices.slice(offset, offset + targetLimit);
+        
+        const matchOutputs: string[] = [];
+        slicedIndices.forEach((matchIdx) => {
+          if (targetContext === 0) {
+            matchOutputs.push(`L${matchIdx + 1}: ${lines[matchIdx].trim().slice(0, 150)}`);
+          } else {
+            const contextStart = Math.max(0, matchIdx - targetContext);
+            const contextEnd = Math.min(lines.length - 1, matchIdx + targetContext);
+            let block = `--- Match at Line ${matchIdx + 1} ---\n`;
+            for (let i = contextStart; i <= contextEnd; i++) {
+              const prefix = i === matchIdx ? '>> ' : '   ';
+              block += `${prefix}L${i + 1}: ${lines[i].trim().slice(0, 150)}\n`;
+            }
+            matchOutputs.push(block.trimEnd());
+          }
+        });
+        
+        let out = matchOutputs.join(targetContext === 0 ? '\n' : '\n\n');
+        let meta = `Showing matches ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total} total matching lines.`;
+        if (total > offset + targetLimit) {
+          meta += ` Re-run tool with offset: ${offset + targetLimit} for next batch.`;
         }
-        return formatSuccess(out);
+        
+        return formatSuccess(`${meta}\n\n${out}`);
       }
       return formatSuccess('Not a file');
     } catch (err) { return formatError(err); }
   });
 
   server.registerTool('get_tree', {
-    description: 'Get file tree. Slices to 50 items. Use offset to paginate. Use q to search/filter files by keyword (e.g. "memoryService") to find paths instantly.',
+    description: 'Get file tree. Slices tree listings with control options for paging size.',
     inputSchema: {
       owner: z.string().describe('Repository owner/organization'),
       repo: z.string().describe('Repository name'),
       tree_sha: z.string().default('main').describe('Git branch, tag, or commit SHA'),
-      offset: z.number().optional().default(0).describe('Index offset for paginating deep trees (increments of 50)'),
+      offset: z.number().optional().default(0).describe('Index offset for paginating deep trees (increments of limit)'),
+      limit: z.number().optional().default(50).describe('Max items to show in single response (default 50, max 200)'),
       q: z.string().optional().describe('Search keyword to filter files by path/name')
     }
-  }, async ({ owner, repo, tree_sha, offset, q }) => {
+  }, async ({ owner, repo, tree_sha, offset, limit, q }) => {
     try {
       const res = await octokitClient.git.getTree({ owner, repo, tree_sha, recursive: 'true' });
       let tree = res.data.tree;
@@ -318,26 +432,33 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         tree = tree.filter(t => (t.path || '').toLowerCase().includes(lowerQ));
       }
       const total = tree.length;
-      const items = tree.slice(offset, offset + 50).map(t => `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`);
+      const targetLimit = Math.min(limit, 200);
+      
+      const items = tree.slice(offset, offset + targetLimit).map(t => 
+        `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`
+      );
+      
       let out = items.join('\n');
-      if (total > offset + 50) {
-        out += `\n... truncated. Total files/matches: ${total}. Call again with offset: ${offset + 50} to retrieve more.`;
+      let meta = `Showing items ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total} total items.`;
+      if (total > offset + targetLimit) {
+        meta += ` Re-run tool with offset: ${offset + targetLimit} for more.`;
       }
-      return formatSuccess(out || 'No files matched your search.');
+      return formatSuccess(`${meta}\n\n${out || 'No files matches found.'}`);
     } catch (err) { return formatError(err); }
   });
 
   server.registerTool('get_contents', {
-    description: 'Read file lines. Automatically slices content to safe 300-line windows if the range is omitted or exceeds the max limit.',
+    description: 'Read file contents inside a controlled safe window (default 300 lines, maximum 750 lines). Use startLine and limit or endLine to control segment size.',
     inputSchema: {
       owner: z.string().describe('Repository owner/organization'),
       repo: z.string().describe('Repository name'),
       path: z.string().describe('Path to the file'),
       ref: z.string().default('main').describe('Git branch, tag, or commit SHA'),
-      startLine: z.number().optional().describe('First line to read (1-based, inclusive). Defaults to 1.'),
-      endLine: z.number().optional().describe('Last line to read (inclusive). Sliced up to (startLine + 299) to protect memory window.')
+      startLine: z.number().optional().default(1).describe('First line to read (1-based, inclusive)'),
+      limit: z.number().optional().default(300).describe('Number of lines to return (default 300, max 750)'),
+      endLine: z.number().optional().describe('Last line to read (inclusive). If specified, overrides the limit up to a max window of 750 lines.')
     }
-  }, async ({ owner, repo, path, ref, startLine, endLine }) => {
+  }, async ({ owner, repo, path, ref, startLine, limit, endLine }) => {
     try {
       const res = await octokitClient.repos.getContent({ owner, repo, path, ref });
       if ('content' in res.data && typeof res.data.content === 'string') {
@@ -345,27 +466,36 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         let lines = raw.split('\n');
         const total = lines.length;
         
-        let start = startLine ? Math.max(1, startLine) : 1;
-        let end = endLine ? Math.min(total, endLine) : total;
+        let start = Math.max(1, startLine);
+        let targetLimit = Math.min(Math.max(1, limit), 750);
+        
+        if (endLine) {
+          const calculatedLimit = endLine - start + 1;
+          if (calculatedLimit > 0) {
+            targetLimit = Math.min(calculatedLimit, 750);
+          }
+        }
+        
+        let end = Math.min(total, start + targetLimit - 1);
         
         if (start > total) {
           return formatError(new Error(`Invalid startLine: ${startLine}. Total lines in file: ${total}`));
         }
         
         let truncated = false;
-        if (end - start >= 300) {
-          end = start + 299;
+        if (total > end) {
           truncated = true;
         }
         
-        lines = lines.slice(start - 1, end);
-        let out = lines.join('\n');
+        const windowLines = lines.slice(start - 1, end);
+        let out = windowLines.join('\n');
         
-        if (truncated || total > end) {
-          out += `\n\n... (truncated. Displaying lines ${start}-${end} of ${total} total lines. To read subsequent lines, invoke get_contents with startLine: ${end + 1})`;
+        let meta = `Displaying lines ${start}-${end} of ${total} total lines.`;
+        if (truncated) {
+          meta += ` File is truncated. Call again with startLine: ${end + 1} to view subsequent segments.`;
         }
         
-        return formatSuccess(out);
+        return formatSuccess(`[METADATA: ${meta}]\n\n${out}`);
       }
       return formatSuccess('Not a file');
     } catch (err) { return formatError(err); }
@@ -468,10 +598,24 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('list_workspaces', {
-    description: 'List the workspaces that you have access to.',
+    description: 'List accessible workspaces. Hyper-condensed output.',
     inputSchema: {}
   }, async (args) => {
-    return callRenderTool('list_workspaces', args, renderToken);
+    const rawResult = await callRenderTool('list_workspaces', args, renderToken);
+    const parsed = extractJsonResult(rawResult);
+    if (!parsed) return rawResult;
+
+    try {
+      let workspaces = Array.isArray(parsed) ? parsed : (parsed.workspaces || []);
+      const simplified = workspaces.map((w: any) => ({
+        id: w.id || w.workspace?.id,
+        name: w.name || w.workspace?.name,
+        personal: w.personal || w.workspace?.personal
+      }));
+      return formatSuccess({ workspaces: simplified });
+    } catch {
+      return rawResult;
+    }
   });
 
   server.registerTool('select_workspace', {
@@ -491,12 +635,81 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('list_services', {
-    description: 'List all services in your Render account.',
+    description: 'List, search, and paginate through Render services. Supports regex and substring searches matching names or connected repository URLs.',
     inputSchema: {
+      q: z.string().optional().describe('Filter/search query. Supports case-insensitive substring or regex (e.g. "grumm" or "^web-"). Matches service name, id, type, or connected repository URL.'),
+      limit: z.number().optional().default(3).describe('Number of items to return in this batch (default 3, max 50)'),
+      offset: z.number().optional().default(0).describe('Zero-based offset for pagination'),
       includePreviews: z.boolean().optional().default(false)
     }
-  }, async (args) => {
-    return callRenderTool('list_services', args, renderToken);
+  }, async ({ q, limit, offset, includePreviews }) => {
+    const rawResult = await callRenderTool('list_services', { includePreviews }, renderToken);
+    const parsed = extractJsonResult(rawResult);
+    if (!parsed) return rawResult;
+
+    try {
+      let services = Array.isArray(parsed) ? parsed : [];
+      if (!Array.isArray(services) && typeof parsed === 'object') {
+        for (const k of Object.keys(parsed)) {
+          if (Array.isArray(parsed[k])) {
+            services = parsed[k];
+            break;
+          }
+        }
+      }
+
+      // Filter locally with regex or simple substring fallback
+      if (q) {
+        let regex: RegExp | null = null;
+        try {
+          regex = new RegExp(q, 'i');
+        } catch {
+          // Fallback to substring match if q is not a compilable regex pattern
+        }
+
+        services = services.filter((s: any) => {
+          const name = s.name || s.service?.name || '';
+          const id = s.id || s.service?.id || '';
+          const type = s.type || s.service?.type || '';
+          const repo = s.repo || s.service?.repo || s.service?.repoDetails?.url || '';
+
+          if (regex) {
+            return regex.test(name) || regex.test(id) || regex.test(type) || regex.test(repo);
+          } else {
+            const lowerQ = q.toLowerCase();
+            return name.toLowerCase().includes(lowerQ) ||
+                   id.toLowerCase().includes(lowerQ) ||
+                   type.toLowerCase().includes(lowerQ) ||
+                   repo.toLowerCase().includes(lowerQ);
+          }
+        });
+      }
+
+      const totalMatched = services.length;
+      const targetLimit = Math.min(limit, 50);
+      const paginated = services.slice(offset, offset + targetLimit);
+
+      const simplified = paginated.map((s: any) => ({
+        id: s.id || s.service?.id,
+        name: s.name || s.service?.name,
+        type: s.type || s.service?.type,
+        state: s.state || s.service?.state,
+        updatedAt: s.updatedAt || s.service?.updatedAt,
+        repo: s.repo || s.service?.repo || s.service?.repoDetails?.url
+      }));
+
+      let message = `Displaying ${paginated.length} of ${totalMatched} matched services.`;
+      if (totalMatched > offset + targetLimit) {
+        message += ` Re-run tool with offset: ${offset + targetLimit} to retrieve the next batch.`;
+      }
+
+      return formatSuccess({
+        meta: message,
+        services: simplified
+      });
+    } catch (err: any) {
+      return formatError(new Error(`Failed to filter/paginate services: ${err.message}`));
+    }
   });
 
   server.registerTool('get_service', {
@@ -509,13 +722,49 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('list_deploys', {
-    description: 'List deploy history.',
+    description: 'List deploy history. Highly simplified metadata and paginated to save context limits.',
     inputSchema: {
       serviceId: z.string(),
-      limit: z.number().optional().default(10)
+      limit: z.number().optional().default(3).describe('Number of deployments to display (default 3, max 50)'),
+      offset: z.number().optional().default(0).describe('Pagination offset')
     }
-  }, async (args) => {
-    return callRenderTool('list_deploys', args, renderToken);
+  }, async ({ serviceId, limit, offset }) => {
+    const targetLimit = Math.min(limit, 50);
+    const rawResult = await callRenderTool('list_deploys', { serviceId, limit: Math.max(offset + targetLimit, 20) }, renderToken);
+    const parsed = extractJsonResult(rawResult);
+    if (!parsed) return rawResult;
+
+    try {
+      let deploys = Array.isArray(parsed) ? parsed : [];
+      if (!Array.isArray(deploys) && typeof parsed === 'object') {
+        for (const k of Object.keys(parsed)) {
+          if (Array.isArray(parsed[k])) {
+            deploys = parsed[k];
+            break;
+          }
+        }
+      }
+
+      const total = deploys.length;
+      const paginated = deploys.slice(offset, offset + targetLimit);
+
+      const simplified = paginated.map((d: any) => ({
+        id: d.id || d.deploy?.id,
+        status: d.status || d.deploy?.status,
+        commitMessage: d.commit?.message || d.deploy?.commit?.message || 'N/A',
+        createdAt: d.createdAt || d.deploy?.createdAt,
+        finishedAt: d.finishedAt || d.deploy?.finishedAt
+      }));
+
+      let meta = `Showing deployments ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total}.`;
+      if (total > offset + targetLimit) {
+        meta += ` For next batch, re-run with offset: ${offset + targetLimit}.`;
+      }
+
+      return formatSuccess({ meta, deploys: simplified });
+    } catch (err: any) {
+      return formatError(new Error(`Failed to parse deployments: ${err.message}`));
+    }
   });
 
   server.registerTool('get_deploy', {
@@ -529,17 +778,46 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('list_logs', {
-    description: 'Get service logs matching the provided filters.',
+    description: 'Get service logs. Slices long messages to protect token efficiency.',
     inputSchema: {
-      resource: z.array(z.string()).describe('Filter logs by their resource (array of strings, required, e.g. ["srv-xxxx"])'),
-      level: z.array(z.string()).optional().describe('Filter logs by their severity level (array of strings, optional)'),
-      type: z.array(z.string()).optional().describe('Filter logs by their type (array of strings, optional)'),
-      instance: z.array(z.string()).optional().describe('Filter logs by the instance they were emitted from (array of strings, optional)'),
-      host: z.array(z.string()).optional().describe('Filter request logs by their host (array of strings, optional)'),
-      limit: z.number().optional().describe('Maximum number of log lines to return (number, optional)')
+      resource: z.array(z.string()).describe('Filter logs by their resource (array of strings, e.g. ["srv-xxxx"])'),
+      level: z.array(z.string()).optional().describe('Filter logs by severity level'),
+      type: z.array(z.string()).optional().describe('Filter logs by type'),
+      instance: z.array(z.string()).optional().describe('Filter logs by instance'),
+      host: z.array(z.string()).optional().describe('Filter request logs by host'),
+      limit: z.number().optional().default(15).describe('Maximum number of log lines to return (default 15, max 250)')
     }
   }, async (args) => {
-    return callRenderTool('list_logs', args, renderToken);
+    const requestedLimit = args.limit || 15;
+    const targetLimit = Math.min(requestedLimit, 250);
+    const payload = { ...args, limit: targetLimit };
+
+    const rawResult = await callRenderTool('list_logs', payload, renderToken);
+    const parsed = extractJsonResult(rawResult);
+    if (!parsed) return rawResult;
+
+    try {
+      if (Array.isArray(parsed)) {
+        const sliced = parsed.slice(0, targetLimit);
+        const simplified = sliced.map((l: any) => {
+          if (typeof l === 'string') return l.slice(0, 180);
+          return {
+            t: l.timestamp || l.time || l.t,
+            lvl: l.level || l.lvl,
+            msg: (l.message || l.msg || JSON.stringify(l)).trim().slice(0, 180)
+          };
+        });
+
+        let truncatedNote = '';
+        if (parsed.length > targetLimit) {
+          truncatedNote = `\n... (truncated from ${parsed.length} items. Request larger limit if details are missing.)`;
+        }
+        return formatSuccess(JSON.stringify(simplified, null, 2) + truncatedNote);
+      }
+      return rawResult;
+    } catch {
+      return rawResult;
+    }
   });
 
   return server;
