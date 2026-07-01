@@ -403,7 +403,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
         encoding = undefined;
       }
       if (chunk) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, typeof encoding === 'string' ? encoding : 'utf8'));
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, (typeof encoding === 'string' ? encoding : 'utf8') as BufferEncoding));
       }
       return true;
     } as any;
@@ -414,7 +414,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
         encoding = undefined;
       }
       if (chunk) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, typeof encoding === 'string' ? encoding : 'utf8'));
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, (typeof encoding === 'string' ? encoding : 'utf8') as BufferEncoding));
       }
       const body = Buffer.concat(chunks).toString('utf8');
       try {
