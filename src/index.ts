@@ -440,6 +440,29 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     } catch (err) { return formatError(err); }
   });
 
+  server.registerTool('list_workspaces', {
+    description: 'List the workspaces that you have access to.',
+    inputSchema: {}
+  }, async (args) => {
+    return callRenderTool('list_workspaces', args, renderToken);
+  });
+
+  server.registerTool('select_workspace', {
+    description: 'Select a workspace to use.',
+    inputSchema: {
+      ownerID: z.string().describe('The ID of the workspace to use (starts with tea- or own-).')
+    }
+  }, async (args) => {
+    return callRenderTool('select_workspace', args, renderToken);
+  });
+
+  server.registerTool('get_selected_workspace', {
+    description: 'Get the currently selected workspace.',
+    inputSchema: {}
+  }, async (args) => {
+    return callRenderTool('get_selected_workspace', args, renderToken);
+  });
+
   server.registerTool('list_services', {
     description: 'List all services in your Render account.',
     inputSchema: {
