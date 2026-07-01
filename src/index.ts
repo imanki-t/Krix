@@ -20,41 +20,127 @@ const formatError = (error: any) => ({
   content: [{ type: 'text' as const, text: error?.message || String(error) }]
 });
 
+const renderSessions = new Map<string, string>();
+
+async function initializeRenderSession(renderToken: string): Promise<string> {
+  const response = await fetch('https://mcp.render.com/mcp', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${renderToken}`
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: {
+          name: 'github-lean-agent-proxy',
+          version: '1.2.0'
+        }
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Failed to initialize Render MCP session: ${errText}`);
+  }
+
+  const sessionId = response.headers.get('mcp-session-id');
+  if (!sessionId) {
+    throw new Error('Render MCP server did not return an mcp-session-id header.');
+  }
+
+  try {
+    await fetch('https://mcp.render.com/mcp', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${renderToken}`,
+        'Mcp-Session-Id': sessionId
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'notifications/initialized'
+      })
+    });
+  } catch {}
+
+  return sessionId;
+}
+
+async function getOrInitializeRenderSession(renderToken: string): Promise<string> {
+  const cached = renderSessions.get(renderToken);
+  if (cached) {
+    return cached;
+  }
+  const session = await initializeRenderSession(renderToken);
+  renderSessions.set(renderToken, session);
+  return session;
+}
+
 async function callRenderTool(toolName: string, args: any, renderToken: string | undefined) {
   if (!renderToken) {
     return formatError(new Error('Missing Render API key. Please check your RENDER_API_KEY environment variable or headers.'));
   }
-  try {
-    const response = await fetch('https://mcp.render.com/mcp', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${renderToken}`
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'tools/call',
-        params: {
-          name: toolName,
-          arguments: args
+  
+  let attempts = 0;
+  while (attempts < 2) {
+    attempts++;
+    try {
+      const sessionId = await getOrInitializeRenderSession(renderToken);
+      const response = await fetch('https://mcp.render.com/mcp', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${renderToken}`,
+          'Mcp-Session-Id': sessionId
         },
-        id: `proxy-${toolName}`
-      })
-    });
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'tools/call',
+          params: {
+            name: toolName,
+            arguments: args
+          },
+          id: `proxy-${toolName}`
+        })
+      });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      return formatError(new Error(`Render MCP Error: ${errText}`));
-    }
+      if (response.status === 400 || response.status === 401 || !response.ok) {
+        const errText = await response.text();
+        if (errText.includes('session') || errText.includes('Session') || response.status === 400) {
+          renderSessions.delete(renderToken);
+          if (attempts < 2) {
+            continue;
+          }
+        }
+        return formatError(new Error(`Render MCP Error: ${errText}`));
+      }
 
-    const data = await response.json() as any;
-    if (data?.error) {
-      return formatError(new Error(data.error.message || JSON.stringify(data.error)));
+      const data = await response.json() as any;
+      if (data?.error) {
+        const errMsg = data.error.message || JSON.stringify(data.error);
+        if (errMsg.includes('session') || errMsg.includes('Session')) {
+          renderSessions.delete(renderToken);
+          if (attempts < 2) {
+            continue;
+          }
+        }
+        return formatError(new Error(errMsg));
+      }
+      return data?.result || data;
+    } catch (err: any) {
+      renderSessions.delete(renderToken);
+      if (attempts >= 2) {
+        return formatError(err);
+      }
     }
-    return data?.result || data;
-  } catch (err: any) {
-    return formatError(err);
   }
+  return formatError(new Error('Render MCP call failed.'));
 }
 
 function createMcpServer(octokitClient: Octokit, renderToken: string | undefined) {
