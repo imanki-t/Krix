@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Octokit } from '@octokit/rest';
 import { z } from 'zod';
 import dotenv from 'dotenv';
@@ -210,56 +211,44 @@ function createMcpServer(octokitClient: Octokit) {
 }
 
 // ============================================================================
-// 🔌 PURE STATELESS STREAMABLE HTTP ENGINE (In-Memory Transport Pattern)
+// 🔌 OFFICIAL COMPLIANT STREAMABLE HTTP TRANSPORT RUNTIME
 // ============================================================================
-const app = express(); // FIXED: Standard Express Initialization
+const app = express();
 app.use(express.json());
 
-// FIXED: Explicitly typed Request and Response
+// Handshake router utilizing native Streamable SDK logic
 app.post('/mcp', async (req: Request, res: Response): Promise<void> => {
   try {
     const customPat = req.headers['x-github-token'] as string;
     const activeToken = customPat || DEFAULT_GITHUB_PAT;
     const activeOctokit = new Octokit({ auth: activeToken });
 
+    // 1. Build a isolated per-request server layout
     const activeServer = createMcpServer(activeOctokit);
 
-    let responsePayload: any = null;
+    // 2. Initialize official stateless streamable transport mechanism
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined // Triggers official compliant stateless communication stream
+    });
 
-    // Typecast as 'any' to completely bypass strict Transport interface requirements
-    const transport: any = {
-      start: async () => {},
-      send: async (message: any) => {
-        responsePayload = message;
-      },
-      close: async () => {},
-      onclose: undefined,
-      onerror: undefined,
-      onmessage: undefined,
-    };
-
+    // 3. Connect and execute the native SDK handler pipeline natively
     await activeServer.connect(transport);
-
-    if (typeof transport.onmessage === 'function') {
-      await transport.onmessage(req.body);
-    }
-
-    res.json(responsePayload);
+    await transport.handleRequest(req, res);
   } catch (error: any) {
     res.status(500).json({
       jsonrpc: '2.0',
-      error: { code: -32603, message: error?.message || 'Internal MCP Handler Crash' },
+      error: { code: -32603, message: error?.message || 'Internal Handshake Failure' },
       id: req.body?.id || null
     });
   }
 });
 
 app.get('/', (req: Request, res: Response) => {
-  res.send('🚀 Stateless GitHub MCP Server is fully responsive.');
+  res.send('🚀 Stateless GitHub MCP Server is online and compliant.');
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Stateless Lean GitHub MCP Server operational on port ${PORT}`);
+  console.log(`🚀 Compliant Lean GitHub MCP Server active on port ${PORT}`);
 });
-    
+      
