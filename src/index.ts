@@ -11,6 +11,23 @@ const DEFAULT_GITHUB_PAT = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || process.e
 const DEFAULT_RENDER_API_KEY = process.env.RENDER_API_KEY || process.env.RENDER_PAT;
 const MCP_API_KEY = process.env.MCP_API_KEY;
 
+const GITHUB_TOOLS = new Set([
+  'get_viewer',
+  'list_repos',
+  'search_repos',
+  'list_branches',
+  'search_code',
+  'grep_file',
+  'get_tree',
+  'get_contents',
+  'put_contents',
+  'patch_contents',
+  'delete_contents',
+  'create_ref',
+  'delete_ref',
+  'create_pull'
+]);
+
 const formatSuccess = (data: any) => ({
   content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data) }]
 });
@@ -117,14 +134,73 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('search_code', {
-    description: 'Search code',
+    description: 'Search for code patterns across repositories. Returns matching file paths and the code fragments containing the matches.',
     inputSchema: {
-      q: z.string()
+      q: z.string().describe('Search query keyword or code pattern'),
+      owner: z.string().optional().describe('Optional repository owner to restrict search scope'),
+      repo: z.string().optional().describe('Optional repository name to restrict search scope (requires owner)')
     }
-  }, async ({ q }) => {
+  }, async ({ q, owner, repo }) => {
     try {
-      const res = await octokitClient.search.code({ q, per_page: 10 });
-      return formatSuccess(res.data.items.map(i => `${i.repository.full_name}:${i.path}`).join('\n'));
+      let query = q;
+      if (owner && repo) {
+        query += ` repo:${owner}/${repo}`;
+      }
+      const res = await octokitClient.search.code({
+        q: query,
+        per_page: 5,
+        headers: {
+          accept: 'application/vnd.github.v3.text-match+json'
+        }
+      });
+      
+      const results = res.data.items.map(item => {
+        let text = `File: ${item.repository.full_name}:${item.path}\n`;
+        const matches = (item as any).text_matches;
+        if (matches && Array.isArray(matches) && matches.length > 0) {
+          matches.forEach(match => {
+            text += `Match Context:\n${match.fragment}\n`;
+          });
+        }
+        return text;
+      }).join('\n---\n\n');
+      
+      return formatSuccess(results || 'No code matches found.');
+    } catch (err) { return formatError(err); }
+  });
+
+  server.registerTool('grep_file', {
+    description: 'Search for a keyword or regex within a specific file to find matching lines and their line numbers. Extremely useful for navigating large files.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      path: z.string().describe('Path to the file'),
+      query: z.string().describe('Keyword or text to search for'),
+      ref: z.string().default('main').describe('Git branch, tag, or commit SHA')
+    }
+  }, async ({ owner, repo, path, query, ref }) => {
+    try {
+      const res = await octokitClient.repos.getContent({ owner, repo, path, ref });
+      if ('content' in res.data && typeof res.data.content === 'string') {
+        const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
+        const lines = raw.split('\n');
+        const regex = new RegExp(query, 'i');
+        const matches: string[] = [];
+        lines.forEach((line, index) => {
+          if (regex.test(line)) {
+            matches.push(`Line ${index + 1}: ${line.trim()}`);
+          }
+        });
+        if (matches.length === 0) {
+          return formatSuccess('No matching lines found.');
+        }
+        let out = matches.slice(0, 50).join('\n');
+        if (matches.length > 50) {
+          out += `\n... truncated. Total matches: ${matches.length}`;
+        }
+        return formatSuccess(out);
+      }
+      return formatSuccess('Not a file');
     } catch (err) { return formatError(err); }
   });
 
