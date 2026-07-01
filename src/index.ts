@@ -104,7 +104,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('list_branches', {
-    description: 'List branches',
+    description: 'List branches with full 40-character commit SHAs (needed for branch creation).',
     inputSchema: {
       owner: z.string(),
       repo: z.string()
@@ -112,7 +112,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   }, async ({ owner, repo }) => {
     try {
       const res = await octokitClient.repos.listBranches({ owner, repo, per_page: 30 });
-      return formatSuccess(res.data.map(b => `${b.name} (${b.commit.sha.substring(0, 7)})`).join('\n'));
+      return formatSuccess(res.data.map(b => `${b.name} (${b.commit.sha})`).join('\n'));
     } catch (err) { return formatError(err); }
   });
 
@@ -129,23 +129,34 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
   });
 
   server.registerTool('get_tree', {
-    description: 'Get file tree',
+    description: 'Get file tree. Slices to 50 items. Use offset to paginate. Use q to search/filter files by keyword (e.g. "memoryService") to find paths instantly.',
     inputSchema: {
       owner: z.string(),
       repo: z.string(),
-      tree_sha: z.string()
+      tree_sha: z.string().default('main'),
+      offset: z.number().optional().default(0),
+      q: z.string().optional()
     }
-  }, async ({ owner, repo, tree_sha }) => {
+  }, async ({ owner, repo, tree_sha, offset, q }) => {
     try {
       const res = await octokitClient.git.getTree({ owner, repo, tree_sha, recursive: 'true' });
-      const items = res.data.tree.slice(0, 100).map(t => `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`);
-      if (res.data.tree.length > 100) items.push(`... truncated ${res.data.tree.length - 100} files`);
-      return formatSuccess(items.join('\n'));
+      let tree = res.data.tree;
+      if (q) {
+        const regex = new RegExp(q, 'i');
+        tree = tree.filter(t => regex.test(t.path || ''));
+      }
+      const total = tree.length;
+      const items = tree.slice(offset, offset + 50).map(t => `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`);
+      let out = items.join('\n');
+      if (total > offset + 50) {
+        out += `\n... truncated. Total files/matches: ${total}. Call again with offset: ${offset + 50} to retrieve more.`;
+      }
+      return formatSuccess(out || 'No files matched your search.');
     } catch (err) { return formatError(err); }
   });
 
   server.registerTool('get_contents', {
-    description: 'Read file lines',
+    description: 'Read file lines. Max 300 lines limit. ALWAYS specify startLine and endLine (e.g. startLine: 1, endLine: 150) on your first read to avoid errors on large files.',
     inputSchema: {
       owner: z.string(),
       repo: z.string(),
@@ -163,7 +174,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         const total = lines.length;
         const start = startLine ? Math.max(1, startLine) : 1;
         const end = endLine ? Math.min(total, endLine) : total;
-        if (end - start > 300) return formatError(new Error('Max 300 lines'));
+        if (end - start > 300) return formatError(new Error('Max 300 lines. Please request a smaller line range (e.g. startLine: 1, endLine: 150) to stay within limits.'));
         lines = lines.slice(start - 1, end);
         let out = lines.join('\n');
         if (total > end) out += `\n... (truncated, total lines: ${total})`;
