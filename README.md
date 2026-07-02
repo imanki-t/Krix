@@ -45,8 +45,9 @@ Instead of fetching and outputting a full array of services to the model, the `l
 *   **Continuation Prompts**: Truncated results append clear paging guides indicating exactly how to call subsequent blocks.
 
 ### Code Searches & Match Contexts
-*   **Code Search (`search_code`)**: Limits result structures to targeted fragments rather than entire files. Includes a `fragmentLines` parameter (up to 50 lines) so the model can request more surrounding code when needed.
-*   **Localized Grepping (`grep_file`)**: Rather than reading entire files to locate reference terms, the `grep_file` tool supports regex match limits (up to 100) and an optional `contextLines` parameter (up to 5 lines). When enabled, this generates visual blocks highlighting the target matched lines along with their immediate surrounding lines in the terminal.
+*   **Code Search (`search_code`)**: Limits result structures to targeted fragments rather than entire files (max 20 files, `fragmentLines` up to 10) so the model can request more surrounding code when needed.
+*   **Localized Grepping (`grep`)**: Rather than reading entire files to locate reference terms, `grep` supports regex or literal pattern matching with `context_before`/`context_after` (up to 10 lines each), a `glob`/`type` filter, and three output modes (`content`, `files_with_matches`, `count`). If a direct file `path` is given, it scans that file directly instead of hitting the search index.
+*   **File Outline (`view_file_outline`)**: Pulls high-level symbol structures (functions, classes, imports) from a file without loading its raw contents — useful for orienting on large files before editing.
 
 ---
 
