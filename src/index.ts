@@ -11,14 +11,27 @@ const DEFAULT_GITHUB_PAT = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || process.e
 const DEFAULT_RENDER_API_KEY = process.env.RENDER_API_KEY || process.env.RENDER_PAT;
 const MCP_API_KEY = process.env.MCP_API_KEY;
 
+// Format successful response schemas
 const formatSuccess = (data: any) => ({
   content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data) }]
 });
 
+// Format err response schemas
 const formatError = (error: any) => ({
   isError: true,
   content: [{ type: 'text' as const, text: error?.message || String(error) }]
 });
+
+// Decodes and captures rate limit status from GitHub API errors
+function handleGitHubError(err: any): any {
+  if (err?.status === 403 && err?.headers?.['x-ratelimit-remaining'] === '0') {
+    const resetTime = err.headers['x-ratelimit-reset'] 
+      ? new Date(parseInt(err.headers['x-ratelimit-reset']) * 1000).toLocaleTimeString() 
+      : 'soon';
+    return formatError(new Error(`GitHub API rate limit exceeded. Resets at ${resetTime}.`));
+  }
+  return formatError(err);
+}
 
 interface SessionEntry {
   transport: StreamableHTTPServerTransport;
@@ -33,56 +46,198 @@ interface RenderSessionEntry {
 const transports = new Map<string, SessionEntry>();
 const renderSessions = new Map<string, RenderSessionEntry>();
 
-async function initializeRenderSession(renderToken: string): Promise<string> {
-  const response = await fetch('https://mcp.render.com/mcp', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${renderToken}`
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        clientInfo: {
-          name: 'github-lean-agent-proxy',
-          version: '1.2.0'
+// Calculates text matching similarity via standard edit distance ratios
+function getSimilarity(s1: string, s2: string): number {
+  let longer = s1;
+  let shorter = s2;
+  if (s1.length < s2.length) {
+    longer = s2;
+    shorter = s1;
+  }
+  const longerLength = longer.length;
+  if (longerLength === 0) {
+    return 1.0;
+  }
+  return (longerLength - editDistance(longer, shorter)) / longerLength;
+}
+
+// Compute string edit distance
+function editDistance(s1: string, s2: string): number {
+  s1 = s1.toLowerCase();
+  s2 = s2.toLowerCase();
+  const costs: number[] = [];
+  for (let i = 0; i <= s1.length; i++) {
+    let lastValue = i;
+    for (let j = 0; j <= s2.length; j++) {
+      if (i === 0) {
+        costs[j] = j;
+      } else {
+        if (j > 0) {
+          let newValue = costs[j - 1];
+          if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
+            newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
+          }
+          costs[j - 1] = lastValue;
+          lastValue = newValue;
         }
       }
-    })
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Failed to initialize Render MCP session: ${errText}`);
+    }
+    if (i > 0) {
+      costs[s2.length] = lastValue;
+    }
   }
+  return costs[s2.length];
+}
 
-  const sessionId = response.headers.get('mcp-session-id');
-  if (!sessionId) {
-    throw new Error('Render MCP server did not return an mcp-session-id header.');
+// Employs sliding window search to assist on fuzzy typos
+function getBestMatchFeedback(content: string, oldStr: string): string {
+  const contentLines = content.split('\n');
+  const oldLines = oldStr.split('\n');
+  const n = contentLines.length;
+  const m = oldLines.length;
+  let bestRatio = 0;
+  let bestStartIdx = -1;
+  let bestEndIdx = -1;
+  if (!oldStr.trim()) {
+    return "Error: target old_str is blank.";
   }
+  for (let i = 0; i <= n - m; i++) {
+    const window = contentLines.slice(i, i + m).join('\n');
+    const sim = getSimilarity(window, oldStr);
+    if (sim > bestRatio) {
+      bestRatio = sim;
+      bestStartIdx = i;
+      bestEndIdx = i + m;
+    }
+  }
+  if (bestRatio > 0.4) {
+    const closestSnippet: string[] = [];
+    const contextStart = Math.max(0, bestStartIdx - 3);
+    const contextEnd = Math.min(n, bestEndIdx + 3);
+    for (let idx = contextStart; idx < contextEnd; idx++) {
+      const isTarget = idx >= bestStartIdx && idx < bestEndIdx;
+      const prefix = isTarget ? ">> " : "   ";
+      closestSnippet.push(`${prefix}L${idx + 1}: ${contentLines[idx]}`);
+    }
+    return `Error: The code block to replace was not found exactly.\n\n` +
+           `Closest match found (similarity ${(bestRatio * 100).toFixed(1)}%):\n` +
+           `-----------------------------------------\n` +
+           `${closestSnippet.join('\n')}\n` +
+           `-----------------------------------------\n\n` +
+           `Check your formatting, indentation and brackets inside old_str precisely.`;
+  }
+  return "Error: Code block was not found. Check target file parameters and try again.";
+}
 
+// Fast mapping generator to fetch code layouts without opening massive files
+function extractFileOutline(content: string, filePath: string): string {
+  const lines = content.split('\n');
+  const outline: string[] = [];
+  const ext = filePath.split('.').pop()?.toLowerCase() || '';
+  for (let idx = 0; idx < lines.length; idx++) {
+    const lineNum = idx + 1;
+    const trimmed = lines[idx].trim();
+    if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {
+      continue;
+    }
+    if (['ts', 'tsx', 'js', 'jsx', 'go', 'rs', 'cpp', 'h', 'java', 'cs', 'php'].includes(ext)) {
+      if (trimmed.startsWith('import ') || trimmed.startsWith('export import ')) {
+        if (outline.length === 0 || !outline[outline.length - 1].includes('import ')) {
+          outline.push(`L${lineNum}: import ...`);
+        }
+      } else if (/^(export\s+)?(class|interface|type|enum|struct)\b/.test(trimmed)) {
+        outline.push(`L${lineNum}: ${trimmed.split('{')[0].split('=')[0].trim()}`);
+      } else if (/^(export\s+)?(const|let|var)\s+\w+\s*=\s*(\([^)]*\)|[^=]+)\s*=>/.test(trimmed)) {
+        const match = trimmed.match(/^(export\s+)?(const|let|var)\s+(\w+)/);
+        if (match) {
+          outline.push(`L${lineNum}: const ${match[3]} = (...) =>`);
+        }
+      } else if (/^(export\s+)?(async\s+)?function\s+(\w+)/.test(trimmed)) {
+        outline.push(`L${lineNum}: ${trimmed.split('{')[0].trim()}`);
+      } else if (trimmed.startsWith('func ') || trimmed.startsWith('pub fn ') || trimmed.startsWith('fn ')) {
+        outline.push(`L${lineNum}: ${trimmed.split('{')[0].trim()}`);
+      } else if (/^(public|private|protected|static|async)\s+/.test(trimmed) && trimmed.includes('(') && trimmed.includes(')')) {
+        outline.push(`L${lineNum}: [Method] ${trimmed.split('{')[0].trim()}`);
+      }
+    } else if (ext === 'py') {
+      if (trimmed.startsWith('def ') || trimmed.startsWith('class ')) {
+        const indentCount = lines[idx].search(/\S/);
+        const prefix = '  '.repeat(Math.floor(indentCount / 4));
+        outline.push(`L${lineNum}: ${prefix}${trimmed.replace(/:$/, '')}`);
+      }
+    } else if (ext === 'rb') {
+      if (trimmed.startsWith('def ') || trimmed.startsWith('class ') || trimmed.startsWith('module ')) {
+        outline.push(`L${lineNum}: ${trimmed}`);
+      }
+    } else if (ext === 'json') {
+      if (trimmed.startsWith('"') && trimmed.includes(':')) {
+        const key = trimmed.split(':')[0].trim();
+        outline.push(`L${lineNum}: ${key}: ...`);
+      }
+    }
+  }
+  return outline.length > 0 
+    ? outline.join('\n') 
+    : "No major declarations found inside this file.";
+}
+
+// Launch session validation against the Render platform API
+async function initializeRenderSession(renderToken: string): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
   try {
-    await fetch('https://mcp.render.com/mcp', {
+    const response = await fetch('https://mcp.render.com/mcp', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${renderToken}`,
-        'Mcp-Session-Id': sessionId
+        'Authorization': `Bearer ${renderToken}`
       },
+      signal: controller.signal,
       body: JSON.stringify({
         jsonrpc: '2.0',
-        method: 'notifications/initialized'
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: {
+            name: 'github-lean-agent-proxy',
+            version: '1.2.0'
+          }
+        }
       })
     });
-  } catch {}
-
-  return sessionId;
+    clearTimeout(timeoutId);
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Failed to initialize Render MCP session: ${errText}`);
+    }
+    const sessionId = response.headers.get('mcp-session-id');
+    if (!sessionId) {
+      throw new Error('Render MCP server did not return an mcp-session-id header.');
+    }
+    try {
+      await fetch('https://mcp.render.com/mcp', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${renderToken}`,
+          'Mcp-Session-Id': sessionId
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/initialized'
+        })
+      });
+    } catch {}
+    return sessionId;
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
 }
 
+// Fetch cached or retrieve fresh Render session
 async function getOrInitializeRenderSession(renderToken: string): Promise<string> {
   const cached = renderSessions.get(renderToken);
   if (cached) {
@@ -94,11 +249,11 @@ async function getOrInitializeRenderSession(renderToken: string): Promise<string
   return session;
 }
 
+// Proxy tool calling handler for Render services
 async function callRenderTool(toolName: string, args: any, renderToken: string | undefined) {
   if (!renderToken) {
-    return formatError(new Error('Missing Render API key. Please check your RENDER_API_KEY environment variable or headers.'));
+    return formatError(new Error('Missing Render API key. Verify your environment variables.'));
   }
-  
   let attempts = 0;
   while (attempts < 2) {
     attempts++;
@@ -121,7 +276,6 @@ async function callRenderTool(toolName: string, args: any, renderToken: string |
           id: `proxy-${toolName}`
         })
       });
-
       if (response.status === 400 || response.status === 401 || !response.ok) {
         const errText = await response.text();
         if (errText.includes('session') || errText.includes('Session') || response.status === 400) {
@@ -132,14 +286,12 @@ async function callRenderTool(toolName: string, args: any, renderToken: string |
         }
         return formatError(new Error(`Render MCP Error: ${errText}`));
       }
-
       let data: any;
       try {
         data = await response.json();
       } catch {
         return formatError(new Error(`Render MCP returned invalid JSON: ${response.status}`));
       }
-
       if (data?.error) {
         const errMsg = data.error.message || JSON.stringify(data.error);
         if (errMsg.includes('session') || errMsg.includes('Session')) {
@@ -161,16 +313,15 @@ async function callRenderTool(toolName: string, args: any, renderToken: string |
   return formatError(new Error('Render MCP call failed.'));
 }
 
+// Safely parse JSON blocks out of raw strings or objects
 function extractJsonResult(rawResult: any): any {
   if (rawResult.isError) return null;
-  
   let contentText = '';
   if (rawResult.content && Array.isArray(rawResult.content)) {
     contentText = rawResult.content[0]?.text || '';
   } else {
     contentText = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
   }
-
   try {
     return JSON.parse(contentText);
   } catch {
@@ -184,27 +335,32 @@ function extractJsonResult(rawResult: any): any {
   return null;
 }
 
+// Generate the MCP server containing highly precise development and system tools
 function createMcpServer(octokitClient: Octokit, renderToken: string | undefined) {
   const server = new McpServer({
     name: 'github-lean-agent',
     version: '1.2.0',
   });
 
+  // Get details of active authorized user
   server.registerTool('get_viewer', {
-    description: 'Get authenticated user',
+    description: 'Get authenticated user profile details.',
     inputSchema: {}
   }, async () => {
     try {
       const res = await octokitClient.users.getAuthenticated();
       return formatSuccess(`${res.data.login} (${res.data.name || ''})`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Retrieves user repositories with strict page limitations
   server.registerTool('list_repos', {
-    description: 'List recent repositories. High-efficiency summary.',
+    description: 'List user repositories. Returns clean layout to prevent context-bloat.',
     inputSchema: {
-      limit: z.number().optional().default(5).describe('Number of repos to return (default 5, max 100)'),
-      page: z.number().optional().default(1).describe('Page number for pagination')
+      limit: z.number().optional().default(5).describe('Repository results count (max 100)'),
+      page: z.number().optional().default(1).describe('Active results page index')
     }
   }, async ({ limit, page }) => {
     try {
@@ -214,60 +370,58 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         per_page: targetLimit,
         page: page
       });
-      
       if (res.data.length === 0) {
         return formatSuccess('No repositories found.');
       }
-
       const formatted = res.data.map(r => 
         `- ${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''} (Updated: ${r.updated_at ? r.updated_at.split('T')[0] : 'N/A'})`
       ).join('\n');
-
-      const meta = `Page ${page}. Displaying ${res.data.length} repos. Request next page for more.`;
+      const meta = `Page ${page}. Showing ${res.data.length} repositories.`;
       return formatSuccess(`${meta}\n\n${formatted}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Searches repositories matching target patterns
   server.registerTool('search_repos', {
-    description: 'Search authenticated user repos or global repos. Concise summary format.',
+    description: 'Find user repositories matching search patterns.',
     inputSchema: {
-      q: z.string().describe('Search keyword or pattern'),
-      limit: z.number().optional().default(5).describe('Max matches to display (default 5, max 50)')
+      q: z.string().describe('Target search string'),
+      limit: z.number().optional().default(5).describe('Maximum matching listings returning (max 50)')
     }
   }, async ({ q, limit }) => {
     try {
       const targetLimit = Math.min(limit, 50);
       const res = await octokitClient.repos.listForAuthenticatedUser({ per_page: 100 });
       const lowerQ = q.toLowerCase();
-      
       let matched = res.data.filter(r => 
         r.name.toLowerCase().includes(lowerQ) || r.full_name.toLowerCase().includes(lowerQ)
       ).slice(0, targetLimit);
-
       if (matched.length === 0) {
         const globalRes = await octokitClient.search.repos({ q: `${q} in:name`, per_page: targetLimit });
         matched = globalRes.data.items as any[];
       }
-
       if (matched.length === 0) {
         return formatSuccess('No matching repositories found.');
       }
-
       const formatted = matched.map(r => 
         `- ${r.full_name} [${r.default_branch}]${r.private ? ' (private)' : ''}`
       ).join('\n');
-
       return formatSuccess(formatted);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Gets branches inside specified repositories
   server.registerTool('list_branches', {
-    description: 'List branches with abbreviated and full commit SHAs. Optimized summary.',
+    description: 'List branches of a repository.',
     inputSchema: {
       owner: z.string(),
       repo: z.string(),
-      limit: z.number().optional().default(5).describe('Number of branches to fetch (default 5, max 50)'),
-      page: z.number().optional().default(1).describe('Page number for pagination')
+      limit: z.number().optional().default(5).describe('Branches result cap (max 50)'),
+      page: z.number().optional().default(1).describe('Pagination index offset')
     }
   }, async ({ owner, repo, limit, page }) => {
     try {
@@ -278,26 +432,26 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         per_page: targetLimit,
         page: page
       });
-      
       if (res.data.length === 0) {
         return formatSuccess('No branches found.');
       }
-
       const listWithShas = res.data.map(b => `${b.name}: ${b.commit.sha}`).join('\n');
-      const meta = `Page ${page}. Showing ${res.data.length} branches. Query next page for more.`;
-      
+      const meta = `Page ${page}. Showing ${res.data.length} branches.`;
       return formatSuccess(`${meta}\n\n${listWithShas}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Locate matching files using fast GitHub indexing queries
   server.registerTool('search_code', {
-    description: 'Search for code patterns across repositories. Returns highly condensed context chunks.',
+    description: 'Find files matching search criteria across codebases using GitHub indexes.',
     inputSchema: {
-      q: z.string().describe('Search query keyword or code pattern'),
-      owner: z.string().optional().describe('Optional repository owner to restrict search scope'),
-      repo: z.string().optional().describe('Optional repository name to restrict search scope'),
-      limit: z.number().optional().default(3).describe('Max code match files to return (default 3, max 20)'),
-      fragmentLines: z.number().optional().default(8).describe('Number of lines of matching context fragment to display (default 8, max 50)')
+      q: z.string().describe('Search query pattern'),
+      owner: z.string().optional().describe('Target code owner scope'),
+      repo: z.string().optional().describe('Target codebase scope'),
+      limit: z.number().optional().default(3).describe('Maximum files (max 20)'),
+      fragmentLines: z.number().optional().default(3).describe('Context lines displaying (max 10)')
     }
   }, async ({ q, owner, repo, limit, fragmentLines }) => {
     try {
@@ -306,7 +460,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         query += ` repo:${owner}/${repo}`;
       }
       const targetLimit = Math.min(limit, 20);
-      const targetFragmentLines = Math.min(fragmentLines, 50);
+      const targetFragmentLines = Math.min(fragmentLines, 10);
       const res = await octokitClient.search.code({
         q: query,
         per_page: targetLimit,
@@ -314,11 +468,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
           accept: 'application/vnd.github.v3.text-match+json'
         }
       });
-      
       if (!res.data.items || res.data.items.length === 0) {
         return formatSuccess('No code matches found.');
       }
-
       const results = res.data.items.map(item => {
         let text = `File: ${item.repository.full_name}:${item.path}\n`;
         const matches = (item as any).text_matches;
@@ -326,31 +478,145 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
           const match = matches[0];
           const fragmented = match.fragment.split('\n');
           const slicedFragment = fragmented.slice(0, targetFragmentLines).join('\n');
-          text += `Match Context (showing first ${targetFragmentLines} lines):\n${slicedFragment}\n`;
+          text += `Match Segment:\n${slicedFragment}\n`;
           if (fragmented.length > targetFragmentLines) {
             text += `... (+${fragmented.length - targetFragmentLines} lines omitted)\n`;
           }
         } else {
-          text += `(No fragment match details returned; file exists)\n`;
+          text += `(File matched search query criteria)\n`;
         }
         return text;
       }).join('\n---\n\n');
-      
       return formatSuccess(results);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
-  server.registerTool('grep_file', {
-    description: 'Search for a keyword or regex within a specific file to find matching lines and surrounding code context.',
+  // Ripgrep-style content pattern search with dynamic context tracking
+  server.registerTool('grep', {
+    description: 'High-performance content search mimicking ripgrep. Finds lines matching patterns inside the codebase with configurable context boundaries.',
     inputSchema: {
       owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
-      path: z.string().describe('Path to the file'),
-      query: z.string().describe('Keyword or text to search for'),
-      ref: z.string().default('main').describe('Git branch, tag, or commit SHA'),
-      limit: z.number().optional().default(15).describe('Maximum matching lines to return (default 15, max 100)'),
-      offset: z.number().optional().default(0).describe('Starting match index for pagination'),
-      contextLines: z.number().optional().default(0).describe('Number of surrounding context lines to show before and after each match (default 0, max 5).')
+      pattern: z.string().describe('Regex or string sequence to look for.'),
+      path: z.string().optional().describe('Optional directory/file scope limit within the repository.'),
+      glob: z.string().optional().describe('Glob pattern filter (e.g. "*.ts", "**/*.tsx").'),
+      type: z.string().optional().describe('File type filter extension (e.g. "py", "rs", "ts").'),
+      output_mode: z.enum(['content', 'files_with_matches', 'count']).default('files_with_matches').describe('Result layout: "files_with_matches" returns paths only, "content" shows matched lines, "count" aggregates statistics.'),
+      case_insensitive: z.boolean().optional().default(true).describe('Case-insensitive match execution.'),
+      show_line_numbers: z.boolean().optional().default(true).describe('Prefix lines with line offsets.'),
+      context_before: z.number().optional().default(2).describe('Reference lines before each match (default 2, min 0, max 10).'),
+      context_after: z.number().optional().default(2).describe('Reference lines after each match (default 2, min 0, max 10).'),
+      ref: z.string().optional().default('main').describe('Git tree reference.'),
+      limit: z.number().optional().default(10).describe('Max candidate files to download and evaluate (default 10, min 1, max 30).')
+    }
+  }, async ({ owner, repo, pattern, path, glob, type, output_mode, case_insensitive, show_line_numbers, context_before, context_after, ref, limit }) => {
+    try {
+      const maxFilesToProcess = Math.min(limit || 10, 30);
+      const beforeCount = Math.min(Math.max(0, context_before ?? 2), 10);
+      const afterCount = Math.min(Math.max(0, context_after ?? 2), 10);
+      
+      let query = pattern;
+      query += ` repo:${owner}/${repo}`;
+      if (path) {
+        query += ` path:${path}`;
+      }
+      if (type) {
+        query += ` extension:${type}`;
+      }
+      const searchRes = await octokitClient.search.code({
+        q: query,
+        per_page: maxFilesToProcess
+      });
+      let items = searchRes.data.items || [];
+      if (glob) {
+        const globLower = glob.toLowerCase().replace(/\*/g, '');
+        items = items.filter(item => item.path.toLowerCase().includes(globLower));
+      }
+      if (items.length === 0) {
+        return formatSuccess('No matching code files found.');
+      }
+      if (output_mode === 'files_with_matches') {
+        const fileList = items.map(item => `- ${item.path}`).join('\n');
+        return formatSuccess(`Matching files (limit: ${maxFilesToProcess}):\n\n${fileList}`);
+      }
+      const results: string[] = [];
+      const filesToProcess = items.slice(0, maxFilesToProcess);
+      for (const item of filesToProcess) {
+        try {
+          const fileContentRes = await octokitClient.repos.getContent({
+            owner,
+            repo,
+            path: item.path,
+            ref
+          });
+          if ('content' in fileContentRes.data && typeof fileContentRes.data.content === 'string') {
+            const rawContent = Buffer.from(fileContentRes.data.content, 'base64').toString('utf-8');
+            const lines = rawContent.split('\n');
+            const matchedLinesInfo: { idx: number; line: string }[] = [];
+            const isLineMatch = (lineText: string): boolean => {
+              try {
+                const regexFlags = case_insensitive ? 'i' : '';
+                const rx = new RegExp(pattern, regexFlags);
+                return rx.test(lineText);
+              } catch {
+                const lowerPattern = pattern.toLowerCase();
+                const lowerLine = lineText.toLowerCase();
+                return case_insensitive ? lowerLine.includes(lowerPattern) : lineText.includes(pattern);
+              }
+            };
+            lines.forEach((lineText, idx) => {
+              if (isLineMatch(lineText)) {
+                matchedLinesInfo.push({ idx, line: lineText });
+              }
+            });
+            if (matchedLinesInfo.length > 0) {
+              if (output_mode === 'count') {
+                results.push(`File: ${item.path} - ${matchedLinesInfo.length} matches`);
+              } else {
+                let fileOut = `File: ${item.path}\n`;
+                const processedLines = new Set<number>();
+                matchedLinesInfo.forEach(({ idx }) => {
+                  const startIdx = Math.max(0, idx - beforeCount);
+                  const endIdx = Math.min(lines.length - 1, idx + afterCount);
+                  for (let i = startIdx; i <= endIdx; i++) {
+                    if (processedLines.has(i)) {
+                      continue;
+                    }
+                    processedLines.add(i);
+                    const prefix = i === idx ? '>> ' : '   ';
+                    const numPrefix = show_line_numbers ? `L${i + 1} | ` : '';
+                    fileOut += `${prefix}${numPrefix}${lines[i]}\n`;
+                  }
+                });
+                results.push(fileOut.trimEnd());
+              }
+            }
+          }
+        } catch {}
+      }
+      if (results.length === 0) {
+        return formatSuccess('No matched patterns found inside the matching files.');
+      }
+      return formatSuccess(results.join('\n\n=========================================\n\n'));
+    } catch (err) {
+      return handleGitHubError(err);
+    }
+  });
+
+  // Legacy grep wrapper mapped to single file targets for backward compatibility
+  server.registerTool('grep_file', {
+    description: 'Legacy search inside a single file path. Prefer using grep for robust recursive scopes.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      path: z.string().describe('Target file path'),
+      query: z.string().describe('Pattern to search for'),
+      ref: z.string().default('main').describe('Active reference commit ref'),
+      limit: z.number().optional().default(10).describe('Max results (max 50)'),
+      offset: z.number().optional().default(0).describe('Pagination index offset'),
+      contextLines: z.number().optional().default(1).describe('Reference lines around match (max 3)')
     }
   }, async ({ owner, repo, path, query, ref, limit, offset, contextLines }) => {
     try {
@@ -358,11 +624,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       if ('content' in res.data && typeof res.data.content === 'string') {
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
         const lines = raw.split('\n');
-        
         const matchedIndices: number[] = [];
-        const targetLimit = Math.min(limit, 100);
-        const targetContext = Math.min(contextLines, 5);
-        
+        const targetLimit = Math.min(limit, 50);
+        const targetContext = Math.min(contextLines, 3);
         const testMatch = (line: string): boolean => {
           try {
             const regex = new RegExp(query, 'i');
@@ -371,20 +635,16 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
             return line.toLowerCase().includes(query.toLowerCase());
           }
         };
-
         lines.forEach((line, index) => {
           if (testMatch(line)) {
             matchedIndices.push(index);
           }
         });
-        
         if (matchedIndices.length === 0) {
           return formatSuccess('No matching lines found.');
         }
-        
         const total = matchedIndices.length;
         const slicedIndices = matchedIndices.slice(offset, offset + targetLimit);
-        
         const matchOutputs: string[] = [];
         slicedIndices.forEach((matchIdx) => {
           if (targetContext === 0) {
@@ -395,33 +655,34 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
             let block = `--- Match at Line ${matchIdx + 1} ---\n`;
             for (let i = contextStart; i <= contextEnd; i++) {
               const prefix = i === matchIdx ? '>> ' : '   ';
-              block += `${prefix}L${i + 1}: ${lines[i].trim().slice(0, 150)}\n`;
+              block += `${prefix}L${i + 1} | ${lines[i].trim().slice(0, 150)}\n`;
             }
             matchOutputs.push(block.trimEnd());
           }
         });
-        
         let out = matchOutputs.join(targetContext === 0 ? '\n' : '\n\n');
-        let meta = `Showing matches ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total} total matching lines.`;
+        let meta = `Matches ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total}.`;
         if (total > offset + targetLimit) {
-          meta += ` Re-run tool with offset: ${offset + targetLimit} for next batch.`;
+          meta += ` Re-run with offset: ${offset + targetLimit} for next batch.`;
         }
-        
         return formatSuccess(`${meta}\n\n${out}`);
       }
       return formatSuccess('Not a file');
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Pull recursive repository tree details
   server.registerTool('get_tree', {
-    description: 'Get file tree. Slices tree listings with control options for paging size.',
+    description: 'Retrieve file path paths tree index recursively.',
     inputSchema: {
-      owner: z.string().describe('Repository owner/organization'),
+      owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
-      tree_sha: z.string().default('main').describe('Git branch, tag, or commit SHA'),
-      offset: z.number().optional().default(0).describe('Index offset for paginating deep trees (increments of limit)'),
-      limit: z.number().optional().default(50).describe('Max items to show in single response (default 50, max 200)'),
-      q: z.string().optional().describe('Search keyword to filter files by path/name')
+      tree_sha: z.string().default('main').describe('Branch, tag, or commit SHA'),
+      offset: z.number().optional().default(0).describe('Pagination offset index'),
+      limit: z.number().optional().default(50).describe('Maximum items displaying in index output (max 200)'),
+      q: z.string().optional().describe('Keyword folder structure match filter')
     }
   }, async ({ owner, repo, tree_sha, offset, limit, q }) => {
     try {
@@ -433,76 +694,155 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       }
       const total = tree.length;
       const targetLimit = Math.min(limit, 200);
-      
       const items = tree.slice(offset, offset + targetLimit).map(t => 
         `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`
       );
-      
       let out = items.join('\n');
-      let meta = `Showing items ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total} total items.`;
+      let meta = `Showing items ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total} paths.`;
       if (total > offset + targetLimit) {
-        meta += ` Re-run tool with offset: ${offset + targetLimit} for more.`;
+        meta += ` Re-run with offset: ${offset + targetLimit} for more.`;
       }
-      return formatSuccess(`${meta}\n\n${out || 'No files matches found.'}`);
-    } catch (err) { return formatError(err); }
+      return formatSuccess(`${meta}\n\n${out || 'No paths located matching folder filter.'}`);
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Read file segments mapping line numbers prefixing by default
   server.registerTool('get_contents', {
-    description: 'Read file contents inside a controlled safe window (default 300 lines, maximum 750 lines). Use startLine and limit or endLine to control segment size.',
+    description: 'Read file lines. Automatically attaches line number prefixes for precision targeting.',
     inputSchema: {
-      owner: z.string().describe('Repository owner/organization'),
+      owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
-      path: z.string().describe('Path to the file'),
-      ref: z.string().default('main').describe('Git branch, tag, or commit SHA'),
-      startLine: z.number().optional().default(1).describe('First line to read (1-based, inclusive)'),
-      limit: z.number().optional().default(300).describe('Number of lines to return (default 300, max 750)'),
-      endLine: z.number().optional().describe('Last line to read (inclusive). If specified, overrides the limit up to a max window of 750 lines.')
+      path: z.string().describe('File path'),
+      ref: z.string().default('main').describe('Commit, branch or tag ref'),
+      startLine: z.number().optional().default(1).describe('Starting coordinate (1-based index)'),
+      limit: z.number().optional().default(100).describe('Lines displaying (default 100, max 500)'),
+      endLine: z.number().optional().describe('Ending coordinate. Overrides limit bounds up to 500 lines.')
     }
   }, async ({ owner, repo, path, ref, startLine, limit, endLine }) => {
     try {
       const res = await octokitClient.repos.getContent({ owner, repo, path, ref });
       if ('content' in res.data && typeof res.data.content === 'string') {
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
-        let lines = raw.split('\n');
+        const lines = raw.split('\n');
         const total = lines.length;
-        
         let start = Math.max(1, startLine);
-        let targetLimit = Math.min(Math.max(1, limit), 750);
-        
+        let targetLimit = Math.min(Math.max(1, limit), 500);
         if (endLine) {
           const calculatedLimit = endLine - start + 1;
           if (calculatedLimit > 0) {
-            targetLimit = Math.min(calculatedLimit, 750);
+            targetLimit = Math.min(calculatedLimit, 500);
           }
         }
-        
         let end = Math.min(total, start + targetLimit - 1);
-        
         if (start > total) {
-          return formatError(new Error(`Invalid startLine: ${startLine}. Total lines in file: ${total}`));
+          return formatError(new Error(`startLine ${startLine} is larger than file length ${total}`));
         }
-        
-        let truncated = false;
-        if (total > end) {
-          truncated = true;
-        }
-        
         const windowLines = lines.slice(start - 1, end);
-        let out = windowLines.join('\n');
-        
-        let meta = `Displaying lines ${start}-${end} of ${total} total lines.`;
-        if (truncated) {
-          meta += ` File is truncated. Call again with startLine: ${end + 1} to view subsequent segments.`;
+        const out = windowLines.map((line, idx) => {
+          const lineNum = start + idx;
+          return `${lineNum.toString().padStart(5, ' ')} | ${line}`;
+        }).join('\n');
+        let meta = `Lines ${start}-${end} of ${total} total lines.`;
+        if (total > end) {
+          meta += ` File truncated. Fetch again with startLine: ${end + 1} to view subsequent segments.`;
         }
-        
         return formatSuccess(`[METADATA: ${meta}]\n\n${out}`);
       }
       return formatSuccess('Not a file');
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Pull high-level file declarations without loading entire code segments
+  server.registerTool('view_file_outline', {
+    description: 'Pull high-level symbol structures, structures, or definitions without loading raw contents.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      path: z.string().describe('File path'),
+      ref: z.string().default('main').describe('Target Git ref context')
+    }
+  }, async ({ owner, repo, path, ref }) => {
+    try {
+      const res = await octokitClient.repos.getContent({ owner, repo, path, ref });
+      if ('content' in res.data && typeof res.data.content === 'string') {
+        const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
+        const outline = extractFileOutline(raw, path);
+        return formatSuccess(`--- FILE STRUCTURE OUTLINE: ${path} (${ref}) ---\n\n${outline}`);
+      }
+      return formatSuccess('Not a text file.');
+    } catch (err) {
+      return handleGitHubError(err);
+    }
+  });
+
+  // Surgical replacement editor resolving line differences dynamically
+  server.registerTool('str_replace_editor', {
+    description: 'Surgically search and replace a unique code block (old_str) with new code (new_str). Safe-checks uniqueness.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      path: z.string().describe('File path'),
+      branch: z.string().describe('Active git branch reference'),
+      old_str: z.string().describe('Exact sequence of code lines to replace. Spacing/tabs must match exactly.'),
+      new_str: z.string().describe('Replacement sequence block.'),
+      message: z.string().describe('Commit message.'),
+      sha: z.string().optional().describe('Git object SHA. Automatically fetched if omitted.')
+    }
+  }, async ({ owner, repo, path, branch, old_str, new_str, message, sha }) => {
+    try {
+      const fileData = await octokitClient.repos.getContent({ owner, repo, path, ref: branch });
+      if (Array.isArray(fileData.data) || !('content' in fileData.data)) {
+        throw new Error('Target is not a file.');
+      }
+      const rawContent = Buffer.from(fileData.data.content, 'base64').toString('utf-8');
+      const targetSha = sha || fileData.data.sha;
+      const normalizedContent = rawContent.replace(/\r\n/g, '\n');
+      const normalizedOld = old_str.replace(/\r\n/g, '\n');
+      const normalizedNew = new_str.replace(/\r\n/g, '\n');
+      const occurrences = normalizedContent.split(normalizedOld).length - 1;
+      if (occurrences === 0) {
+        const feedback = getBestMatchFeedback(normalizedContent, normalizedOld);
+        throw new Error(feedback);
+      }
+      if (occurrences > 1) {
+        const occLineNumbers: number[] = [];
+        const lines = normalizedContent.split('\n');
+        const oldLines = normalizedOld.split('\n');
+        for (let i = 0; i <= lines.length - oldLines.length; i++) {
+          const chunk = lines.slice(i, i + oldLines.length).join('\n');
+          if (chunk === normalizedOld) {
+            occLineNumbers.push(i + 1);
+          }
+        }
+        throw new Error(`The old_str block was found ${occurrences} times at starting lines: ${occLineNumbers.join(', ')}. Expand context limits in old_str to isolate targets.`);
+      }
+      const updatedContentNormalized = normalizedContent.replace(normalizedOld, normalizedNew);
+      const hasCrLf = rawContent.includes('\r\n');
+      const finalContent = hasCrLf 
+        ? updatedContentNormalized.replace(/\n/g, '\r\n') 
+        : updatedContentNormalized;
+      const res = await octokitClient.repos.createOrUpdateFileContents({
+        owner,
+        repo,
+        path,
+        message,
+        content: Buffer.from(finalContent, 'utf-8').toString('base64'),
+        branch,
+        sha: targetSha
+      });
+      return formatSuccess(`Surgical replacement successful. Commit: ${res.data.commit.sha}`);
+    } catch (err) {
+      return handleGitHubError(err);
+    }
+  });
+
+  // Create new files or fully write small files
   server.registerTool('put_contents', {
-    description: 'Write/overwrite file',
+    description: 'Completely write or overwrite file contents. Best used to generate NEW files. For updates, prefer using str_replace_editor.',
     inputSchema: {
       owner: z.string(),
       repo: z.string(),
@@ -518,11 +858,14 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         owner, repo, path, message, content: Buffer.from(content, 'utf-8').toString('base64'), branch, sha
       });
       return formatSuccess(`Success: ${res.data.commit.sha}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Replace specified line ranges directly
   server.registerTool('patch_contents', {
-    description: 'Replace line range',
+    description: 'Replace specified line indices directly. Prefer using str_replace_editor to prevent overlapping index changes.',
     inputSchema: {
       owner: z.string(),
       repo: z.string(),
@@ -539,18 +882,21 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       if (Array.isArray(fileData.data) || !('content' in fileData.data)) throw new Error('Not a file');
       const lines = Buffer.from(fileData.data.content, 'base64').toString('utf-8').split('\n');
       if (startLine < 1 || endLine < startLine || endLine > lines.length) {
-        throw new Error(`Invalid range. Lines: ${lines.length}`);
+        throw new Error(`Invalid line coordinates. Target boundary has ${lines.length} lines.`);
       }
       lines.splice(startLine - 1, endLine - startLine + 1, ...newContent.split('\n'));
       const res = await octokitClient.repos.createOrUpdateFileContents({
         owner, repo, path, message, content: Buffer.from(lines.join('\n'), 'utf-8').toString('base64'), branch, sha: fileData.data.sha
       });
       return formatSuccess(`Success: ${res.data.commit.sha}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Delete files from branches
   server.registerTool('delete_contents', {
-    description: 'Delete file',
+    description: 'Delete files from repository branches.',
     inputSchema: {
       owner: z.string(), repo: z.string(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string()
     }
@@ -558,11 +904,14 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     try {
       await octokitClient.repos.deleteFile({ owner, repo, path, message, sha, branch });
       return formatSuccess(`Deleted ${path}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Create workspace branches
   server.registerTool('create_ref', {
-    description: 'Create branch',
+    description: 'Create repository branches.',
     inputSchema: {
       owner: z.string(), repo: z.string(), branch: z.string(), refSha: z.string()
     }
@@ -570,11 +919,14 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     try {
       await octokitClient.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: refSha });
       return formatSuccess(`Created branch ${branch}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Delete workspace branches
   server.registerTool('delete_ref', {
-    description: 'Delete branch',
+    description: 'Delete branches from repositories.',
     inputSchema: {
       owner: z.string(), repo: z.string(), branch: z.string()
     }
@@ -582,11 +934,14 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     try {
       await octokitClient.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
       return formatSuccess(`Deleted branch ${branch}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Open Pull Request references
   server.registerTool('create_pull', {
-    description: 'Create PR',
+    description: 'Create pull requests between branches.',
     inputSchema: {
       owner: z.string(), repo: z.string(), title: z.string(), body: z.string().optional(), head: z.string(), base: z.string().default('main')
     }
@@ -594,59 +949,67 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     try {
       const res = await octokitClient.pulls.create({ owner, repo, title, body, head, base });
       return formatSuccess(`PR #${res.data.number} opened: ${res.data.html_url}`);
-    } catch (err) { return formatError(err); }
+    } catch (err) {
+      return handleGitHubError(err);
+    }
   });
 
+  // Fetch Render workspaces auto-defaulting single selections
   server.registerTool('list_workspaces', {
-    description: 'List accessible workspaces. Hyper-condensed output.',
+    description: 'List active workspaces. Auto-detects single user workspaces to bypass selection processes.',
     inputSchema: {}
   }, async (args) => {
     const rawResult = await callRenderTool('list_workspaces', args, renderToken);
     const parsed = extractJsonResult(rawResult);
     if (!parsed) return rawResult;
-
     try {
-      let workspaces = Array.isArray(parsed) ? parsed : (parsed.workspaces || []);
+      const workspaces = Array.isArray(parsed) ? parsed : (parsed.workspaces || []);
       const simplified = workspaces.map((w: any) => ({
         id: w.id || w.workspace?.id,
         name: w.name || w.workspace?.name,
         personal: w.personal || w.workspace?.personal
       }));
-      return formatSuccess({ workspaces: simplified });
+      let autoSelectNote = "";
+      if (simplified.length === 1) {
+        autoSelectNote = `\n[AUTO-DEFAULT: Single active workspace isolated with OwnerID: ${simplified[0].id}]`;
+      }
+      return formatSuccess({ workspaces: simplified, meta: autoSelectNote.trim() });
     } catch {
       return rawResult;
     }
   });
 
+  // Selection mapping configurations
   server.registerTool('select_workspace', {
-    description: 'Select a workspace to use.',
+    description: 'Set target active workspace ID.',
     inputSchema: {
-      ownerID: z.string().describe('The ID of the workspace to use (starts with tea- or own-).')
+      ownerID: z.string().describe('Target owner ID starts with tea- or own-.')
     }
   }, async (args) => {
     return callRenderTool('select_workspace', args, renderToken);
   });
 
+  // Fetch target active workspace setup details
   server.registerTool('get_selected_workspace', {
-    description: 'Get the currently selected workspace.',
+    description: 'Get details for selected workspace.',
     inputSchema: {}
   }, async (args) => {
     return callRenderTool('get_selected_workspace', args, renderToken);
   });
 
+  // Render services index with advanced substring filtering and default selectors
   server.registerTool('list_services', {
-    description: 'List, search, and paginate through Render services. Supports regex and substring searches matching names or connected repository URLs.',
+    description: 'Query active services. Isolate results by query parameter to bypass retrieving complete listings.',
     inputSchema: {
-      q: z.string().optional().describe('Filter/search query. Supports case-insensitive substring or regex (e.g. "grumm" or "^web-"). Matches service name, id, type, or connected repository URL.'),
-      limit: z.number().optional().default(3).describe('Number of items to return in this batch (default 3, max 50)'),
-      offset: z.number().optional().default(0).describe('Zero-based offset for pagination'),
+      q: z.string().optional().describe('Substring filters service name, ID, type, or repository URL to isolate targets.'),
+      limit: z.number().optional().default(5).describe('Pagination index offset limit (max 50)'),
+      offset: z.number().optional().default(0).describe('Pagination page offset index'),
       includePreviews: z.boolean().optional().default(false)
     }
   }, async ({ q, limit, offset, includePreviews }) => {
     const rawResult = await callRenderTool('list_services', { includePreviews }, renderToken);
     const parsed = extractJsonResult(rawResult);
     if (!parsed) return rawResult;
-
     try {
       let services = Array.isArray(parsed) ? parsed : [];
       if (!Array.isArray(services) && typeof parsed === 'object') {
@@ -657,63 +1020,41 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
           }
         }
       }
-
-      // Filter locally with regex or simple substring fallback
       if (q) {
-        let regex: RegExp | null = null;
-        try {
-          regex = new RegExp(q, 'i');
-        } catch {
-          // Fallback to substring match if q is not a compilable regex pattern
-        }
-
+        const lowerQ = q.toLowerCase();
         services = services.filter((s: any) => {
-          const name = s.name || s.service?.name || '';
-          const id = s.id || s.service?.id || '';
-          const type = s.type || s.service?.type || '';
-          const repo = s.repo || s.service?.repo || s.service?.repoDetails?.url || '';
-
-          if (regex) {
-            return regex.test(name) || regex.test(id) || regex.test(type) || regex.test(repo);
-          } else {
-            const lowerQ = q.toLowerCase();
-            return name.toLowerCase().includes(lowerQ) ||
-                   id.toLowerCase().includes(lowerQ) ||
-                   type.toLowerCase().includes(lowerQ) ||
-                   repo.toLowerCase().includes(lowerQ);
-          }
+          const name = (s.name || s.service?.name || '').toLowerCase();
+          const id = (s.id || s.service?.id || '').toLowerCase();
+          const type = (s.type || s.service?.type || '').toLowerCase();
+          const repo = (s.repo || s.service?.repo || s.service?.repoDetails?.url || '').toLowerCase();
+          return name.includes(lowerQ) || id.includes(lowerQ) || type.includes(lowerQ) || repo.includes(lowerQ);
         });
       }
-
       const totalMatched = services.length;
       const targetLimit = Math.min(limit, 50);
       const paginated = services.slice(offset, offset + targetLimit);
-
       const simplified = paginated.map((s: any) => ({
         id: s.id || s.service?.id,
         name: s.name || s.service?.name,
         type: s.type || s.service?.type,
         state: s.state || s.service?.state,
-        updatedAt: s.updatedAt || s.service?.updatedAt,
         repo: s.repo || s.service?.repo || s.service?.repoDetails?.url
       }));
-
-      let message = `Displaying ${paginated.length} of ${totalMatched} matched services.`;
-      if (totalMatched > offset + targetLimit) {
-        message += ` Re-run tool with offset: ${offset + targetLimit} to retrieve the next batch.`;
+      let meta = `Matched ${paginated.length} of ${totalMatched} services.`;
+      if (totalMatched === 1) {
+        meta += ` [AUTO-DEFAULT: Single target service isolated. ID: ${simplified[0].id}]`;
+      } else if (totalMatched > offset + targetLimit) {
+        meta += ` Re-run with offset: ${offset + targetLimit} for next batch.`;
       }
-
-      return formatSuccess({
-        meta: message,
-        services: simplified
-      });
+      return formatSuccess({ meta, services: simplified });
     } catch (err: any) {
-      return formatError(new Error(`Failed to filter/paginate services: ${err.message}`));
+      return formatError(new Error(`Failed to query services: ${err.message}`));
     }
   });
 
+  // Get details of specified service profiles
   server.registerTool('get_service', {
-    description: 'Get details about a specific service.',
+    description: 'Get configuration detail metrics of specified services.',
     inputSchema: {
       serviceId: z.string()
     }
@@ -721,19 +1062,19 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     return callRenderTool('get_service', args, renderToken);
   });
 
+  // Retrieve deployments history auto-detecting single items
   server.registerTool('list_deploys', {
-    description: 'List deploy history. Highly simplified metadata and paginated to save context limits.',
+    description: 'List deployments histories.',
     inputSchema: {
       serviceId: z.string(),
-      limit: z.number().optional().default(3).describe('Number of deployments to display (default 3, max 50)'),
-      offset: z.number().optional().default(0).describe('Pagination offset')
+      limit: z.number().optional().default(3).describe('Deployments history log limit (max 20)'),
+      offset: z.number().optional().default(0).describe('Pagination page offset index')
     }
   }, async ({ serviceId, limit, offset }) => {
-    const targetLimit = Math.min(limit, 50);
-    const rawResult = await callRenderTool('list_deploys', { serviceId, limit: Math.max(offset + targetLimit, 20) }, renderToken);
+    const targetLimit = Math.min(limit, 20);
+    const rawResult = await callRenderTool('list_deploys', { serviceId, limit: offset + targetLimit }, renderToken);
     const parsed = extractJsonResult(rawResult);
     if (!parsed) return rawResult;
-
     try {
       let deploys = Array.isArray(parsed) ? parsed : [];
       if (!Array.isArray(deploys) && typeof parsed === 'object') {
@@ -744,31 +1085,27 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
           }
         }
       }
-
       const total = deploys.length;
       const paginated = deploys.slice(offset, offset + targetLimit);
-
       const simplified = paginated.map((d: any) => ({
         id: d.id || d.deploy?.id,
         status: d.status || d.deploy?.status,
         commitMessage: d.commit?.message || d.deploy?.commit?.message || 'N/A',
-        createdAt: d.createdAt || d.deploy?.createdAt,
-        finishedAt: d.finishedAt || d.deploy?.finishedAt
+        createdAt: d.createdAt || d.deploy?.createdAt
       }));
-
-      let meta = `Showing deployments ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total}.`;
-      if (total > offset + targetLimit) {
-        meta += ` For next batch, re-run with offset: ${offset + targetLimit}.`;
+      let meta = `Deployments ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total}.`;
+      if (total === 1) {
+        meta += ` [AUTO-DEFAULT: Only deployment found. ID: ${simplified[0].id}]`;
       }
-
       return formatSuccess({ meta, deploys: simplified });
     } catch (err: any) {
-      return formatError(new Error(`Failed to parse deployments: ${err.message}`));
+      return formatError(new Error(`Failed to query deployments: ${err.message}`));
     }
   });
 
+  // Get details of specific deployments
   server.registerTool('get_deploy', {
-    description: 'Get deployment details.',
+    description: 'Get configuration layout details of specified deployments.',
     inputSchema: {
       serviceId: z.string(),
       deployId: z.string()
@@ -777,25 +1114,24 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     return callRenderTool('get_deploy', args, renderToken);
   });
 
+  // Get active console log outputs trimming parameters to protect token bounds
   server.registerTool('list_logs', {
-    description: 'Get service logs. Slices long messages to protect token efficiency.',
+    description: 'Get console and service logs.',
     inputSchema: {
-      resource: z.array(z.string()).describe('Filter logs by their resource (array of strings, e.g. ["srv-xxxx"])'),
-      level: z.array(z.string()).optional().describe('Filter logs by severity level'),
-      type: z.array(z.string()).optional().describe('Filter logs by type'),
-      instance: z.array(z.string()).optional().describe('Filter logs by instance'),
-      host: z.array(z.string()).optional().describe('Filter request logs by host'),
-      limit: z.number().optional().default(15).describe('Maximum number of log lines to return (default 15, max 250)')
+      resource: z.array(z.string()).describe('Array of resource IDs like srv-xxxx'),
+      level: z.array(z.string()).optional().describe('Log severity levels'),
+      type: z.array(z.string()).optional().describe('Log type classification'),
+      instance: z.array(z.string()).optional(),
+      host: z.array(z.string()).optional(),
+      limit: z.number().optional().default(15).describe('Log entries cap (max 250)')
     }
   }, async (args) => {
     const requestedLimit = args.limit || 15;
     const targetLimit = Math.min(requestedLimit, 250);
     const payload = { ...args, limit: targetLimit };
-
     const rawResult = await callRenderTool('list_logs', payload, renderToken);
     const parsed = extractJsonResult(rawResult);
     if (!parsed) return rawResult;
-
     try {
       if (Array.isArray(parsed)) {
         const sliced = parsed.slice(0, targetLimit);
@@ -807,10 +1143,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
             msg: (l.message || l.msg || JSON.stringify(l)).trim().slice(0, 180)
           };
         });
-
         let truncatedNote = '';
         if (parsed.length > targetLimit) {
-          truncatedNote = `\n... (truncated from ${parsed.length} items. Request larger limit if details are missing.)`;
+          truncatedNote = `\n... (truncated from ${parsed.length} lines)`;
         }
         return formatSuccess(JSON.stringify(simplified, null, 2) + truncatedNote);
       }
@@ -835,7 +1170,6 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     });
     return;
   }
-
   const clientApiKey = (req.headers['x-api-key'] as string)
     || req.headers['authorization']?.toString().replace('Bearer ', '')
     || (req.query.api_key as string);
@@ -848,12 +1182,10 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     });
     return;
   }
-
   const githubToken = (req.headers['x-github-token'] as string) || DEFAULT_GITHUB_PAT;
   const renderToken = (req.headers['x-render-token'] as string)
     || (req.headers['x-render-api-key'] as string)
     || DEFAULT_RENDER_API_KEY;
-
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
   if (sessionId && transports.has(sessionId)) {
@@ -888,7 +1220,6 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
 
   const octokit = new Octokit({ auth: githubToken || '' });
   const server = createMcpServer(octokit, renderToken);
-
   try {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -907,10 +1238,10 @@ app.get('/', (req: Request, res: Response) => {
   res.send('🚀 Stateless Unified MCP Server active.');
 });
 
-setInterval(() => {
+// Periodic session cleanup process
+const timer = setInterval(() => {
   const now = Date.now();
   const maxIdleTime = 15 * 60 * 1000;
-  
   for (const [id, entry] of transports.entries()) {
     if (now - entry.lastActive > maxIdleTime) {
       try {
@@ -921,16 +1252,23 @@ setInterval(() => {
       transports.delete(id);
     }
   }
-
   for (const [token, entry] of renderSessions.entries()) {
     if (now - entry.lastActive > maxIdleTime) {
       renderSessions.delete(token);
     }
   }
-}, 5 * 60 * 1000).unref();
+}, 5 * 60 * 1000);
+timer.unref();
 
-process.on('unhandledRejection', () => {});
-process.on('uncaughtException', () => {});
+// Intercept process exits to prevent timers from lingering in runtimes
+process.on('SIGINT', () => {
+  clearInterval(timer);
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  clearInterval(timer);
+  process.exit(0);
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
