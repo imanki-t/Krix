@@ -495,34 +495,119 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Ripgrep-style content pattern search with dynamic context tracking
+  // Perform pattern search across directories or within a single file
   server.registerTool('grep', {
-    description: 'High-performance content search mimicking ripgrep. Finds lines matching patterns inside the codebase with configurable context boundaries.',
+    description: 'High-performance pattern search. If a direct file path is specified, it will scan the file directly to bypass search indexing delays. Otherwise, scans recursively.',
     inputSchema: {
       owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
       pattern: z.string().describe('Regex or string sequence to look for.'),
-      path: z.string().optional().describe('Optional directory/file scope limit within the repository.'),
-      glob: z.string().optional().describe('Glob pattern filter (e.g. "*.ts", "**/*.tsx").'),
-      type: z.string().optional().describe('File type filter extension (e.g. "py", "rs", "ts").'),
-      output_mode: z.enum(['content', 'files_with_matches', 'count']).default('files_with_matches').describe('Result layout: "files_with_matches" returns paths only, "content" shows matched lines, "count" aggregates statistics.'),
+      path: z.string().optional().describe('Optional file or directory scope limit. If a file is targeted, index searches are bypassed.'),
+      glob: z.string().optional().describe('Glob pattern filter (e.g. "*.ts", "**/*.tsx"). Only evaluated during recursive search.'),
+      type: z.string().optional().describe('File type filter extension (e.g. "py", "rs", "ts"). Only evaluated during recursive search.'),
+      output_mode: z.enum(['content', 'files_with_matches', 'count']).default('content').describe('Result format: "files_with_matches" returns paths, "content" returns matched lines, "count" returns counts.'),
       case_insensitive: z.boolean().optional().default(true).describe('Case-insensitive match execution.'),
       show_line_numbers: z.boolean().optional().default(true).describe('Prefix lines with line offsets.'),
-      context_before: z.number().optional().default(2).describe('Reference lines before each match (default 2, min 0, max 10).'),
-      context_after: z.number().optional().default(2).describe('Reference lines after each match (default 2, min 0, max 10).'),
+      context_before: z.number().optional().default(2).describe('Reference lines before each match (min 0, max 10).'),
+      context_after: z.number().optional().default(2).describe('Reference lines after each match (min 0, max 10).'),
       ref: z.string().optional().default('main').describe('Git tree reference.'),
-      limit: z.number().optional().default(10).describe('Max candidate files to download and evaluate (default 10, min 1, max 30).')
+      limit: z.number().optional().default(10).describe('Max files to download or max single-file matches to return (min 1, max 30).'),
+      offset: z.number().optional().default(0).describe('Pagination offset. Only evaluated during single-file scan results.')
     }
-  }, async ({ owner, repo, pattern, path, glob, type, output_mode, case_insensitive, show_line_numbers, context_before, context_after, ref, limit }) => {
+  }, async ({ owner, repo, pattern, path: targetPath, glob, type, output_mode, case_insensitive, show_line_numbers, context_before, context_after, ref, limit, offset }) => {
     try {
       const maxFilesToProcess = Math.min(limit || 10, 30);
       const beforeCount = Math.min(Math.max(0, context_before ?? 2), 10);
       const afterCount = Math.min(Math.max(0, context_after ?? 2), 10);
       
+      let isSingleFile = false;
+      let rawContent = '';
+      
+      // Attempt direct file retrieval if a specific target path is passed
+      if (targetPath) {
+        try {
+          const fileRes = await octokitClient.repos.getContent({
+            owner,
+            repo,
+            path: targetPath,
+            ref
+          });
+          if (fileRes.data && !Array.isArray(fileRes.data) && 'content' in fileRes.data) {
+            rawContent = Buffer.from(fileRes.data.content, 'base64').toString('utf-8');
+            isSingleFile = true;
+          }
+        } catch {
+          // If 404, we assume it is a directory path or not yet created, falling back to search API
+        }
+      }
+
+      const isLineMatch = (lineText: string): boolean => {
+        try {
+          const regexFlags = case_insensitive ? 'i' : '';
+          const rx = new RegExp(pattern, regexFlags);
+          return rx.test(lineText);
+        } catch {
+          const lowerPattern = pattern.toLowerCase();
+          const lowerLine = lineText.toLowerCase();
+          return case_insensitive ? lowerLine.includes(lowerPattern) : lineText.includes(pattern);
+        }
+      };
+
+      // Execute direct single file grep if single file was successfully retrieved
+      if (isSingleFile && targetPath) {
+        const lines = rawContent.split('\n');
+        const matchedIndices: number[] = [];
+        lines.forEach((lineText, idx) => {
+          if (isLineMatch(lineText)) {
+            matchedIndices.push(idx);
+          }
+        });
+
+        if (matchedIndices.length === 0) {
+          return formatSuccess('No matched patterns found inside the target file.');
+        }
+
+        if (output_mode === 'files_with_matches') {
+          return formatSuccess(`Matching target path:\n- ${targetPath}`);
+        }
+
+        if (output_mode === 'count') {
+          return formatSuccess(`File: ${targetPath} - ${matchedIndices.length} matches`);
+        }
+
+        const total = matchedIndices.length;
+        const slicedIndices = matchedIndices.slice(offset, offset + maxFilesToProcess);
+        const results: string[] = [];
+        let fileOut = `File: ${targetPath}\n`;
+        const processedLines = new Set<number>();
+
+        slicedIndices.forEach((matchIdx) => {
+          const startIdx = Math.max(0, matchIdx - beforeCount);
+          const endIdx = Math.min(lines.length - 1, matchIdx + afterCount);
+          for (let i = startIdx; i <= endIdx; i++) {
+            if (processedLines.has(i)) {
+              continue;
+            }
+            processedLines.add(i);
+            const prefix = i === matchIdx ? '>> ' : '   ';
+            const numPrefix = show_line_numbers ? `L${i + 1} | ` : '';
+            fileOut += `${prefix}${numPrefix}${lines[i]}\n`;
+          }
+        });
+
+        results.push(fileOut.trimEnd());
+        let meta = `Matches ${offset + 1}-${Math.min(offset + maxFilesToProcess, total)} of ${total} lines.`;
+        if (total > offset + maxFilesToProcess) {
+          meta += ` Re-run with offset: ${offset + maxFilesToProcess} to view subsequent segments.`;
+        }
+        return formatSuccess(`[METADATA: ${meta}]\n\n${results.join('\n')}`);
+      }
+
+      // Execute recursive search branch if no single file was targeted
       let query = pattern;
       query += ` repo:${owner}/${repo}`;
-      if (path) {
-        query += ` path:${path}`;
+      if (targetPath) {
+        query += ` path:${targetPath}`;
       }
       if (type) {
         query += ` extension:${type}`;
@@ -554,20 +639,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
             ref
           });
           if ('content' in fileContentRes.data && typeof fileContentRes.data.content === 'string') {
-            const rawContent = Buffer.from(fileContentRes.data.content, 'base64').toString('utf-8');
-            const lines = rawContent.split('\n');
+            const rawContentFile = Buffer.from(fileContentRes.data.content, 'base64').toString('utf-8');
+            const lines = rawContentFile.split('\n');
             const matchedLinesInfo: { idx: number; line: string }[] = [];
-            const isLineMatch = (lineText: string): boolean => {
-              try {
-                const regexFlags = case_insensitive ? 'i' : '';
-                const rx = new RegExp(pattern, regexFlags);
-                return rx.test(lineText);
-              } catch {
-                const lowerPattern = pattern.toLowerCase();
-                const lowerLine = lineText.toLowerCase();
-                return case_insensitive ? lowerLine.includes(lowerPattern) : lineText.includes(pattern);
-              }
-            };
             lines.forEach((lineText, idx) => {
               if (isLineMatch(lineText)) {
                 matchedLinesInfo.push({ idx, line: lineText });
@@ -602,74 +676,6 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         return formatSuccess('No matched patterns found inside the matching files.');
       }
       return formatSuccess(results.join('\n\n=========================================\n\n'));
-    } catch (err) {
-      return handleGitHubError(err);
-    }
-  });
-
-  // Legacy grep wrapper mapped to single file targets for backward compatibility
-  server.registerTool('grep_file', {
-    description: 'Legacy search inside a single file path. Prefer using grep for robust recursive scopes.',
-    inputSchema: {
-      owner: z.string().describe('Repository owner'),
-      repo: z.string().describe('Repository name'),
-      path: z.string().describe('Target file path'),
-      query: z.string().describe('Pattern to search for'),
-      ref: z.string().default('main').describe('Active reference commit ref'),
-      limit: z.number().optional().default(10).describe('Max results (max 50)'),
-      offset: z.number().optional().default(0).describe('Pagination index offset'),
-      contextLines: z.number().optional().default(1).describe('Reference lines around match (max 3)')
-    }
-  }, async ({ owner, repo, path, query, ref, limit, offset, contextLines }) => {
-    try {
-      const res = await octokitClient.repos.getContent({ owner, repo, path, ref });
-      if ('content' in res.data && typeof res.data.content === 'string') {
-        const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
-        const lines = raw.split('\n');
-        const matchedIndices: number[] = [];
-        const targetLimit = Math.min(limit, 50);
-        const targetContext = Math.min(contextLines, 3);
-        const testMatch = (line: string): boolean => {
-          try {
-            const regex = new RegExp(query, 'i');
-            return regex.test(line);
-          } catch {
-            return line.toLowerCase().includes(query.toLowerCase());
-          }
-        };
-        lines.forEach((line, index) => {
-          if (testMatch(line)) {
-            matchedIndices.push(index);
-          }
-        });
-        if (matchedIndices.length === 0) {
-          return formatSuccess('No matching lines found.');
-        }
-        const total = matchedIndices.length;
-        const slicedIndices = matchedIndices.slice(offset, offset + targetLimit);
-        const matchOutputs: string[] = [];
-        slicedIndices.forEach((matchIdx) => {
-          if (targetContext === 0) {
-            matchOutputs.push(`L${matchIdx + 1}: ${lines[matchIdx].trim().slice(0, 150)}`);
-          } else {
-            const contextStart = Math.max(0, matchIdx - targetContext);
-            const contextEnd = Math.min(lines.length - 1, matchIdx + targetContext);
-            let block = `--- Match at Line ${matchIdx + 1} ---\n`;
-            for (let i = contextStart; i <= contextEnd; i++) {
-              const prefix = i === matchIdx ? '>> ' : '   ';
-              block += `${prefix}L${i + 1} | ${lines[i].trim().slice(0, 150)}\n`;
-            }
-            matchOutputs.push(block.trimEnd());
-          }
-        });
-        let out = matchOutputs.join(targetContext === 0 ? '\n' : '\n\n');
-        let meta = `Matches ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total}.`;
-        if (total > offset + targetLimit) {
-          meta += ` Re-run with offset: ${offset + targetLimit} for next batch.`;
-        }
-        return formatSuccess(`${meta}\n\n${out}`);
-      }
-      return formatSuccess('Not a file');
     } catch (err) {
       return handleGitHubError(err);
     }
@@ -956,7 +962,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Synchronizes local files from the local workspace disk back to remote repositories [added tool]
+  // Synchronizes local files from the local workspace disk back to remote repositories
   server.registerTool('workspace_push', {
     description: 'Reads an edited file natively from the local sandbox disk and pushes it directly back to the specified remote GitHub repository branch, bypassing chat window rendering and context token expansion.',
     inputSchema: {
@@ -1009,7 +1015,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Streams a file from remote GitHub repository directly to the local sandbox [added tool]
+  // Streams a file from remote GitHub repository directly to the local sandbox
   server.registerTool('workspace_pull', {
     description: 'Stream a file from a remote GitHub repository directly into the local workspace container disk, enabling native local editing while minimizing prompt token usage.',
     inputSchema: {
