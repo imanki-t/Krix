@@ -1,20 +1,21 @@
 # Unified GitHub & Render MCP Gateway
 
-This repository contains a lightweight, single-port Model Context Protocol (MCP) server that merges local GitHub utility tools with a curated, token-efficient proxy to official Render developer actions. 
+This repository contains a lightweight, single-port Model Context Protocol (MCP) server that merges local GitHub utility tools with a curated, token-efficient proxy to official Render developer actions.
 
-By filtering down heavy JSON payloads locally and providing highly parameterized search, grep, and pagination limits, this gateway reduces startup overhead and conversational context consumption by up to 80% compared to a standard, unoptimized registration.
+By filtering down heavy JSON payloads locally and providing highly parameterized search, grep, and pagination limits, this gateway reduces startup overhead and conversational context consumption compared to a standard, unoptimized registration.
 
 ---
 
 ## Features
 
-### 1. GitHub Integration (14 Tools)
+### 1. GitHub Integration (16 Tools)
 *   **Repository Access:** `get_viewer`, `list_repos`, `search_repos`, `list_branches`
-*   **File Manipulation:** `get_tree`, `get_contents`, `put_contents`, `patch_contents`, `delete_contents`, `grep_file`
-*   **Git Control:** `create_ref`, `delete_ref`, `search_code`, `create_pull`
+*   **Code Discovery:** `search_code`, `grep`, `get_tree`, `view_file_outline`
+*   **File Manipulation:** `get_contents`, `str_replace_editor`, `put_contents`, `patch_contents`, `delete_contents`
+*   **Git Control:** `create_ref`, `delete_ref`, `create_pull`
 
 ### 2. Streamlined Render Integration (8 Tools)
-To prevent your chat limits from draining due to schema overhead and verbose responses, the following Render tools are registered:
+To prevent your chat limits from draining due to schema overhead and verbose responses, the following Render tools are registered as a proxy over the Render MCP server:
 *   `list_workspaces` — Lists available personal and team Render workspaces.
 *   `select_workspace` — Switches context to a specific workspace ID.
 *   `get_selected_workspace` — Identifies the active workspace configuration.
@@ -23,6 +24,8 @@ To prevent your chat limits from draining due to schema overhead and verbose res
 *   `list_deploys` — Retrieves deployment success/failure history.
 *   `get_deploy` — Gets exact details of a specific build phase.
 *   `list_logs` — Pulls application server logs with configurable search limits.
+
+24 tools total. Render sessions are established lazily against `https://mcp.render.com/mcp` and cached per API key, with automatic re-initialization on session expiry.
 
 ---
 
