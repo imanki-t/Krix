@@ -6,6 +6,7 @@ import { z } from 'zod';
 import dotenv from 'dotenv';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import vm from 'node:vm';
 
 dotenv.config();
 
@@ -129,6 +130,42 @@ function getBestMatchFeedback(content: string, oldStr: string): string {
            `Check your formatting, indentation and brackets inside old_str precisely.`;
   }
   return "Error: Code block was not found. Check target file parameters and try again.";
+}
+
+// Safely run regular expression matches across lines using Node's VM module with a hard timeout to prevent ReDoS
+function findMatchedLines(lines: string[], pattern: string, flags: string, timeoutMs: number = 200): number[] {
+  const context = {
+    lines,
+    pattern,
+    flags,
+    matchedIndices: [] as number[],
+    error: null as any
+  };
+
+  try {
+    const code = `
+      try {
+        const rx = new RegExp(pattern, flags);
+        for (let i = 0; i < lines.length; i++) {
+          if (rx.test(lines[i])) {
+            matchedIndices.push(i);
+          }
+        }
+      } catch (e) {
+        error = e;
+      }
+    `;
+    vm.runInNewContext(code, context, { timeout: timeoutMs });
+    if (context.error) {
+      throw context.error;
+    }
+    return context.matchedIndices;
+  } catch (err: any) {
+    if (err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+      throw new Error(`Regex matching timed out (potential ReDoS detected).`);
+    }
+    throw err;
+  }
 }
 
 // Fast mapping generator to fetch code layouts without opening massive files
@@ -495,7 +532,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Perform pattern search across directories or within a single file
+  // Perform pattern search across directories or within a single file safely (mitigated ReDoS loop)
   server.registerTool('grep', {
     description: 'High-performance pattern search. If a direct file path is specified, it will scan the file directly to bypass search indexing delays. Otherwise, scans recursively.',
     inputSchema: {
@@ -541,27 +578,27 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         }
       }
 
-      const isLineMatch = (lineText: string): boolean => {
-        try {
-          const regexFlags = case_insensitive ? 'i' : '';
-          const rx = new RegExp(pattern, regexFlags);
-          return rx.test(lineText);
-        } catch {
-          const lowerPattern = pattern.toLowerCase();
-          const lowerLine = lineText.toLowerCase();
-          return case_insensitive ? lowerLine.includes(lowerPattern) : lineText.includes(pattern);
-        }
-      };
+      const regexFlags = case_insensitive ? 'i' : '';
 
       // Execute direct single file grep if single file was successfully retrieved
       if (isSingleFile && targetPath) {
         const lines = rawContent.split('\n');
-        const matchedIndices: number[] = [];
-        lines.forEach((lineText, idx) => {
-          if (isLineMatch(lineText)) {
-            matchedIndices.push(idx);
+        let matchedIndices: number[] = [];
+        try {
+          // Sandbox context run with 500ms timeout for the single file process
+          matchedIndices = findMatchedLines(lines, pattern, regexFlags, 500);
+        } catch (err: any) {
+          if (err.message?.includes('timed out')) {
+            return formatError(new Error(`Grep aborted: potential ReDoS detected (execution timed out).`));
           }
-        });
+          // If regex creation failed (syntax errors), fallback to precise substring literal lookup
+          const lowerPattern = pattern.toLowerCase();
+          lines.forEach((lineText, idx) => {
+            const lowerLine = lineText.toLowerCase();
+            const matched = case_insensitive ? lowerLine.includes(lowerPattern) : lineText.includes(pattern);
+            if (matched) matchedIndices.push(idx);
+          });
+        }
 
         if (matchedIndices.length === 0) {
           return formatSuccess('No matched patterns found inside the target file.');
@@ -641,19 +678,29 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
           if ('content' in fileContentRes.data && typeof fileContentRes.data.content === 'string') {
             const rawContentFile = Buffer.from(fileContentRes.data.content, 'base64').toString('utf-8');
             const lines = rawContentFile.split('\n');
-            const matchedLinesInfo: { idx: number; line: string }[] = [];
-            lines.forEach((lineText, idx) => {
-              if (isLineMatch(lineText)) {
-                matchedLinesInfo.push({ idx, line: lineText });
+            let matchedIndices: number[] = [];
+            try {
+              // Sandbox context run with 200ms timeout per scanned file
+              matchedIndices = findMatchedLines(lines, pattern, regexFlags, 200);
+            } catch (err: any) {
+              if (err.message?.includes('timed out')) {
+                return formatError(new Error(`Grep aborted: potential ReDoS detected in file ${item.path} (execution timed out).`));
               }
-            });
-            if (matchedLinesInfo.length > 0) {
+              // Fallback to literal search if regex compiles with errors
+              const lowerPattern = pattern.toLowerCase();
+              lines.forEach((lineText, idx) => {
+                const lowerLine = lineText.toLowerCase();
+                const matched = case_insensitive ? lowerLine.includes(lowerPattern) : lineText.includes(pattern);
+                if (matched) matchedIndices.push(idx);
+              });
+            }
+            if (matchedIndices.length > 0) {
               if (output_mode === 'count') {
-                results.push(`File: ${item.path} - ${matchedLinesInfo.length} matches`);
+                results.push(`File: ${item.path} - ${matchedIndices.length} matches`);
               } else {
                 let fileOut = `File: ${item.path}\n`;
                 const processedLines = new Set<number>();
-                matchedLinesInfo.forEach(({ idx }) => {
+                matchedIndices.forEach((idx) => {
                   const startIdx = Math.max(0, idx - beforeCount);
                   const endIdx = Math.min(lines.length - 1, idx + afterCount);
                   for (let i = startIdx; i <= endIdx; i++) {
@@ -1361,17 +1408,49 @@ const timer = setInterval(() => {
 }, 5 * 60 * 1000);
 timer.unref();
 
-// Intercept process exits to prevent timers from lingering in runtimes
-process.on('SIGINT', () => {
-  clearInterval(timer);
-  process.exit(0);
-});
-process.on('SIGTERM', () => {
-  clearInterval(timer);
-  process.exit(0);
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const serverInstance = app.listen(PORT, () => {
   console.log(`Port ${PORT}`);
 });
+
+// Handle graceful process shutdown
+let isShuttingDown = false;
+
+function gracefulShutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  console.log(`Received ${signal}. Initiating graceful shutdown sequence...`);
+  clearInterval(timer);
+
+  // Stop active transport sessions cleanly
+  for (const [id, entry] of transports.entries()) {
+    try {
+      if (typeof entry.transport.close === 'function') {
+        entry.transport.close();
+      }
+    } catch {}
+    transports.delete(id);
+  }
+
+  // Define a watchdog timer to force exit if active connections fail to drain within 10 seconds
+  const forceExitTimeout = setTimeout(() => {
+    console.error('Forced shutdown: Active connections did not resolve in time.');
+    process.exit(1);
+  }, 10000);
+  forceExitTimeout.unref();
+
+  serverInstance.close((err) => {
+    clearTimeout(forceExitTimeout);
+    if (err) {
+      console.error('Error closing Express server:', err);
+      process.exit(1);
+    } else {
+      console.log('Express server closed gracefully.');
+      process.exit(0);
+    }
+  });
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
