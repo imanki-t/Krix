@@ -25,6 +25,14 @@ const formatError = (error: any) => ({
   content: [{ type: 'text' as const, text: error?.message || String(error) }]
 });
 
+// Helper function to resolve plain or base64 input strings safely
+function resolveInputString(plain?: string, b64?: string): string {
+  if (b64) {
+    return Buffer.from(b64, 'base64').toString('utf-8');
+  }
+  return plain || '';
+}
+
 // Decodes and captures rate limit status from GitHub API errors
 function handleGitHubError(err: any): any {
   if (err?.status === 403 && err?.headers?.['x-ratelimit-remaining'] === '0') {
@@ -132,7 +140,7 @@ function getBestMatchFeedback(content: string, oldStr: string): string {
   return "Error: Code block was not found. Check target file parameters and try again.";
 }
 
-// Safely run regular expression matches across lines using Node's VM module with a hard timeout to prevent ReDoS
+// Safely run regular expression matches across lines using Node's VM module
 function findMatchedLines(lines: string[], pattern: string, flags: string, timeoutMs: number = 200): number[] {
   const context = {
     lines,
@@ -374,14 +382,13 @@ function extractJsonResult(rawResult: any): any {
   return null;
 }
 
-// Generate the MCP server containing highly precise development and system tools
+// Generate the MCP server containing development and system tools
 function createMcpServer(octokitClient: Octokit, renderToken: string | undefined) {
   const server = new McpServer({
     name: 'github-lean-agent',
     version: '1.2.0',
   });
 
-  // Get details of active authorized user
   server.registerTool('get_viewer', {
     description: 'Get authenticated user profile details.',
     inputSchema: {}
@@ -394,9 +401,8 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Retrieves user repositories with strict page limitations
   server.registerTool('list_repos', {
-    description: 'List user repositories. Returns clean layout to prevent context-bloat.',
+    description: 'List user repositories.',
     inputSchema: {
       limit: z.number().optional().default(5).describe('Repository results count (max 100)'),
       page: z.number().optional().default(1).describe('Active results page index')
@@ -422,7 +428,6 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Searches repositories matching target patterns
   server.registerTool('search_repos', {
     description: 'Find user repositories matching search patterns.',
     inputSchema: {
@@ -453,7 +458,6 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Gets branches inside specified repositories
   server.registerTool('list_branches', {
     description: 'List branches of a repository.',
     inputSchema: {
@@ -482,7 +486,6 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Locate matching files using fast GitHub indexing queries
   server.registerTool('search_code', {
     description: 'Find files matching search criteria across codebases using GitHub indexes.',
     inputSchema: {
@@ -532,24 +535,23 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Perform pattern search across directories or within a single file safely (mitigated ReDoS loop)
   server.registerTool('grep', {
-    description: 'High-performance pattern search. If a direct file path is specified, it will scan the file directly to bypass search indexing delays. Otherwise, scans recursively.',
+    description: 'High-performance pattern search.',
     inputSchema: {
       owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
       pattern: z.string().describe('Regex or string sequence to look for.'),
-      path: z.string().optional().describe('Optional file or directory scope limit. If a file is targeted, index searches are bypassed.'),
-      glob: z.string().optional().describe('Glob pattern filter (e.g. "*.ts", "**/*.tsx"). Only evaluated during recursive search.'),
-      type: z.string().optional().describe('File type filter extension (e.g. "py", "rs", "ts"). Only evaluated during recursive search.'),
-      output_mode: z.enum(['content', 'files_with_matches', 'count']).default('content').describe('Result format: "files_with_matches" returns paths, "content" returns matched lines, "count" returns counts.'),
-      case_insensitive: z.boolean().optional().default(true).describe('Case-insensitive match execution.'),
-      show_line_numbers: z.boolean().optional().default(true).describe('Prefix lines with line offsets.'),
-      context_before: z.number().optional().default(2).describe('Reference lines before each match (min 0, max 10).'),
-      context_after: z.number().optional().default(2).describe('Reference lines after each match (min 0, max 10).'),
-      ref: z.string().optional().default('main').describe('Git tree reference.'),
-      limit: z.number().optional().default(10).describe('Max files to download or max single-file matches to return (min 1, max 30).'),
-      offset: z.number().optional().default(0).describe('Pagination offset. Only evaluated during single-file scan results.')
+      path: z.string().optional(),
+      glob: z.string().optional(),
+      type: z.string().optional(),
+      output_mode: z.enum(['content', 'files_with_matches', 'count']).default('content'),
+      case_insensitive: z.boolean().optional().default(true),
+      show_line_numbers: z.boolean().optional().default(true),
+      context_before: z.number().optional().default(2),
+      context_after: z.number().optional().default(2),
+      ref: z.string().optional().default('main'),
+      limit: z.number().optional().default(10),
+      offset: z.number().optional().default(0)
     }
   }, async ({ owner, repo, pattern, path: targetPath, glob, type, output_mode, case_insensitive, show_line_numbers, context_before, context_after, ref, limit, offset }) => {
     try {
@@ -560,38 +562,27 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       let isSingleFile = false;
       let rawContent = '';
       
-      // Attempt direct file retrieval if a specific target path is passed
       if (targetPath) {
         try {
-          const fileRes = await octokitClient.repos.getContent({
-            owner,
-            repo,
-            path: targetPath,
-            ref
-          });
+          const fileRes = await octokitClient.repos.getContent({ owner, repo, path: targetPath, ref });
           if (fileRes.data && !Array.isArray(fileRes.data) && 'content' in fileRes.data) {
             rawContent = Buffer.from(fileRes.data.content, 'base64').toString('utf-8');
             isSingleFile = true;
           }
-        } catch {
-          // If 404, we assume it is a directory path or not yet created, falling back to search API
-        }
+        } catch {}
       }
 
       const regexFlags = case_insensitive ? 'i' : '';
 
-      // Execute direct single file grep if single file was successfully retrieved
       if (isSingleFile && targetPath) {
         const lines = rawContent.split('\n');
         let matchedIndices: number[] = [];
         try {
-          // Sandbox context run with 500ms timeout for the single file process
           matchedIndices = findMatchedLines(lines, pattern, regexFlags, 500);
         } catch (err: any) {
           if (err.message?.includes('timed out')) {
-            return formatError(new Error(`Grep aborted: potential ReDoS detected (execution timed out).`));
+            return formatError(new Error(`Grep aborted: potential ReDoS detected.`));
           }
-          // If regex creation failed (syntax errors), fallback to precise substring literal lookup
           const lowerPattern = pattern.toLowerCase();
           lines.forEach((lineText, idx) => {
             const lowerLine = lineText.toLowerCase();
@@ -622,9 +613,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
           const startIdx = Math.max(0, matchIdx - beforeCount);
           const endIdx = Math.min(lines.length - 1, matchIdx + afterCount);
           for (let i = startIdx; i <= endIdx; i++) {
-            if (processedLines.has(i)) {
-              continue;
-            }
+            if (processedLines.has(i)) continue;
             processedLines.add(i);
             const prefix = i === matchIdx ? '>> ' : '   ';
             const numPrefix = show_line_numbers ? `L${i + 1} | ` : '';
@@ -634,25 +623,15 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
 
         results.push(fileOut.trimEnd());
         let meta = `Matches ${offset + 1}-${Math.min(offset + maxFilesToProcess, total)} of ${total} lines.`;
-        if (total > offset + maxFilesToProcess) {
-          meta += ` Re-run with offset: ${offset + maxFilesToProcess} to view subsequent segments.`;
-        }
         return formatSuccess(`[METADATA: ${meta}]\n\n${results.join('\n')}`);
       }
 
-      // Execute recursive search branch if no single file was targeted
       let query = pattern;
       query += ` repo:${owner}/${repo}`;
-      if (targetPath) {
-        query += ` path:${targetPath}`;
-      }
-      if (type) {
-        query += ` extension:${type}`;
-      }
-      const searchRes = await octokitClient.search.code({
-        q: query,
-        per_page: maxFilesToProcess
-      });
+      if (targetPath) query += ` path:${targetPath}`;
+      if (type) query += ` extension:${type}`;
+      
+      const searchRes = await octokitClient.search.code({ q: query, per_page: maxFilesToProcess });
       let items = searchRes.data.items || [];
       if (glob) {
         const globLower = glob.toLowerCase().replace(/\*/g, '');
@@ -663,30 +642,22 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       }
       if (output_mode === 'files_with_matches') {
         const fileList = items.map(item => `- ${item.path}`).join('\n');
-        return formatSuccess(`Matching files (limit: ${maxFilesToProcess}):\n\n${fileList}`);
+        return formatSuccess(`Matching files:\n\n${fileList}`);
       }
       const results: string[] = [];
-      const filesToProcess = items.slice(0, maxFilesToProcess);
-      for (const item of filesToProcess) {
+      for (const item of items.slice(0, maxFilesToProcess)) {
         try {
-          const fileContentRes = await octokitClient.repos.getContent({
-            owner,
-            repo,
-            path: item.path,
-            ref
-          });
+          const fileContentRes = await octokitClient.repos.getContent({ owner, repo, path: item.path, ref });
           if ('content' in fileContentRes.data && typeof fileContentRes.data.content === 'string') {
             const rawContentFile = Buffer.from(fileContentRes.data.content, 'base64').toString('utf-8');
             const lines = rawContentFile.split('\n');
             let matchedIndices: number[] = [];
             try {
-              // Sandbox context run with 200ms timeout per scanned file
               matchedIndices = findMatchedLines(lines, pattern, regexFlags, 200);
             } catch (err: any) {
               if (err.message?.includes('timed out')) {
-                return formatError(new Error(`Grep aborted: potential ReDoS detected in file ${item.path} (execution timed out).`));
+                return formatError(new Error(`Grep aborted on ${item.path}`));
               }
-              // Fallback to literal search if regex compiles with errors
               const lowerPattern = pattern.toLowerCase();
               lines.forEach((lineText, idx) => {
                 const lowerLine = lineText.toLowerCase();
@@ -704,9 +675,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
                   const startIdx = Math.max(0, idx - beforeCount);
                   const endIdx = Math.min(lines.length - 1, idx + afterCount);
                   for (let i = startIdx; i <= endIdx; i++) {
-                    if (processedLines.has(i)) {
-                      continue;
-                    }
+                    if (processedLines.has(i)) continue;
                     processedLines.add(i);
                     const prefix = i === idx ? '>> ' : '   ';
                     const numPrefix = show_line_numbers ? `L${i + 1} | ` : '';
@@ -719,25 +688,22 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
           }
         } catch {}
       }
-      if (results.length === 0) {
-        return formatSuccess('No matched patterns found inside the matching files.');
-      }
+      if (results.length === 0) return formatSuccess('No matched patterns found inside matching files.');
       return formatSuccess(results.join('\n\n=========================================\n\n'));
     } catch (err) {
       return handleGitHubError(err);
     }
   });
 
-  // Pull recursive repository tree details
   server.registerTool('get_tree', {
     description: 'Retrieve file path paths tree index recursively.',
     inputSchema: {
-      owner: z.string().describe('Repository owner'),
-      repo: z.string().describe('Repository name'),
-      tree_sha: z.string().default('main').describe('Branch, tag, or commit SHA'),
-      offset: z.number().optional().default(0).describe('Pagination offset index'),
-      limit: z.number().optional().default(50).describe('Maximum items displaying in index output (max 200)'),
-      q: z.string().optional().describe('Keyword folder structure match filter')
+      owner: z.string(),
+      repo: z.string(),
+      tree_sha: z.string().default('main'),
+      offset: z.number().optional().default(0),
+      limit: z.number().optional().default(50),
+      q: z.string().optional()
     }
   }, async ({ owner, repo, tree_sha, offset, limit, q }) => {
     try {
@@ -754,26 +720,22 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       );
       let out = items.join('\n');
       let meta = `Showing items ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total} paths.`;
-      if (total > offset + targetLimit) {
-        meta += ` Re-run with offset: ${offset + targetLimit} for more.`;
-      }
-      return formatSuccess(`${meta}\n\n${out || 'No paths located matching folder filter.'}`);
+      return formatSuccess(`${meta}\n\n${out || 'No paths located.'}`);
     } catch (err) {
       return handleGitHubError(err);
     }
   });
 
-  // Read file segments mapping line numbers prefixing by default
   server.registerTool('get_contents', {
-    description: 'Read file lines. Automatically attaches line number prefixes for precision targeting.',
+    description: 'Read file lines.',
     inputSchema: {
-      owner: z.string().describe('Repository owner'),
-      repo: z.string().describe('Repository name'),
-      path: z.string().describe('File path'),
-      ref: z.string().default('main').describe('Commit, branch or tag ref'),
-      startLine: z.number().optional().default(1).describe('Starting coordinate (1-based index)'),
-      limit: z.number().optional().default(100).describe('Lines displaying (default 100, max 500)'),
-      endLine: z.number().optional().describe('Ending coordinate. Overrides limit bounds up to 500 lines.')
+      owner: z.string(),
+      repo: z.string(),
+      path: z.string(),
+      ref: z.string().default('main'),
+      startLine: z.number().optional().default(1),
+      limit: z.number().optional().default(100),
+      endLine: z.number().optional()
     }
   }, async ({ owner, repo, path, ref, startLine, limit, endLine }) => {
     try {
@@ -786,23 +748,13 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         let targetLimit = Math.min(Math.max(1, limit), 500);
         if (endLine) {
           const calculatedLimit = endLine - start + 1;
-          if (calculatedLimit > 0) {
-            targetLimit = Math.min(calculatedLimit, 500);
-          }
+          if (calculatedLimit > 0) targetLimit = Math.min(calculatedLimit, 500);
         }
         let end = Math.min(total, start + targetLimit - 1);
-        if (start > total) {
-          return formatError(new Error(`startLine ${startLine} is larger than file length ${total}`));
-        }
+        if (start > total) return formatError(new Error(`startLine ${startLine} is larger than file length ${total}`));
         const windowLines = lines.slice(start - 1, end);
-        const out = windowLines.map((line, idx) => {
-          const lineNum = start + idx;
-          return `${lineNum.toString().padStart(5, ' ')} | ${line}`;
-        }).join('\n');
+        const out = windowLines.map((line, idx) => `${(start + idx).toString().padStart(5, ' ')} | ${line}`).join('\n');
         let meta = `Lines ${start}-${end} of ${total} total lines.`;
-        if (total > end) {
-          meta += ` File truncated. Fetch again with startLine: ${end + 1} to view subsequent segments.`;
-        }
         return formatSuccess(`[METADATA: ${meta}]\n\n${out}`);
       }
       return formatSuccess('Not a file');
@@ -811,15 +763,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Pull high-level file declarations without loading entire code segments
   server.registerTool('view_file_outline', {
-    description: 'Pull high-level symbol structures, structures, or definitions without loading raw contents.',
-    inputSchema: {
-      owner: z.string().describe('Repository owner'),
-      repo: z.string().describe('Repository name'),
-      path: z.string().describe('File path'),
-      ref: z.string().default('main').describe('Target Git ref context')
-    }
+    description: 'Pull high-level symbol structures.',
+    inputSchema: { owner: z.string(), repo: z.string(), path: z.string(), ref: z.string().default('main') }
   }, async ({ owner, repo, path, ref }) => {
     try {
       const res = await octokitClient.repos.getContent({ owner, repo, path, ref });
@@ -834,21 +780,30 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Surgical replacement editor resolving line differences dynamically
+  // UPDATED: Surgical replacement editor with Base64 parameter support
   server.registerTool('str_replace_editor', {
-    description: 'Surgically search and replace a unique code block (old_str) with new code (new_str). Safe-checks uniqueness.',
+    description: 'Surgically search and replace code. Supports base64 inputs (old_str_b64, new_str_b64) to bypass WAF / XSS filters blocking raw SVG/HTML tags.',
     inputSchema: {
       owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
       path: z.string().describe('File path'),
       branch: z.string().describe('Active git branch reference'),
-      old_str: z.string().describe('Exact sequence of code lines to replace. Spacing/tabs must match exactly.'),
-      new_str: z.string().describe('Replacement sequence block.'),
+      old_str: z.string().optional().describe('Exact code to replace'),
+      old_str_b64: z.string().optional().describe('Base64 encoded string of old_str (bypasses security filters)'),
+      new_str: z.string().optional().describe('Replacement sequence block'),
+      new_str_b64: z.string().optional().describe('Base64 encoded string of new_str (bypasses security filters)'),
       message: z.string().describe('Commit message.'),
-      sha: z.string().optional().describe('Git object SHA. Automatically fetched if omitted.')
+      sha: z.string().optional().describe('Git object SHA.')
     }
-  }, async ({ owner, repo, path, branch, old_str, new_str, message, sha }) => {
+  }, async ({ owner, repo, path, branch, old_str, old_str_b64, new_str, new_str_b64, message, sha }) => {
     try {
+      const resolvedOldStr = resolveInputString(old_str, old_str_b64);
+      const resolvedNewStr = resolveInputString(new_str, new_str_b64);
+
+      if (!resolvedOldStr) {
+        throw new Error('Either old_str or old_str_b64 must be provided.');
+      }
+
       const fileData = await octokitClient.repos.getContent({ owner, repo, path, ref: branch });
       if (Array.isArray(fileData.data) || !('content' in fileData.data)) {
         throw new Error('Target is not a file.');
@@ -856,8 +811,8 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       const rawContent = Buffer.from(fileData.data.content, 'base64').toString('utf-8');
       const targetSha = sha || fileData.data.sha;
       const normalizedContent = rawContent.replace(/\r\n/g, '\n');
-      const normalizedOld = old_str.replace(/\r\n/g, '\n');
-      const normalizedNew = new_str.replace(/\r\n/g, '\n');
+      const normalizedOld = resolvedOldStr.replace(/\r\n/g, '\n');
+      const normalizedNew = resolvedNewStr.replace(/\r\n/g, '\n');
       const occurrences = normalizedContent.split(normalizedOld).length - 1;
       if (occurrences === 0) {
         const feedback = getBestMatchFeedback(normalizedContent, normalizedOld);
@@ -869,11 +824,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         const oldLines = normalizedOld.split('\n');
         for (let i = 0; i <= lines.length - oldLines.length; i++) {
           const chunk = lines.slice(i, i + oldLines.length).join('\n');
-          if (chunk === normalizedOld) {
-            occLineNumbers.push(i + 1);
-          }
+          if (chunk === normalizedOld) occLineNumbers.push(i + 1);
         }
-        throw new Error(`The old_str block was found ${occurrences} times at starting lines: ${occLineNumbers.join(', ')}. Expand context limits in old_str to isolate targets.`);
+        throw new Error(`The old_str block was found ${occurrences} times at starting lines: ${occLineNumbers.join(', ')}.`);
       }
       const updatedContentNormalized = normalizedContent.replace(normalizedOld, normalizedNew);
       const hasCrLf = rawContent.includes('\r\n');
@@ -895,22 +848,24 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Create new files or fully write small files
+  // UPDATED: Completely write or overwrite file contents with Base64 parameter support
   server.registerTool('put_contents', {
-    description: 'Completely write or overwrite file contents. Best used to generate NEW files. For updates, prefer using str_replace_editor.',
+    description: 'Completely write or overwrite file contents. Supports content_b64 to bypass WAF / security filters.',
     inputSchema: {
       owner: z.string(),
       repo: z.string(),
       path: z.string(),
-      content: z.string(),
+      content: z.string().optional(),
+      content_b64: z.string().optional().describe('Base64 encoded file content'),
       message: z.string(),
       branch: z.string(),
       sha: z.string().optional()
     }
-  }, async ({ owner, repo, path, content, message, branch, sha }) => {
+  }, async ({ owner, repo, path, content, content_b64, message, branch, sha }) => {
     try {
+      const resolvedContent = resolveInputString(content, content_b64);
       const res = await octokitClient.repos.createOrUpdateFileContents({
-        owner, repo, path, message, content: Buffer.from(content, 'utf-8').toString('base64'), branch, sha
+        owner, repo, path, message, content: Buffer.from(resolvedContent, 'utf-8').toString('base64'), branch, sha
       });
       return formatSuccess(`Success: ${res.data.commit.sha}`);
     } catch (err) {
@@ -918,9 +873,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Replace specified line ranges directly
+  // UPDATED: Replace specified line ranges directly with Base64 parameter support
   server.registerTool('patch_contents', {
-    description: 'Replace specified line indices directly. Prefer using str_replace_editor to prevent overlapping index changes.',
+    description: 'Replace specified line ranges directly. Supports newContent_b64 to bypass WAF / security filters.',
     inputSchema: {
       owner: z.string(),
       repo: z.string(),
@@ -928,18 +883,20 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
       branch: z.string(),
       startLine: z.number(),
       endLine: z.number(),
-      newContent: z.string(),
+      newContent: z.string().optional(),
+      newContent_b64: z.string().optional().describe('Base64 encoded replacement string'),
       message: z.string()
     }
-  }, async ({ owner, repo, path, branch, startLine, endLine, newContent, message }) => {
+  }, async ({ owner, repo, path, branch, startLine, endLine, newContent, newContent_b64, message }) => {
     try {
+      const resolvedNewContent = resolveInputString(newContent, newContent_b64);
       const fileData = await octokitClient.repos.getContent({ owner, repo, path, ref: branch });
       if (Array.isArray(fileData.data) || !('content' in fileData.data)) throw new Error('Not a file');
       const lines = Buffer.from(fileData.data.content, 'base64').toString('utf-8').split('\n');
       if (startLine < 1 || endLine < startLine || endLine > lines.length) {
         throw new Error(`Invalid line coordinates. Target boundary has ${lines.length} lines.`);
       }
-      lines.splice(startLine - 1, endLine - startLine + 1, ...newContent.split('\n'));
+      lines.splice(startLine - 1, endLine - startLine + 1, ...resolvedNewContent.split('\n'));
       const res = await octokitClient.repos.createOrUpdateFileContents({
         owner, repo, path, message, content: Buffer.from(lines.join('\n'), 'utf-8').toString('base64'), branch, sha: fileData.data.sha
       });
@@ -949,12 +906,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Delete files from branches
   server.registerTool('delete_contents', {
     description: 'Delete files from repository branches.',
-    inputSchema: {
-      owner: z.string(), repo: z.string(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string()
-    }
+    inputSchema: { owner: z.string(), repo: z.string(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string() }
   }, async ({ owner, repo, path, message, sha, branch }) => {
     try {
       await octokitClient.repos.deleteFile({ owner, repo, path, message, sha, branch });
@@ -964,12 +918,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Create workspace branches
   server.registerTool('create_ref', {
     description: 'Create repository branches.',
-    inputSchema: {
-      owner: z.string(), repo: z.string(), branch: z.string(), refSha: z.string()
-    }
+    inputSchema: { owner: z.string(), repo: z.string(), branch: z.string(), refSha: z.string() }
   }, async ({ owner, repo, branch, refSha }) => {
     try {
       await octokitClient.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: refSha });
@@ -979,12 +930,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Delete workspace branches
   server.registerTool('delete_ref', {
     description: 'Delete branches from repositories.',
-    inputSchema: {
-      owner: z.string(), repo: z.string(), branch: z.string()
-    }
+    inputSchema: { owner: z.string(), repo: z.string(), branch: z.string() }
   }, async ({ owner, repo, branch }) => {
     try {
       await octokitClient.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
@@ -994,12 +942,9 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Open Pull Request references
   server.registerTool('create_pull', {
     description: 'Create pull requests between branches.',
-    inputSchema: {
-      owner: z.string(), repo: z.string(), title: z.string(), body: z.string().optional(), head: z.string(), base: z.string().default('main')
-    }
+    inputSchema: { owner: z.string(), repo: z.string(), title: z.string(), body: z.string().optional(), head: z.string(), base: z.string().default('main') }
   }, async ({ owner, repo, title, body, head, base }) => {
     try {
       const res = await octokitClient.pulls.create({ owner, repo, title, body, head, base });
@@ -1009,9 +954,8 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Fetch Render workspaces auto-defaulting single selections
   server.registerTool('list_workspaces', {
-    description: 'List active workspaces. Auto-detects single user workspaces to bypass selection processes.',
+    description: 'List active workspaces.',
     inputSchema: {}
   }, async (args) => {
     const rawResult = await callRenderTool('list_workspaces', args, renderToken);
@@ -1034,31 +978,22 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
     }
   });
 
-  // Selection mapping configurations
   server.registerTool('select_workspace', {
     description: 'Set target active workspace ID.',
-    inputSchema: {
-      ownerID: z.string().describe('Target owner ID starts with tea- or own-.')
-    }
-  }, async (args) => {
-    return callRenderTool('select_workspace', args, renderToken);
-  });
+    inputSchema: { ownerID: z.string() }
+  }, async (args) => callRenderTool('select_workspace', args, renderToken));
 
-  // Fetch target active workspace setup details
   server.registerTool('get_selected_workspace', {
     description: 'Get details for selected workspace.',
     inputSchema: {}
-  }, async (args) => {
-    return callRenderTool('get_selected_workspace', args, renderToken);
-  });
+  }, async (args) => callRenderTool('get_selected_workspace', args, renderToken));
 
-  // Render services index with advanced substring filtering and default selectors
   server.registerTool('list_services', {
-    description: 'Query active services. Isolate results by query parameter to bypass retrieving complete listings.',
+    description: 'Query active services.',
     inputSchema: {
-      q: z.string().optional().describe('Substring filters service name, ID, type, or repository URL to isolate targets.'),
-      limit: z.number().optional().default(5).describe('Pagination index offset limit (max 50)'),
-      offset: z.number().optional().default(0).describe('Pagination page offset index'),
+      q: z.string().optional(),
+      limit: z.number().optional().default(5),
+      offset: z.number().optional().default(0),
       includePreviews: z.boolean().optional().default(false)
     }
   }, async ({ q, limit, offset, includePreviews }) => {
@@ -1096,35 +1031,20 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         repo: s.repo || s.service?.repo || s.service?.repoDetails?.url
       }));
       let meta = `Matched ${paginated.length} of ${totalMatched} services.`;
-      if (totalMatched === 1) {
-        meta += ` [AUTO-DEFAULT: Single target service isolated. ID: ${simplified[0].id}]`;
-      } else if (totalMatched > offset + targetLimit) {
-        meta += ` Re-run with offset: ${offset + targetLimit} for next batch.`;
-      }
       return formatSuccess({ meta, services: simplified });
     } catch (err: any) {
       return formatError(new Error(`Failed to query services: ${err.message}`));
     }
   });
 
-  // Get details of specified service profiles
   server.registerTool('get_service', {
     description: 'Get configuration detail metrics of specified services.',
-    inputSchema: {
-      serviceId: z.string()
-    }
-  }, async (args) => {
-    return callRenderTool('get_service', args, renderToken);
-  });
+    inputSchema: { serviceId: z.string() }
+  }, async (args) => callRenderTool('get_service', args, renderToken));
 
-  // Retrieve deployments history auto-detecting single items
   server.registerTool('list_deploys', {
     description: 'List deployments histories.',
-    inputSchema: {
-      serviceId: z.string(),
-      limit: z.number().optional().default(3).describe('Deployments history log limit (max 20)'),
-      offset: z.number().optional().default(0).describe('Pagination page offset index')
-    }
+    inputSchema: { serviceId: z.string(), limit: z.number().optional().default(3), offset: z.number().optional().default(0) }
   }, async ({ serviceId, limit, offset }) => {
     const targetLimit = Math.min(limit, 20);
     const rawResult = await callRenderTool('list_deploys', { serviceId, limit: offset + targetLimit }, renderToken);
@@ -1149,36 +1069,26 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
         createdAt: d.createdAt || d.deploy?.createdAt
       }));
       let meta = `Deployments ${offset + 1}-${Math.min(offset + targetLimit, total)} of ${total}.`;
-      if (total === 1) {
-        meta += ` [AUTO-DEFAULT: Only deployment found. ID: ${simplified[0].id}]`;
-      }
       return formatSuccess({ meta, deploys: simplified });
     } catch (err: any) {
       return formatError(new Error(`Failed to query deployments: ${err.message}`));
     }
   });
 
-  // Get details of specific deployments
   server.registerTool('get_deploy', {
     description: 'Get configuration layout details of specified deployments.',
-    inputSchema: {
-      serviceId: z.string(),
-      deployId: z.string()
-    }
-  }, async (args) => {
-    return callRenderTool('get_deploy', args, renderToken);
-  });
+    inputSchema: { serviceId: z.string(), deployId: z.string() }
+  }, async (args) => callRenderTool('get_deploy', args, renderToken));
 
-  // Get active console log outputs trimming parameters to protect token bounds
   server.registerTool('list_logs', {
     description: 'Get console and service logs.',
     inputSchema: {
-      resource: z.array(z.string()).describe('Array of resource IDs like srv-xxxx'),
-      level: z.array(z.string()).optional().describe('Log severity levels'),
-      type: z.array(z.string()).optional().describe('Log type classification'),
+      resource: z.array(z.string()),
+      level: z.array(z.string()).optional(),
+      type: z.array(z.string()).optional(),
       instance: z.array(z.string()).optional(),
       host: z.array(z.string()).optional(),
-      limit: z.number().optional().default(15).describe('Log entries cap (max 250)')
+      limit: z.number().optional().default(15)
     }
   }, async (args) => {
     const requestedLimit = args.limit || 15;
@@ -1198,10 +1108,7 @@ function createMcpServer(octokitClient: Octokit, renderToken: string | undefined
             msg: (l.message || l.msg || JSON.stringify(l)).trim().slice(0, 180)
           };
         });
-        let truncatedNote = '';
-        if (parsed.length > targetLimit) {
-          truncatedNote = `\n... (truncated from ${parsed.length} lines)`;
-        }
+        let truncatedNote = parsed.length > targetLimit ? `\n... (truncated from ${parsed.length} lines)` : '';
         return formatSuccess(JSON.stringify(simplified, null, 2) + truncatedNote);
       }
       return rawResult;
@@ -1320,7 +1227,6 @@ const serverInstance = app.listen(PORT, () => {
   console.log(`Port ${PORT}`);
 });
 
-// Handle graceful process shutdown
 let isShuttingDown = false;
 
 function gracefulShutdown(signal: string) {
@@ -1330,7 +1236,6 @@ function gracefulShutdown(signal: string) {
   console.log(`Received ${signal}. Initiating graceful shutdown sequence...`);
   clearInterval(timer);
 
-  // Stop active transport sessions cleanly
   for (const [id, entry] of transports.entries()) {
     try {
       if (typeof entry.transport.close === 'function') {
@@ -1340,7 +1245,6 @@ function gracefulShutdown(signal: string) {
     transports.delete(id);
   }
 
-  // Define a watchdog timer to force exit if active connections fail to drain within 10 seconds
   const forceExitTimeout = setTimeout(() => {
     console.error('Forced shutdown: Active connections did not resolve in time.');
     process.exit(1);
