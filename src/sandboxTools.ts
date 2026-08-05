@@ -15,10 +15,6 @@ interface ActiveProcess {
 
 const activeProcesses = new Map<number, ActiveProcess>();
 
-/**
- * Creates or gets an isolated, ephemeral session directory.
- * Cleans up automatically after execution or on explicit cleanup request.
- */
 async function getOrCreateSandboxDir(sessionId: string = 'default'): Promise<string> {
   const dir = path.join(os.tmpdir(), `mcp_sandbox_${sessionId}`);
   await fs.mkdir(dir, { recursive: true });
@@ -28,7 +24,6 @@ async function getOrCreateSandboxDir(sessionId: string = 'default'): Promise<str
 export async function destroySandbox(sessionId: string = 'default'): Promise<void> {
   const dir = path.join(os.tmpdir(), `mcp_sandbox_${sessionId}`);
   try {
-    // Kill any active child processes running inside this sandbox
     for (const [pid, item] of activeProcesses.entries()) {
       item.proc.kill('SIGKILL');
       activeProcesses.delete(pid);
@@ -38,15 +33,12 @@ export async function destroySandbox(sessionId: string = 'default'): Promise<voi
 }
 
 export function registerSandboxTools(server: McpServer) {
-  // 1. Terminal Execution
   server.registerTool('execute_bash', {
-    description: 'Execute shell commands inside isolated ephemeral sandbox terminal.',
-    inputSchema: {
-      command: z.string(),
-      timeoutMs: z.number().optional().default(30000)
-    },
+    description: 'Execute shell commands inside isolated sandbox terminal.',
+    inputSchema: { command: z.string(), timeoutMs: z.number().optional().default(30000) },
     annotations: getToolAnnotations('execute_bash')
-  }, async ({ command, timeoutMs }) => {
+  }, async (args: any) => {
+    const { command, timeoutMs } = args;
     try {
       sanitizeCommand(command);
       const sandboxDir = await getOrCreateSandboxDir('default');
@@ -64,19 +56,19 @@ export function registerSandboxTools(server: McpServer) {
     } catch (err) { return formatError(err); }
   });
 
-  // 2. Python Snippet Runner
   server.registerTool('run_python', {
-    description: 'Execute Python snippet inside ephemeral virtual environment.',
+    description: 'Execute Python snippet.',
     inputSchema: { code: z.string(), args: z.array(z.string()).optional().default([]) },
     annotations: getToolAnnotations('run_python')
-  }, async ({ code, args }) => {
+  }, async (args: any) => {
+    const { code, args: pyArgs } = args;
     try {
       const sandboxDir = await getOrCreateSandboxDir('default');
       const tmpFile = path.join(sandboxDir, `script_${Date.now()}.py`);
       await fs.writeFile(tmpFile, code, 'utf-8');
 
       return await new Promise((resolve) => {
-        exec(`python3 ${tmpFile} ${args.join(' ')}`, { cwd: sandboxDir, timeout: 30000 }, async (err, stdout, stderr) => {
+        exec(`python3 ${tmpFile} ${pyArgs.join(' ')}`, { cwd: sandboxDir, timeout: 30000 }, async (err, stdout, stderr) => {
           await fs.unlink(tmpFile).catch(() => {});
           resolve(formatOptimizedResponse(stdout || stderr || (err ? err.message : 'Finished.')));
         });
@@ -84,12 +76,12 @@ export function registerSandboxTools(server: McpServer) {
     } catch (err) { return formatError(err); }
   });
 
-  // 3. Node.js Snippet Runner
   server.registerTool('run_node', {
     description: 'Execute JavaScript/TypeScript code snippet.',
     inputSchema: { code: z.string() },
     annotations: getToolAnnotations('run_node')
-  }, async ({ code }) => {
+  }, async (args: any) => {
+    const { code } = args;
     try {
       const sandboxDir = await getOrCreateSandboxDir('default');
       const tmpFile = path.join(sandboxDir, `script_${Date.now()}.js`);
@@ -104,12 +96,12 @@ export function registerSandboxTools(server: McpServer) {
     } catch (err) { return formatError(err); }
   });
 
-  // 4. Isolated Package Installer
   server.registerTool('install_package', {
-    description: 'Install npm or pip packages into ephemeral sandbox directory.',
+    description: 'Install npm or pip packages into sandbox.',
     inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()) },
     annotations: getToolAnnotations('install_package')
-  }, async ({ manager, packages }) => {
+  }, async (args: any) => {
+    const { manager, packages } = args;
     try {
       const sandboxDir = await getOrCreateSandboxDir('default');
       const pkgList = packages.join(' ');
@@ -118,30 +110,30 @@ export function registerSandboxTools(server: McpServer) {
       return await new Promise((resolve) => {
         exec(cmd, { cwd: sandboxDir, timeout: 60000 }, (err, stdout, stderr) => {
           if (err) resolve(formatError(`Install failed: ${stderr || err.message}`));
-          else resolve(formatOptimizedResponse(`Installed ${pkgList} into ephemeral sandbox.`));
+          else resolve(formatOptimizedResponse(`Installed ${pkgList} into sandbox.`));
         });
       });
     } catch (err) { return formatError(err); }
   });
 
-  // 5. Multi-language File Runner
   server.registerTool('run_code_file', {
     description: 'Run code file (.py, .js, .ts, .java, .cpp, .go, .sh).',
     inputSchema: { filePath: z.string(), args: z.array(z.string()).optional().default([]) },
     annotations: getToolAnnotations('run_code_file')
-  }, async ({ filePath, args }) => {
+  }, async (args: any) => {
+    const { filePath, args: runArgs } = args;
     try {
       const absPath = sanitizePath(filePath);
       const ext = path.extname(absPath).toLowerCase();
       let cmd = '';
 
-      if (ext === '.py') cmd = `python3 ${absPath} ${args.join(' ')}`;
-      else if (ext === '.js') cmd = `node ${absPath} ${args.join(' ')}`;
-      else if (ext === '.ts') cmd = `npx ts-node ${absPath} ${args.join(' ')}`;
-      else if (ext === '.java') cmd = `java ${absPath} ${args.join(' ')}`;
-      else if (ext === '.go') cmd = `go run ${absPath} ${args.join(' ')}`;
-      else if (ext === '.sh') cmd = `bash ${absPath} ${args.join(' ')}`;
-      else if (ext === '.cpp') cmd = `g++ ${absPath} -o /tmp/app.out && /tmp/app.out ${args.join(' ')}`;
+      if (ext === '.py') cmd = `python3 ${absPath} ${runArgs.join(' ')}`;
+      else if (ext === '.js') cmd = `node ${absPath} ${runArgs.join(' ')}`;
+      else if (ext === '.ts') cmd = `npx ts-node ${absPath} ${runArgs.join(' ')}`;
+      else if (ext === '.java') cmd = `java ${absPath} ${runArgs.join(' ')}`;
+      else if (ext === '.go') cmd = `go run ${absPath} ${runArgs.join(' ')}`;
+      else if (ext === '.sh') cmd = `bash ${absPath} ${runArgs.join(' ')}`;
+      else if (ext === '.cpp') cmd = `g++ ${absPath} -o /tmp/app.out && /tmp/app.out ${runArgs.join(' ')}`;
       else throw new Error(`Unsupported extension '${ext}'`);
 
       return await new Promise((resolve) => {
@@ -152,12 +144,12 @@ export function registerSandboxTools(server: McpServer) {
     } catch (err) { return formatError(err); }
   });
 
-  // 6. Process Manager
   server.registerTool('manage_process', {
     description: 'Inspect or terminate background sandbox processes.',
     inputSchema: { action: z.enum(['list', 'kill']), pid: z.number().optional() },
     annotations: getToolAnnotations('manage_process')
-  }, async ({ action, pid }) => {
+  }, async (args: any) => {
+    const { action, pid } = args;
     try {
       if (action === 'list') {
         const list = Array.from(activeProcesses.values()).map(p => `PID ${p.pid}: ${p.command}`);
@@ -175,21 +167,19 @@ export function registerSandboxTools(server: McpServer) {
     } catch (err) { return formatError(err); }
   });
 
-  // 7. Ephemeral Reset / Cleanup Tool
   server.registerTool('cleanup_sandbox', {
-    description: 'Completely destroy temporary files, packages, and reset sandbox to fresh state.',
+    description: 'Wipe temporary sandbox files.',
     inputSchema: {},
     annotations: getToolAnnotations('cleanup_sandbox')
   }, async () => {
     try {
       await destroySandbox('default');
-      return formatOptimizedResponse('Ephemeral sandbox wiped clean. Fresh environment initialized.');
+      return formatOptimizedResponse('Sandbox wiped clean.');
     } catch (err) { return formatError(err); }
   });
 
-  // 8. Sandbox Environment Status
   server.registerTool('get_sandbox_status', {
-    description: 'Check virtual IDE environment tools, memory, and status.',
+    description: 'Check virtual IDE environment status.',
     inputSchema: {},
     annotations: getToolAnnotations('get_sandbox_status')
   }, async () => {

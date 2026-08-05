@@ -107,10 +107,9 @@ app.get('/', (_req, res) => {
   res.send('⚡ Unified Ephemeral MCP Gateway Active.');
 });
 
-// Idle Cleanup Daemon
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
-  const maxIdle = 10 * 60 * 1000; // 10 mins
+  const maxIdle = 10 * 60 * 1000;
   for (const [id, entry] of transports.entries()) {
     if (now - entry.lastActive > maxIdle) {
       destroySandbox(id);

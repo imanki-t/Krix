@@ -7,10 +7,6 @@ export enum PermissionLevel {
   ADMIN = 'ADMIN'
 }
 
-/**
- * Session Context State. Stores default target repository/workspace
- * so AI doesn't have to transmit `owner`, `repo`, `branch` in every single tool call.
- */
 export interface SessionContext {
   owner?: string;
   repo?: string;
@@ -34,13 +30,7 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
   return current;
 }
 
-/**
- * Maps tools to permission levels.
- * Read-only tools are assigned READ_ONLY so AI clients (Gemini, Claude, Cursor)
- * auto-approve execution without asking user permission.
- */
 export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
-  // GitHub Read Tools
   'set_active_context': PermissionLevel.READ_ONLY,
   'get_me': PermissionLevel.READ_ONLY,
   'get_file_contents': PermissionLevel.READ_ONLY,
@@ -69,8 +59,9 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'search_repositories': PermissionLevel.READ_ONLY,
   'search_users': PermissionLevel.READ_ONLY,
   'run_secret_scanning': PermissionLevel.READ_ONLY,
+  'grep': PermissionLevel.READ_ONLY,
+  'view_file_outline': PermissionLevel.READ_ONLY,
 
-  // Render Read Tools
   'list_workspaces': PermissionLevel.READ_ONLY,
   'get_selected_workspace': PermissionLevel.READ_ONLY,
   'list_services': PermissionLevel.READ_ONLY,
@@ -81,10 +72,8 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'get_metrics': PermissionLevel.READ_ONLY,
   'list_env_vars': PermissionLevel.READ_ONLY,
 
-  // Sandbox Read Tools
   'get_sandbox_status': PermissionLevel.READ_ONLY,
 
-  // Mutating Tools
   'add_comment_to_pending_review': PermissionLevel.MUTATING,
   'add_issue_comment': PermissionLevel.MUTATING,
   'add_reply_to_pull_request_comment': PermissionLevel.MUTATING,
@@ -104,7 +93,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'update_pull_request_branch': PermissionLevel.MUTATING,
   'str_replace_editor': PermissionLevel.MUTATING,
 
-  // Render Mutating
   'select_workspace': PermissionLevel.MUTATING,
   'create_web_service': PermissionLevel.MUTATING,
   'create_static_site': PermissionLevel.MUTATING,
@@ -117,7 +105,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'delete_env_var': PermissionLevel.MUTATING,
   'query_render_postgres': PermissionLevel.READ_ONLY,
 
-  // Sandbox Mutating
   'execute_bash': PermissionLevel.MUTATING,
   'run_python': PermissionLevel.MUTATING,
   'run_node': PermissionLevel.MUTATING,
@@ -136,10 +123,6 @@ export function getToolAnnotations(toolName: string) {
   };
 }
 
-/**
- * UNIFIED RESPONSE GATEWAY & TOKEN COMPRESSION ENGINE
- * Strips verbose metadata, URLs, headers, nulls, and compresses response structures.
- */
 export function compressResponseData(data: any, maxChars: number = 2500): any {
   if (data === null || data === undefined) return '';
 
@@ -153,7 +136,7 @@ export function compressResponseData(data: any, maxChars: number = 2500): any {
 
   if (Array.isArray(data)) {
     const compressedList = data.slice(0, 15).map(item => compressResponseData(item, 300));
-    let result = compressedList;
+    let result: any[] = compressedList;
     if (data.length > 15) {
       result.push({ _meta: `Showing 15 of ${data.length} total entries.` });
     }
@@ -162,7 +145,7 @@ export function compressResponseData(data: any, maxChars: number = 2500): any {
 
   if (typeof data === 'object') {
     const compressedObj: Record<string, any> = {};
-    const keysToOmit = new Set(['node_id', 'gravatar_id', 'url', 'html_url', 'followers_url', 'following_url', 'gists_url', 'starred_url', 'subscriptions_url', 'organizations_url', 'repos_url', 'events_url', 'received_events_url', 'site_admin', 'authorizations_url', 'code_frequency_stats', 'commit_activity_stats']);
+    const keysToOmit = new Set(['node_id', 'gravatar_id', 'url', 'html_url', 'followers_url', 'following_url', 'gists_url', 'starred_url', 'subscriptions_url', 'organizations_url', 'repos_url', 'events_url', 'received_events_url', 'site_admin', 'authorizations_url']);
 
     for (const [key, value] of Object.entries(data)) {
       if (keysToOmit.has(key) || value === null || value === undefined || value === '') continue;
@@ -232,4 +215,26 @@ export function sanitizeCommand(cmd: string): void {
 export function resolveInputString(plain?: string, b64?: string): string {
   if (b64) return Buffer.from(b64, 'base64').toString('utf-8');
   return plain || '';
+}
+
+export function safeRegexTest(pattern: string, flags: string, text: string, timeoutMs: number = 200): boolean {
+  const context = { text, pattern, flags, result: false, error: null as any };
+  try {
+    const code = `
+      try {
+        const rx = new RegExp(pattern, flags);
+        result = rx.test(text);
+      } catch(e) {
+        error = e;
+      }
+    `;
+    vm.runInNewContext(code, context, { timeout: timeoutMs });
+    if (context.error) throw context.error;
+    return context.result;
+  } catch (err: any) {
+    if (err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+      throw new Error('Security Error: Regex matching timed out.');
+    }
+    throw err;
+  }
 }

@@ -52,68 +52,68 @@ export function registerRenderTools(server: McpServer, renderTokenGetter: () => 
     async () => callRenderTool('list_workspaces', {}, renderTokenGetter()));
 
   server.registerTool('select_workspace', { description: 'Select active workspace.', inputSchema: { ownerID: z.string() }, annotations: getToolAnnotations('select_workspace') },
-    async (args) => callRenderTool('select_workspace', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('select_workspace', args, renderTokenGetter()));
 
   server.registerTool('get_selected_workspace', { description: 'Get selected workspace info.', inputSchema: {}, annotations: getToolAnnotations('get_selected_workspace') },
     async () => callRenderTool('get_selected_workspace', {}, renderTokenGetter()));
 
   server.registerTool('list_services', { description: 'List services.', inputSchema: { includePreviews: z.boolean().optional().default(false) }, annotations: getToolAnnotations('list_services') },
-    async (args) => callRenderTool('list_services', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('list_services', args, renderTokenGetter()));
 
   server.registerTool('get_service', { description: 'Get service info.', inputSchema: { serviceId: z.string() }, annotations: getToolAnnotations('get_service') },
-    async (args) => callRenderTool('get_service', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('get_service', args, renderTokenGetter()));
 
   server.registerTool('create_web_service', {
     description: 'Create web service.',
     inputSchema: { name: z.string(), runtime: z.enum(['node', 'python', 'go', 'rust', 'docker']), buildCommand: z.string(), startCommand: z.string(), repo: z.string() },
     annotations: getToolAnnotations('create_web_service')
-  }, async (args) => callRenderTool('create_web_service', args, renderTokenGetter()));
+  }, async (args: any) => callRenderTool('create_web_service', args, renderTokenGetter()));
 
   server.registerTool('create_static_site', {
     description: 'Create static site.',
     inputSchema: { name: z.string(), repo: z.string(), buildCommand: z.string(), publishPath: z.string().default('public') },
     annotations: getToolAnnotations('create_static_site')
-  }, async (args) => callRenderTool('create_static_site', args, renderTokenGetter()));
+  }, async (args: any) => callRenderTool('create_static_site', args, renderTokenGetter()));
 
   server.registerTool('create_cron_job', {
     description: 'Create cron job.',
     inputSchema: { name: z.string(), schedule: z.string(), command: z.string(), repo: z.string() },
     annotations: getToolAnnotations('create_cron_job')
-  }, async (args) => callRenderTool('create_cron_job', args, renderTokenGetter()));
+  }, async (args: any) => callRenderTool('create_cron_job', args, renderTokenGetter()));
 
   server.registerTool('restart_service', { description: 'Restart service.', inputSchema: { serviceId: z.string() }, annotations: getToolAnnotations('restart_service') },
-    async (args) => callRenderTool('restart_service', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('restart_service', args, renderTokenGetter()));
 
   server.registerTool('delete_service', { description: 'Delete service.', inputSchema: { serviceId: z.string() }, annotations: getToolAnnotations('delete_service') },
-    async (args) => callRenderTool('delete_service', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('delete_service', args, renderTokenGetter()));
 
   server.registerTool('list_deploys', { description: 'List deploys.', inputSchema: { serviceId: z.string(), limit: z.number().optional().default(5) }, annotations: getToolAnnotations('list_deploys') },
-    async (args) => callRenderTool('list_deploys', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('list_deploys', args, renderTokenGetter()));
 
   server.registerTool('get_deploy', { description: 'Get deploy status.', inputSchema: { serviceId: z.string(), deployId: z.string() }, annotations: getToolAnnotations('get_deploy') },
-    async (args) => callRenderTool('get_deploy', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('get_deploy', args, renderTokenGetter()));
 
   server.registerTool('trigger_deploy', { description: 'Trigger deploy.', inputSchema: { serviceId: z.string(), clearCache: z.enum(['clear', 'do_not_clear']).default('do_not_clear') }, annotations: getToolAnnotations('trigger_deploy') },
-    async (args) => callRenderTool('trigger_deploy', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('trigger_deploy', args, renderTokenGetter()));
 
   server.registerTool('cancel_deploy', { description: 'Cancel deploy.', inputSchema: { serviceId: z.string(), deployId: z.string() }, annotations: getToolAnnotations('cancel_deploy') },
-    async (args) => callRenderTool('cancel_deploy', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('cancel_deploy', args, renderTokenGetter()));
 
   server.registerTool('list_logs', { description: 'Fetch service logs.', inputSchema: { resource: z.array(z.string()), limit: z.number().optional().default(15) }, annotations: getToolAnnotations('list_logs') },
-    async (args) => callRenderTool('list_logs', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('list_logs', args, renderTokenGetter()));
 
   server.registerTool('get_metrics', { description: 'Get CPU/Mem metrics.', inputSchema: { serviceId: z.string() }, annotations: getToolAnnotations('get_metrics') },
-    async (args) => callRenderTool('get_metrics', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('get_metrics', args, renderTokenGetter()));
 
   server.registerTool('list_env_vars', { description: 'List env vars.', inputSchema: { serviceId: z.string() }, annotations: getToolAnnotations('list_env_vars') },
-    async (args) => callRenderTool('list_env_vars', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('list_env_vars', args, renderTokenGetter()));
 
   server.registerTool('update_env_vars', { description: 'Set env vars.', inputSchema: { serviceId: z.string(), envVars: z.array(z.object({ key: z.string(), value: z.string() })) }, annotations: getToolAnnotations('update_env_vars') },
-    async (args) => callRenderTool('update_env_vars', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('update_env_vars', args, renderTokenGetter()));
 
   server.registerTool('delete_env_var', { description: 'Delete env var.', inputSchema: { serviceId: z.string(), key: z.string() }, annotations: getToolAnnotations('delete_env_var') },
-    async (args) => callRenderTool('delete_env_var', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('delete_env_var', args, renderTokenGetter()));
 
   server.registerTool('query_render_postgres', { description: 'Run SQL query.', inputSchema: { postgresId: z.string(), query: z.string() }, annotations: getToolAnnotations('query_render_postgres') },
-    async (args) => callRenderTool('query_render_postgres', args, renderTokenGetter()));
+    async (args: any) => callRenderTool('query_render_postgres', args, renderTokenGetter()));
 }
