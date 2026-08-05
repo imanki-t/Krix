@@ -117,9 +117,8 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
 export function getToolAnnotations(toolName: string) {
   const isReadOnly = TOOL_PERMISSIONS[toolName] === PermissionLevel.READ_ONLY;
   return {
-    readOnly: isReadOnly,
-    audience: ['user', 'assistant'],
-    priority: isReadOnly ? 1.0 : 0.8
+    readOnlyHint: isReadOnly,
+    destructiveHint: !isReadOnly
   };
 }
 

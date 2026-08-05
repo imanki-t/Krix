@@ -499,13 +499,20 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
 
   server.registerTool('add_comment_to_pending_review', {
     description: 'Add line comment to pending review.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), body: z.string(), path: z.string(), line: z.number() },
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), body: z.string(), path: z.string(), line: z.number(), commit_id: z.string().optional() },
     annotations: getToolAnnotations('add_comment_to_pending_review')
   }, async (args: any) => {
-    const { owner, repo, pull_number, body, path, line } = args;
+    const { owner, repo, pull_number, body, path, line, commit_id } = args;
     try {
       const target = resolveRepo(owner, repo);
-      const res = await octokit.pulls.createReviewComment({ owner: target.owner, repo: target.repo, pull_number, body, path, line });
+      let activeCommitId = commit_id;
+      if (!activeCommitId) {
+        const pr = await octokit.pulls.get({ owner: target.owner, repo: target.repo, pull_number });
+        activeCommitId = pr.data.head.sha;
+      }
+      const res = await octokit.pulls.createReviewComment({
+        owner: target.owner, repo: target.repo, pull_number, body, path, line, commit_id: activeCommitId
+      });
       return formatOptimizedResponse(`Comment ID: ${res.data.id}`);
     } catch (err) { return handleGitHubError(err); }
   });
