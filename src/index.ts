@@ -28,7 +28,7 @@ const transports = new Map<string, SessionEntry>();
 
 function tagCategory(registry: Record<string, any>, categoryOf: Record<string, ToolCategory>, fallbackCategory: ToolCategory) {
   for (const name of Object.keys(registry)) {
-    if (!(name in categoryOf)) categoryOf[name] = TOOL_CATEGORY[name] || fallbackCategory;
+    categoryOf[name] = TOOL_CATEGORY[name] || fallbackCategory;
   }
 }
 
