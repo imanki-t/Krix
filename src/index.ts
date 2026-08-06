@@ -68,38 +68,6 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
     }
   }
 
-  server.registerTool('load_toolset', {
-    description: "Enable lazy toolsets: 'github_issues_prs' (issue/PR reviews/comments), 'github_admin' (teams/releases/collaborators), 'sandbox' (git clone/exec/run/push), or 'render' (deploys/logs/env/postgres). Pass 'all' to enable everything.",
-    inputSchema: { category: z.enum(['github_issues_prs', 'github_admin', 'sandbox', 'render', 'all']) },
-    annotations: getToolAnnotations('load_toolset')
-  }, async (args: any) => {
-    const ctx = getSessionContext(sessionId);
-    if (args.category === 'all') {
-      const allCats: ToolCategory[] = ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render'];
-      allCats.forEach(c => ctx.enabledCategories.add(c));
-    } else {
-      ctx.enabledCategories.add(args.category as ToolCategory);
-    }
-
-    const wanted: ToolCategory[] = args.category === 'all'
-      ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
-      : [args.category];
-
-    const justEnabled: string[] = [];
-    for (const [name, handle] of Object.entries(registry)) {
-      if (wanted.includes(categoryOf[name]) && !handle.enabled) {
-        handle.enable();
-        justEnabled.push(name);
-      }
-    }
-
-    try {
-      await server.sendToolListChanged();
-    } catch {}
-
-    return formatOptimizedResponse(justEnabled.length ? { enabled: justEnabled } : { note: 'Requested toolset(s) already enabled.' });
-  });
-
   return server;
 }
 
