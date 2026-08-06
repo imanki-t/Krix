@@ -1,187 +1,195 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { exec, child_process, execSync } from 'node:child_process';
+import { exec, execSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { z } from 'zod';
-import { formatOptimizedResponse, formatError, getToolAnnotations, sanitizeCommand, sanitizePath } from './security.js';
+import {
+  formatOptimizedResponse, formatError, getToolAnnotations,
+  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext
+} from './security.js';
 
-interface ActiveProcess {
-  pid: number;
-  command: string;
-  proc: child_process.ChildProcess;
-  startTime: Date;
+interface ActiveProcess { pid: number; command: string; proc: ChildProcess; startTime: Date; }
+
+const OUT_CAP = 2000;
+const EXEC_LIMITS = { maxBuffer: 4 * 1024 * 1024 };
+
+// Per-session background process table (isolated per registerSandboxTools call).
+const processTables = new Map<string, Map<number, ActiveProcess>>();
+function procTable(sessionId: string): Map<number, ActiveProcess> {
+  let t = processTables.get(sessionId);
+  if (!t) { t = new Map(); processTables.set(sessionId, t); }
+  return t;
 }
 
-const activeProcesses = new Map<number, ActiveProcess>();
+function trunc(s: string, cap: number = OUT_CAP): string {
+  const clean = s.trim();
+  if (!clean) return '';
+  return clean.length > cap ? `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated]` : clean;
+}
 
-async function getOrCreateSandboxDir(sessionId: string = 'default'): Promise<string> {
-  const dir = path.join(os.tmpdir(), `mcp_sandbox_${sessionId}`);
+/** Compact { stdout?, stderr?, exit? } — omits empty fields to save tokens. */
+function execResponse(err: any, stdout: string, stderr: string) {
+  const out: Record<string, any> = {};
+  const o = trunc(stdout || '');
+  const e = trunc(stderr || '');
+  if (o) out.stdout = o;
+  if (e) out.stderr = e;
+  if (err) out.exit = typeof err.code === 'number' ? err.code : 1;
+  return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
+}
+
+function run(cmd: string, cwd: string, timeout: number = 30000): Promise<{ err: any; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    exec(cmd, { cwd, timeout, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+  });
+}
+
+async function sandboxRoot(sessionId: string): Promise<string> {
+  const dir = path.join(os.tmpdir(), `mcp_sbx_${sessionId}`);
   await fs.mkdir(dir, { recursive: true });
   return dir;
 }
 
-export async function destroySandbox(sessionId: string = 'default'): Promise<void> {
-  const dir = path.join(os.tmpdir(), `mcp_sandbox_${sessionId}`);
-  try {
-    for (const [pid, item] of activeProcesses.entries()) {
-      item.proc.kill('SIGKILL');
-      activeProcesses.delete(pid);
-    }
-    await fs.rm(dir, { recursive: true, force: true });
-  } catch {}
+/** Working dir: the cloned repo if one is active for this session, else the scratch sandbox root. */
+async function workDir(sessionId: string): Promise<string> {
+  const ctx = getSessionContext(sessionId);
+  if (ctx.sandboxDir) {
+    try { await fs.access(ctx.sandboxDir); return ctx.sandboxDir; } catch { /* fall through */ }
+  }
+  return sandboxRoot(sessionId);
 }
 
-export function registerSandboxTools(server: McpServer) {
-  server.registerTool('execute_bash', {
-    description: 'Execute shell commands inside isolated sandbox terminal.',
-    inputSchema: { command: z.string(), timeoutMs: z.number().optional().default(30000) },
-    annotations: getToolAnnotations('execute_bash')
+export async function destroySandbox(sessionId: string): Promise<void> {
+  const table = processTables.get(sessionId);
+  if (table) {
+    for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch { /* noop */ } }
+    processTables.delete(sessionId);
+  }
+  try {
+    await fs.rm(path.join(os.tmpdir(), `mcp_sbx_${sessionId}`), { recursive: true, force: true });
+  } catch { /* noop */ }
+}
+
+function fileRunCmd(ext: string, abs: string, extraArgs: string): string {
+  switch (ext) {
+    case '.py': return `python3 "${abs}" ${extraArgs}`;
+    case '.js': return `node "${abs}" ${extraArgs}`;
+    case '.ts': return `npx -y tsx "${abs}" ${extraArgs}`;
+    case '.sh': return `bash "${abs}" ${extraArgs}`;
+    case '.go': return `go run "${abs}" ${extraArgs}`;
+    case '.java': return `java "${abs}" ${extraArgs}`;
+    case '.cpp': return `g++ "${abs}" -o /tmp/_sbx_${Date.now()}.out && /tmp/_sbx_${Date.now()}.out ${extraArgs}`;
+    default: throw new Error(`Unsupported extension '${ext}'. Use py/js/ts/sh/go/java/cpp.`);
+  }
+}
+
+const EXT_BY_LANG: Record<string, string> = { py: '.py', js: '.js', ts: '.ts', sh: '.sh', go: '.go', java: '.java', cpp: '.cpp' };
+
+/** git -c http.extraHeader=... so a PAT is used in-flight and never written to disk/config. */
+function authFlag(token?: string): string {
+  if (!token) return '';
+  const b64 = Buffer.from(`x-access-token:${token}`).toString('base64');
+  return `-c http.extraHeader="Authorization: Basic ${b64}" `;
+}
+
+export function registerSandboxTools(server: McpServer, sessionId: string, githubToken?: string) {
+  // ── General-purpose execution ──────────────────────────────────────────
+  server.registerTool('sandbox_exec', {
+    description: 'Run a shell command in the sandbox. Cwd is the active cloned repo if one exists, else scratch dir.',
+    inputSchema: { command: z.string(), timeoutMs: z.number().optional() },
+    annotations: getToolAnnotations('sandbox_exec')
   }, async (args: any) => {
-    const { command, timeoutMs } = args;
     try {
-      sanitizeCommand(command);
-      const sandboxDir = await getOrCreateSandboxDir('default');
-
-      return await new Promise((resolve) => {
-        exec(command, { cwd: sandboxDir, timeout: Math.min(timeoutMs, 120000), maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
-          let output = '';
-          if (stdout) output += `[STDOUT]\n${stdout.slice(0, 2000)}\n`;
-          if (stderr) output += `[STDERR]\n${stderr.slice(0, 1000)}\n`;
-          if (err) output += `[EXIT CODE: ${err.code || 1}]`;
-
-          resolve(formatOptimizedResponse(output.trim() || 'Executed with zero output.'));
-        });
-      });
+      sanitizeCommand(args.command);
+      const cwd = await workDir(sessionId);
+      const { err, stdout, stderr } = await run(args.command, cwd, Math.min(args.timeoutMs || 30000, 120000));
+      return execResponse(err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('run_python', {
-    description: 'Execute Python snippet.',
-    inputSchema: { code: z.string(), args: z.array(z.string()).optional().default([]) },
-    annotations: getToolAnnotations('run_python')
+  server.registerTool('sandbox_run', {
+    description: 'Run code: pass inline `code` (+ optional `lang`, default py) or an existing `filePath`. Langs: py,js,ts,sh,go,java,cpp.',
+    inputSchema: {
+      lang: z.enum(['py', 'js', 'ts', 'sh', 'go', 'java', 'cpp']).optional(),
+      code: z.string().optional(),
+      filePath: z.string().optional(),
+      args: z.array(z.string()).optional()
+    },
+    annotations: getToolAnnotations('sandbox_run')
   }, async (args: any) => {
-    const { code, args: pyArgs } = args;
+    let tmp: string | null = null;
     try {
-      const sandboxDir = await getOrCreateSandboxDir('default');
-      const tmpFile = path.join(sandboxDir, `script_${Date.now()}.py`);
-      await fs.writeFile(tmpFile, code, 'utf-8');
+      const cwd = await workDir(sessionId);
+      const extraArgs = (args.args || []).join(' ');
 
-      return await new Promise((resolve) => {
-        exec(`python3 ${tmpFile} ${pyArgs.join(' ')}`, { cwd: sandboxDir, timeout: 30000 }, async (err, stdout, stderr) => {
-          await fs.unlink(tmpFile).catch(() => {});
-          resolve(formatOptimizedResponse(stdout || stderr || (err ? err.message : 'Finished.')));
-        });
-      });
-    } catch (err) { return formatError(err); }
-  });
-
-  server.registerTool('run_node', {
-    description: 'Execute JavaScript/TypeScript code snippet.',
-    inputSchema: { code: z.string() },
-    annotations: getToolAnnotations('run_node')
-  }, async (args: any) => {
-    const { code } = args;
-    try {
-      const sandboxDir = await getOrCreateSandboxDir('default');
-      const tmpFile = path.join(sandboxDir, `script_${Date.now()}.js`);
-      await fs.writeFile(tmpFile, code, 'utf-8');
-
-      return await new Promise((resolve) => {
-        exec(`node ${tmpFile}`, { cwd: sandboxDir, timeout: 30000 }, async (err, stdout, stderr) => {
-          await fs.unlink(tmpFile).catch(() => {});
-          resolve(formatOptimizedResponse(stdout || stderr || (err ? err.message : 'Finished.')));
-        });
-      });
-    } catch (err) { return formatError(err); }
-  });
-
-  server.registerTool('install_package', {
-    description: 'Install npm or pip packages into sandbox.',
-    inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()) },
-    annotations: getToolAnnotations('install_package')
-  }, async (args: any) => {
-    const { manager, packages } = args;
-    try {
-      const sandboxDir = await getOrCreateSandboxDir('default');
-      const pkgList = packages.join(' ');
-      const cmd = manager === 'npm' ? `npm install ${pkgList}` : `pip install --target=${sandboxDir} ${pkgList}`;
-
-      return await new Promise((resolve) => {
-        exec(cmd, { cwd: sandboxDir, timeout: 60000 }, (err, stdout, stderr) => {
-          if (err) resolve(formatError(`Install failed: ${stderr || err.message}`));
-          else resolve(formatOptimizedResponse(`Installed ${pkgList} into sandbox.`));
-        });
-      });
-    } catch (err) { return formatError(err); }
-  });
-
-  server.registerTool('run_code_file', {
-    description: 'Run code file (.py, .js, .ts, .java, .cpp, .go, .sh).',
-    inputSchema: { filePath: z.string(), args: z.array(z.string()).optional().default([]) },
-    annotations: getToolAnnotations('run_code_file')
-  }, async (args: any) => {
-    const { filePath, args: runArgs } = args;
-    try {
-      const absPath = sanitizePath(filePath);
-      const ext = path.extname(absPath).toLowerCase();
-      let cmd = '';
-
-      if (ext === '.py') cmd = `python3 ${absPath} ${runArgs.join(' ')}`;
-      else if (ext === '.js') cmd = `node ${absPath} ${runArgs.join(' ')}`;
-      else if (ext === '.ts') cmd = `npx ts-node ${absPath} ${runArgs.join(' ')}`;
-      else if (ext === '.java') cmd = `java ${absPath} ${runArgs.join(' ')}`;
-      else if (ext === '.go') cmd = `go run ${absPath} ${runArgs.join(' ')}`;
-      else if (ext === '.sh') cmd = `bash ${absPath} ${runArgs.join(' ')}`;
-      else if (ext === '.cpp') cmd = `g++ ${absPath} -o /tmp/app.out && /tmp/app.out ${runArgs.join(' ')}`;
-      else throw new Error(`Unsupported extension '${ext}'`);
-
-      return await new Promise((resolve) => {
-        exec(cmd, { timeout: 45000 }, (err, stdout, stderr) => {
-          resolve(formatOptimizedResponse(stdout || stderr || (err ? err.message : 'Finished.')));
-        });
-      });
-    } catch (err) { return formatError(err); }
-  });
-
-  server.registerTool('manage_process', {
-    description: 'Inspect or terminate background sandbox processes.',
-    inputSchema: { action: z.enum(['list', 'kill']), pid: z.number().optional() },
-    annotations: getToolAnnotations('manage_process')
-  }, async (args: any) => {
-    const { action, pid } = args;
-    try {
-      if (action === 'list') {
-        const list = Array.from(activeProcesses.values()).map(p => `PID ${p.pid}: ${p.command}`);
-        return formatOptimizedResponse(list.length ? list.join('\n') : 'No active processes.');
+      let cmd: string;
+      if (args.filePath) {
+        const abs = sanitizePath(args.filePath, cwd);
+        cmd = fileRunCmd(path.extname(abs).toLowerCase(), abs, extraArgs);
+      } else if (args.code) {
+        const ext = EXT_BY_LANG[args.lang || 'py'] || '.py';
+        tmp = path.join(cwd, `_snippet_${Date.now()}${ext}`);
+        await fs.writeFile(tmp, args.code, 'utf-8');
+        cmd = fileRunCmd(ext, tmp, extraArgs);
+      } else {
+        throw new Error('Provide either `code` or `filePath`.');
       }
-      if (action === 'kill' && pid) {
-        const item = activeProcesses.get(pid);
-        if (item) {
-          item.proc.kill('SIGKILL');
-          activeProcesses.delete(pid);
-          return formatOptimizedResponse(`Killed PID ${pid}`);
-        }
-      }
-      return formatError('Process not found.');
+
+      const { err, stdout, stderr } = await run(cmd, cwd, 45000);
+      return execResponse(err, stdout, stderr);
+    } catch (err) { return formatError(err); }
+    finally { if (tmp) await fs.unlink(tmp).catch(() => {}); }
+  });
+
+  server.registerTool('sandbox_install', {
+    description: 'Install npm or pip packages into the sandbox/repo.',
+    inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()).min(1) },
+    annotations: getToolAnnotations('sandbox_install')
+  }, async (args: any) => {
+    try {
+      const cwd = await workDir(sessionId);
+      const list = args.packages.join(' ');
+      const cmd = args.manager === 'npm' ? `npm install ${list}` : `pip install --quiet --target=. ${list}`;
+      const { err, stdout, stderr } = await run(cmd, cwd, 90000);
+      if (err) return execResponse(err, stdout, stderr);
+      return formatOptimizedResponse({ installed: args.packages });
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('cleanup_sandbox', {
-    description: 'Wipe temporary sandbox files.',
+  server.registerTool('sandbox_ps', {
+    description: 'List or kill background sandbox processes.',
+    inputSchema: { action: z.enum(['list', 'kill']).default('list'), pid: z.number().optional() },
+    annotations: getToolAnnotations('sandbox_ps')
+  }, async (args: any) => {
+    const table = procTable(sessionId);
+    if (args.action === 'kill' && args.pid) {
+      const item = table.get(args.pid);
+      if (!item) return formatError('No such process.');
+      item.proc.kill('SIGKILL');
+      table.delete(args.pid);
+      return formatOptimizedResponse({ killed: args.pid });
+    }
+    const list = Array.from(table.values()).map(p => ({ pid: p.pid, command: p.command }));
+    return formatOptimizedResponse(list.length ? list : 'No active processes.');
+  });
+
+  server.registerTool('sandbox_reset', {
+    description: 'Wipe the sandbox: scratch files, cloned repo, and background processes.',
     inputSchema: {},
-    annotations: getToolAnnotations('cleanup_sandbox')
+    annotations: getToolAnnotations('sandbox_reset')
   }, async () => {
     try {
-      await destroySandbox('default');
-      return formatOptimizedResponse('Sandbox wiped clean.');
+      await destroySandbox(sessionId);
+      updateSessionContext(sessionId, { sandboxDir: undefined });
+      return formatOptimizedResponse({ reset: true });
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('get_sandbox_status', {
-    description: 'Check virtual IDE environment status.',
+  server.registerTool('sandbox_status', {
+    description: 'Check available runtimes, memory, and the active repo/branch.',
     inputSchema: {},
-    annotations: getToolAnnotations('get_sandbox_status')
+    annotations: getToolAnnotations('sandbox_status')
   }, async () => {
     try {
       const runtimes: Record<string, string> = {};
@@ -189,18 +197,132 @@ export function registerSandboxTools(server: McpServer) {
         try { runtimes[name] = execSync(cmd, { timeout: 1000 }).toString().trim(); }
         catch { runtimes[name] = 'N/A'; }
       };
+      check('node', 'node -v');
+      check('python', 'python3 --version');
+      check('git', 'git --version');
+      check('go', 'go version');
 
-      check('Node.js', 'node -v');
-      check('Python', 'python3 --version');
-      check('Java', 'java -version 2>&1 | head -n 1');
-      check('Go', 'go version');
-      check('GCC', 'gcc --version | head -n 1');
-
+      const ctx = getSessionContext(sessionId);
       return formatOptimizedResponse({
         freeMemMB: Math.round(os.freemem() / (1024 * 1024)),
-        totalMemMB: Math.round(os.totalmem() / (1024 * 1024)),
-        runtimes
+        runtimes,
+        repo: ctx.owner && ctx.repo ? `${ctx.owner}/${ctx.repo}` : undefined,
+        branch: ctx.branch,
+        cloned: !!ctx.sandboxDir
       });
+    } catch (err) { return formatError(err); }
+  });
+
+  // ── GitHub-repo-backed sandbox (clone, branch, commit, push) ───────────
+  server.registerTool('git_clone', {
+    description: 'Clone a repo into the sandbox so it can be run/tested. Omit owner/repo to use the active context set via set_active_context.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string().optional(), depth: z.number().optional().default(1) },
+    annotations: getToolAnnotations('git_clone')
+  }, async (args: any) => {
+    try {
+      const ctx = getSessionContext(sessionId);
+      const owner = args.owner || ctx.owner;
+      const repo = args.repo || ctx.repo;
+      if (!owner || !repo) throw new Error('owner/repo missing. Pass them or call set_active_context first.');
+      const branch = args.branch || ctx.branch || 'main';
+
+      const root = await sandboxRoot(sessionId);
+      const dest = path.join(root, repo);
+      try {
+        await fs.access(dest);
+        updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
+        return formatOptimizedResponse({ note: 'already cloned', path: dest });
+      } catch { /* not cloned yet */ }
+
+      const url = `https://github.com/${owner}/${repo}.git`;
+      const cmd = `git ${authFlag(githubToken)}clone --depth ${args.depth || 1} --branch ${branch} --single-branch "${url}" "${dest}"`;
+      const { err, stdout, stderr } = await run(cmd, root, 60000);
+      if (err) return execResponse(err, stdout, stderr);
+
+      await run(`git config user.email "agent@sandbox.local" && git config user.name "Sandbox Agent"`, dest);
+      updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
+      return formatOptimizedResponse({ cloned: `${owner}/${repo}`, branch, path: dest });
+    } catch (err) { return formatError(err); }
+  });
+
+  server.registerTool('git_checkout', {
+    description: 'Switch or create a branch in the active cloned repo.',
+    inputSchema: { branch: z.string(), create: z.boolean().optional().default(false) },
+    annotations: getToolAnnotations('git_checkout')
+  }, async (args: any) => {
+    try {
+      const ctx = getSessionContext(sessionId);
+      if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+      const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
+      const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
+      if (err) return execResponse(err, stdout, stderr);
+      updateSessionContext(sessionId, { branch: args.branch });
+      return formatOptimizedResponse({ branch: args.branch });
+    } catch (err) { return formatError(err); }
+  });
+
+  server.registerTool('git_pull', {
+    description: 'Fast-forward pull the active branch of the cloned repo.',
+    inputSchema: {},
+    annotations: getToolAnnotations('git_pull')
+  }, async () => {
+    try {
+      const ctx = getSessionContext(sessionId);
+      if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+      const cmd = `git ${authFlag(githubToken)}pull --ff-only`;
+      const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 30000);
+      return execResponse(err, stdout, stderr);
+    } catch (err) { return formatError(err); }
+  });
+
+  server.registerTool('git_status', {
+    description: 'Compact status (branch + changed files) of the cloned repo.',
+    inputSchema: {},
+    annotations: getToolAnnotations('git_status')
+  }, async () => {
+    try {
+      const ctx = getSessionContext(sessionId);
+      if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+      const { err, stdout, stderr } = await run('git status --porcelain=v1 -b', ctx.sandboxDir, 10000);
+      return execResponse(err, stdout, stderr);
+    } catch (err) { return formatError(err); }
+  });
+
+  server.registerTool('git_diff', {
+    description: 'Diff of the cloned repo, optionally scoped to a path or staged changes.',
+    inputSchema: { path: z.string().optional(), staged: z.boolean().optional().default(false) },
+    annotations: getToolAnnotations('git_diff')
+  }, async (args: any) => {
+    try {
+      const ctx = getSessionContext(sessionId);
+      if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+      const cmd = `git diff ${args.staged ? '--cached ' : ''}-- ${args.path ? `"${args.path}"` : ''}`;
+      const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 10000);
+      return execResponse(err, stdout, stderr);
+    } catch (err) { return formatError(err); }
+  });
+
+  server.registerTool('git_commit_push', {
+    description: 'Stage, commit, and (by default) push changes in the cloned repo.',
+    inputSchema: { message: z.string(), push: z.boolean().optional().default(true) },
+    annotations: getToolAnnotations('git_commit_push')
+  }, async (args: any) => {
+    try {
+      const ctx = getSessionContext(sessionId);
+      if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+      const branch = ctx.branch || 'main';
+
+      const add = await run('git add -A', ctx.sandboxDir, 10000);
+      if (add.err) return execResponse(add.err, add.stdout, add.stderr);
+
+      const commit = await run(`git commit -m ${JSON.stringify(args.message)}`, ctx.sandboxDir, 10000);
+      if (commit.err) return execResponse(commit.err, commit.stdout, commit.stderr);
+
+      if (!args.push) return formatOptimizedResponse({ committed: true });
+
+      const push = await run(`git ${authFlag(githubToken)}push -u origin ${branch}`, ctx.sandboxDir, 30000);
+      if (push.err) return execResponse(push.err, push.stdout, push.stderr);
+      return formatOptimizedResponse({ committed: true, pushed: branch });
     } catch (err) { return formatError(err); }
   });
 }

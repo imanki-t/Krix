@@ -13,7 +13,7 @@ function handleGitHubError(err: any): any {
   return formatError(err);
 }
 
-function resolveRepo(inputOwner?: string, inputRepo?: string, sessionId: string = 'default'): { owner: string; repo: string } {
+function resolveRepo(inputOwner: string | undefined, inputRepo: string | undefined, sessionId: string): { owner: string; repo: string } {
   const ctx = getSessionContext(sessionId);
   const owner = inputOwner || ctx.owner;
   const repo = inputRepo || ctx.repo;
@@ -23,14 +23,14 @@ function resolveRepo(inputOwner?: string, inputRepo?: string, sessionId: string 
   return { owner, repo };
 }
 
-export function registerGitHubTools(server: McpServer, octokit: Octokit) {
+export function registerGitHubTools(server: McpServer, octokit: Octokit, sessionId: string) {
   server.registerTool('set_active_context', {
     description: 'Set default GitHub repository context once per session.',
     inputSchema: { owner: z.string(), repo: z.string(), branch: z.string().optional().default('main') },
     annotations: getToolAnnotations('set_active_context')
   }, async (args: any) => {
     const { owner, repo, branch } = args;
-    updateSessionContext('default', { owner, repo, branch });
+    updateSessionContext(sessionId, { owner, repo, branch });
     return formatOptimizedResponse(`Active repository context set to '${owner}/${repo}' on branch '${branch}'.`);
   });
 
@@ -59,8 +59,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, path, ref, startLine, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
-      const activeRef = ref || getSessionContext('default').branch || 'main';
+      const target = resolveRepo(owner, repo, sessionId);
+      const activeRef = ref || getSessionContext(sessionId).branch || 'main';
       const res = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeRef });
       if ('content' in res.data && typeof res.data.content === 'string') {
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
@@ -91,8 +91,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, path, branch, old_str, old_str_b64, new_str, new_str_b64, message } = args;
     try {
-      const target = resolveRepo(owner, repo);
-      const activeBranch = branch || getSessionContext('default').branch || 'main';
+      const target = resolveRepo(owner, repo, sessionId);
+      const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
       const resolvedOld = resolveInputString(old_str, old_str_b64);
       const resolvedNew = resolveInputString(new_str, new_str_b64);
 
@@ -132,8 +132,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pattern, path, ref, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
-      const activeRef = ref || getSessionContext('default').branch || 'main';
+      const target = resolveRepo(owner, repo, sessionId);
+      const activeRef = ref || getSessionContext(sessionId).branch || 'main';
 
       if (path) {
         const res = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeRef });
@@ -162,8 +162,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, path, ref } = args;
     try {
-      const target = resolveRepo(owner, repo);
-      const activeRef = ref || getSessionContext('default').branch || 'main';
+      const target = resolveRepo(owner, repo, sessionId);
+      const activeRef = ref || getSessionContext(sessionId).branch || 'main';
       const res = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeRef });
       if ('content' in res.data && typeof res.data.content === 'string') {
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
@@ -188,7 +188,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, commit_sha } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.getCommit({ owner: target.owner, repo: target.repo, ref: commit_sha });
       return formatOptimizedResponse({ sha: res.data.sha, message: res.data.commit.message });
     } catch (err) { return handleGitHubError(err); }
@@ -201,7 +201,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, name } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.issues.getLabel({ owner: target.owner, repo: target.repo, name });
       return formatOptimizedResponse(res.data);
     } catch (err) { return handleGitHubError(err); }
@@ -214,7 +214,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.getLatestRelease({ owner: target.owner, repo: target.repo });
       return formatOptimizedResponse({ tag: res.data.tag_name, name: res.data.name });
     } catch (err) { return handleGitHubError(err); }
@@ -227,7 +227,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, tag } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.getReleaseByTag({ owner: target.owner, repo: target.repo, tag });
       return formatOptimizedResponse(res.data);
     } catch (err) { return handleGitHubError(err); }
@@ -240,7 +240,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, tag_sha } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.git.getTag({ owner: target.owner, repo: target.repo, tag_sha });
       return formatOptimizedResponse(res.data);
     } catch (err) { return handleGitHubError(err); }
@@ -277,7 +277,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.listBranches({ owner: target.owner, repo: target.repo, per_page: limit });
       return formatOptimizedResponse(res.data.map(b => `${b.name} (${b.commit.sha.substring(0, 7)})`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
@@ -290,7 +290,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.listCommits({ owner: target.owner, repo: target.repo, per_page: limit });
       return formatOptimizedResponse(res.data.map(c => `- ${c.sha.substring(0, 7)}: ${c.commit.message.split('\n')[0]}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
@@ -303,7 +303,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.issues.listLabelsForRepo({ owner: target.owner, repo: target.repo });
       return formatOptimizedResponse(res.data.map(l => l.name));
     } catch (err) { return handleGitHubError(err); }
@@ -322,7 +322,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, state, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.issues.listForRepo({ owner: target.owner, repo: target.repo, state, per_page: limit });
       return formatOptimizedResponse(res.data.map(i => `#${i.number} [${i.state}]: ${i.title}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
@@ -335,7 +335,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, state, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.pulls.list({ owner: target.owner, repo: target.repo, state, per_page: limit });
       return formatOptimizedResponse(res.data.map(p => `#${p.number} [${p.state}]: ${p.title}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
@@ -348,7 +348,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.listReleases({ owner: target.owner, repo: target.repo, per_page: limit });
       return formatOptimizedResponse(res.data.map(r => `${r.tag_name}: ${r.name || 'Untitled'}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
@@ -361,7 +361,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.listCollaborators({ owner: target.owner, repo: target.repo });
       return formatOptimizedResponse(res.data.map(c => `${c.login} (${c.permissions?.admin ? 'admin' : 'write'})`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
@@ -374,7 +374,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, limit } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.listTags({ owner: target.owner, repo: target.repo, per_page: limit });
       return formatOptimizedResponse(res.data.map(t => `${t.name} -> ${t.commit.sha.substring(0, 7)}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
@@ -387,7 +387,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, issue_number } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const issue = await octokit.issues.get({ owner: target.owner, repo: target.repo, issue_number });
       return formatOptimizedResponse({ number: issue.data.number, title: issue.data.title, body: issue.data.body, state: issue.data.state });
     } catch (err) { return handleGitHubError(err); }
@@ -400,7 +400,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pull_number } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.pulls.get({ owner: target.owner, repo: target.repo, pull_number });
       return formatOptimizedResponse({ number: res.data.number, title: res.data.title, state: res.data.state, mergeable: res.data.mergeable });
     } catch (err) { return handleGitHubError(err); }
@@ -416,7 +416,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
       let query = q;
       if (owner && repo) query += ` repo:${owner}/${repo}`;
       else {
-        const ctx = getSessionContext('default');
+        const ctx = getSessionContext(sessionId);
         if (ctx.owner && ctx.repo) query += ` repo:${ctx.owner}/${ctx.repo}`;
       }
       const res = await octokit.search.code({ q: query, per_page: limit });
@@ -491,7 +491,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.secretScanning.listAlertsForRepo({ owner: target.owner, repo: target.repo });
       return formatOptimizedResponse(`Secret Scanning: Found ${res.data.length} active alerts.`);
     } catch (err) { return handleGitHubError(err); }
@@ -504,7 +504,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pull_number, body, path, line, commit_id } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       let activeCommitId = commit_id;
       if (!activeCommitId) {
         const pr = await octokit.pulls.get({ owner: target.owner, repo: target.repo, pull_number });
@@ -524,7 +524,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, issue_number, body } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.issues.createComment({ owner: target.owner, repo: target.repo, issue_number, body });
       return formatOptimizedResponse(`Comment added #${issue_number}`);
     } catch (err) { return handleGitHubError(err); }
@@ -537,7 +537,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pull_number, comment_id, body } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.pulls.createReplyForReviewComment({ owner: target.owner, repo: target.repo, pull_number, comment_id, body });
       return formatOptimizedResponse(`Reply submitted ID: ${res.data.id}`);
     } catch (err) { return handleGitHubError(err); }
@@ -550,7 +550,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, branch, refSha } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       await octokit.git.createRef({ owner: target.owner, repo: target.repo, ref: `refs/heads/${branch}`, sha: refSha });
       return formatOptimizedResponse(`Branch '${branch}' created.`);
     } catch (err) { return handleGitHubError(err); }
@@ -572,8 +572,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, path, content, content_b64, message, branch, sha } = args;
     try {
-      const target = resolveRepo(owner, repo);
-      const activeBranch = branch || getSessionContext('default').branch || 'main';
+      const target = resolveRepo(owner, repo, sessionId);
+      const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
       const text = resolveInputString(content, content_b64);
       const res = await octokit.repos.createOrUpdateFileContents({
         owner: target.owner, repo: target.repo, path, message, content: Buffer.from(text, 'utf-8').toString('base64'), branch: activeBranch, sha
@@ -589,7 +589,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, title, body, head, base } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.pulls.create({ owner: target.owner, repo: target.repo, title, body, head, base });
       return formatOptimizedResponse(`PR #${res.data.number} created.`);
     } catch (err) { return handleGitHubError(err); }
@@ -603,7 +603,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
     const { name, private: isPrivate, description } = args;
     try {
       const res = await octokit.repos.createForAuthenticatedUser({ name, private: isPrivate, description });
-      updateSessionContext('default', { owner: res.data.owner.login, repo: res.data.name });
+      updateSessionContext(sessionId, { owner: res.data.owner.login, repo: res.data.name });
       return formatOptimizedResponse(`Repo created: ${res.data.full_name}`);
     } catch (err) { return handleGitHubError(err); }
   });
@@ -615,7 +615,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, path, message, sha, branch } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       await octokit.repos.deleteFile({ owner: target.owner, repo: target.repo, path, message, sha, branch });
       return formatOptimizedResponse(`Deleted ${path}`);
     } catch (err) { return handleGitHubError(err); }
@@ -628,7 +628,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.repos.createFork({ owner: target.owner, repo: target.repo });
       return formatOptimizedResponse(`Forked to ${res.data.full_name}`);
     } catch (err) { return handleGitHubError(err); }
@@ -641,7 +641,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, title, body, issue_number } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       if (issue_number) {
         const res = await octokit.issues.update({ owner: target.owner, repo: target.repo, issue_number, title, body });
         return formatOptimizedResponse(`Issue #${res.data.number} updated.`);
@@ -659,7 +659,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pull_number } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.pulls.merge({ owner: target.owner, repo: target.repo, pull_number });
       return formatOptimizedResponse(`Merged PR #${pull_number}`);
     } catch (err) { return handleGitHubError(err); }
@@ -672,7 +672,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pull_number, event, body } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.pulls.createReview({ owner: target.owner, repo: target.repo, pull_number, event, body });
       return formatOptimizedResponse(`Review submitted ID: ${res.data.id}`);
     } catch (err) { return handleGitHubError(err); }
@@ -685,7 +685,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, branch, message, files } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       for (const f of files) {
         let existingSha: string | undefined;
         try {
@@ -713,7 +713,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, parent_issue_number, title, body } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       const res = await octokit.issues.create({ owner: target.owner, repo: target.repo, title: `[Sub-issue #${parent_issue_number}] ${title}`, body });
       return formatOptimizedResponse(`Sub-issue #${res.data.number} created.`);
     } catch (err) { return handleGitHubError(err); }
@@ -726,7 +726,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pull_number, title, body, state } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       await octokit.pulls.update({ owner: target.owner, repo: target.repo, pull_number, title, body, state });
       return formatOptimizedResponse(`PR #${pull_number} updated.`);
     } catch (err) { return handleGitHubError(err); }
@@ -739,7 +739,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit) {
   }, async (args: any) => {
     const { owner, repo, pull_number } = args;
     try {
-      const target = resolveRepo(owner, repo);
+      const target = resolveRepo(owner, repo, sessionId);
       await octokit.pulls.updateBranch({ owner: target.owner, repo: target.repo, pull_number });
       return formatOptimizedResponse(`PR #${pull_number} branch updated.`);
     } catch (err) { return handleGitHubError(err); }

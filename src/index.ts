@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import crypto from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Octokit } from '@octokit/rest';
@@ -20,17 +21,18 @@ interface SessionEntry {
 }
 const transports = new Map<string, SessionEntry>();
 
-function createMasterServer(githubToken: string, renderToken?: string) {
+/** Each connection gets its own McpServer + isolated GitHub/sandbox session context, keyed by sessionId. */
+function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
   const server = new McpServer({
     name: 'unified-mcp-server',
-    version: '2.5.0'
+    version: '3.0.0'
   });
 
   const octokit = new Octokit({ auth: githubToken || '' });
 
-  registerGitHubTools(server, octokit);
+  registerGitHubTools(server, octokit, sessionId);
   registerRenderTools(server, () => renderToken);
-  registerSandboxTools(server);
+  registerSandboxTools(server, sessionId, githubToken);
 
   return server;
 }
@@ -78,8 +80,12 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
+  // Generate the session id ourselves *before* connecting, so the same id can be
+  // threaded into the GitHub/sandbox tool registrars for per-connection isolation.
+  const newSessionId = crypto.randomUUID();
+
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => Math.random().toString(36).substring(2, 15),
+    sessionIdGenerator: () => newSessionId,
     onsessioninitialized: (id) => {
       transports.set(id, { transport, lastActive: Date.now() });
     }
@@ -92,7 +98,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     }
   };
 
-  const masterServer = createMasterServer(githubToken, renderToken);
+  const masterServer = createMasterServer(githubToken, renderToken, newSessionId);
   try {
     await masterServer.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -113,7 +119,7 @@ const cleanupTimer = setInterval(() => {
   for (const [id, entry] of transports.entries()) {
     if (now - entry.lastActive > maxIdle) {
       destroySandbox(id);
-      try { entry.transport.close(); } catch {}
+      try { entry.transport.close(); } catch { /* noop */ }
       transports.delete(id);
     }
   }

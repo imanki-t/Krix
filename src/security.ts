@@ -105,13 +105,18 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'delete_env_var': PermissionLevel.MUTATING,
   'query_render_postgres': PermissionLevel.READ_ONLY,
 
-  'execute_bash': PermissionLevel.MUTATING,
-  'run_python': PermissionLevel.MUTATING,
-  'run_node': PermissionLevel.MUTATING,
-  'install_package': PermissionLevel.MUTATING,
-  'run_code_file': PermissionLevel.MUTATING,
-  'manage_process': PermissionLevel.MUTATING,
-  'cleanup_sandbox': PermissionLevel.MUTATING
+  'sandbox_exec': PermissionLevel.MUTATING,
+  'sandbox_run': PermissionLevel.MUTATING,
+  'sandbox_install': PermissionLevel.MUTATING,
+  'sandbox_ps': PermissionLevel.READ_ONLY,
+  'sandbox_reset': PermissionLevel.MUTATING,
+
+  'git_clone': PermissionLevel.MUTATING,
+  'git_checkout': PermissionLevel.MUTATING,
+  'git_pull': PermissionLevel.MUTATING,
+  'git_status': PermissionLevel.READ_ONLY,
+  'git_diff': PermissionLevel.READ_ONLY,
+  'git_commit_push': PermissionLevel.MUTATING
 };
 
 export function getToolAnnotations(toolName: string) {
