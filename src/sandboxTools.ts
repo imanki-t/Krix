@@ -14,7 +14,6 @@ interface ActiveProcess { pid: number; command: string; proc: ChildProcess; star
 const OUT_CAP = 2000;
 const EXEC_LIMITS = { maxBuffer: 4 * 1024 * 1024 };
 
-// Per-session background process table (isolated per registerSandboxTools call).
 const processTables = new Map<string, Map<number, ActiveProcess>>();
 function procTable(sessionId: string): Map<number, ActiveProcess> {
   let t = processTables.get(sessionId);
@@ -28,7 +27,6 @@ function trunc(s: string, cap: number = OUT_CAP): string {
   return clean.length > cap ? `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated]` : clean;
 }
 
-/** Compact { stdout?, stderr?, exit? } — omits empty fields to save tokens. */
 function execResponse(err: any, stdout: string, stderr: string) {
   const out: Record<string, any> = {};
   const o = trunc(stdout || '');
@@ -46,16 +44,15 @@ function run(cmd: string, cwd: string, timeout: number = 30000): Promise<{ err: 
 }
 
 async function sandboxRoot(sessionId: string): Promise<string> {
-  const dir = path.join(os.tmpdir(), `mcp_sbx_${sessionId}`);
+  const dir = path.join(os.tmpdir(), `krix_sbx_${sessionId}`);
   await fs.mkdir(dir, { recursive: true });
   return dir;
 }
 
-/** Working dir: the cloned repo if one is active for this session, else the scratch sandbox root. */
 async function workDir(sessionId: string): Promise<string> {
   const ctx = getSessionContext(sessionId);
   if (ctx.sandboxDir) {
-    try { await fs.access(ctx.sandboxDir); return ctx.sandboxDir; } catch { /* fall through */ }
+    try { await fs.access(ctx.sandboxDir); return ctx.sandboxDir; } catch {}
   }
   return sandboxRoot(sessionId);
 }
@@ -63,12 +60,12 @@ async function workDir(sessionId: string): Promise<string> {
 export async function destroySandbox(sessionId: string): Promise<void> {
   const table = processTables.get(sessionId);
   if (table) {
-    for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch { /* noop */ } }
+    for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch {} }
     processTables.delete(sessionId);
   }
   try {
-    await fs.rm(path.join(os.tmpdir(), `mcp_sbx_${sessionId}`), { recursive: true, force: true });
-  } catch { /* noop */ }
+    await fs.rm(path.join(os.tmpdir(), `krix_sbx_${sessionId}`), { recursive: true, force: true });
+  } catch {}
 }
 
 function fileRunCmd(ext: string, abs: string, extraArgs: string): string {
@@ -86,7 +83,6 @@ function fileRunCmd(ext: string, abs: string, extraArgs: string): string {
 
 const EXT_BY_LANG: Record<string, string> = { py: '.py', js: '.js', ts: '.ts', sh: '.sh', go: '.go', java: '.java', cpp: '.cpp' };
 
-/** git -c http.extraHeader=... so a PAT is used in-flight and never written to disk/config. */
 function authFlag(token?: string): string {
   if (!token) return '';
   const b64 = Buffer.from(`x-access-token:${token}`).toString('base64');
@@ -96,7 +92,6 @@ function authFlag(token?: string): string {
 export function registerSandboxTools(server: McpServer, sessionId: string, githubToken: string | undefined, registry: Record<string, any>) {
   const reg = makeRegistrar(server, registry);
 
-  // ── General-purpose execution ──────────────────────────────────────────
   reg('sandbox_exec', {
     description: 'Run a shell command in the sandbox. Cwd is the active cloned repo if one exists, else scratch dir.',
     inputSchema: { command: z.string(), timeoutMs: z.number().optional() },
@@ -215,9 +210,8 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  // ── GitHub-repo-backed sandbox (clone, branch, commit, push) ───────────
   reg('git_clone', {
-    description: 'Clone a repo into the sandbox so it can be run/tested. Omit owner/repo to use the active context set via set_active_context.',
+    description: 'Clone a repo into the sandbox so it can be run/tested. Omit owner/repo to use active set_active_context.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string().optional(), depth: z.number().optional().default(1) },
     annotations: getToolAnnotations('git_clone')
   }, async (args: any) => {
@@ -234,7 +228,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         await fs.access(dest);
         updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
         return formatOptimizedResponse({ note: 'already cloned', path: dest });
-      } catch { /* not cloned yet */ }
+      } catch {}
 
       const url = `https://github.com/${owner}/${repo}.git`;
       const cmd = `git ${authFlag(githubToken)}clone --depth ${args.depth || 1} --branch ${branch} --single-branch "${url}" "${dest}"`;
@@ -327,4 +321,4 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       return formatOptimizedResponse({ committed: true, pushed: branch });
     } catch (err) { return formatError(err); }
   });
-}
+        }
