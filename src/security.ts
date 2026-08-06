@@ -138,7 +138,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
 
 const CLOSED_WORLD_TOOLS = new Set([
   'set_active_context', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
-  'git_status', 'git_diff', 'load_toolset'
+  'git_status', 'git_diff'
 ]);
 
 export function getToolAnnotations(toolName: string) {
