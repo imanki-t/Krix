@@ -6,7 +6,7 @@ import os from 'node:os';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations,
-  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, makeRegistrar
+  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar
 } from './security.js';
 
 interface ActiveProcess { pid: number; command: string; proc: ChildProcess; startTime: Date; }
@@ -58,6 +58,7 @@ async function workDir(sessionId: string): Promise<string> {
 }
 
 export async function destroySandbox(sessionId: string): Promise<void> {
+  deleteSessionContext(sessionId);
   const table = processTables.get(sessionId);
   if (table) {
     for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch {} }
