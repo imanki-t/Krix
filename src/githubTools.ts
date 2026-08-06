@@ -702,14 +702,78 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('search_repositories', {
-    description: 'Search repositories.',
-    inputSchema: { q: z.string(), limit: z.number().optional().default(5) },
+    description: 'Search repositories or list user/org repos with pagination (max 20 per page), regex filter, similarity ranking, and detailed metadata.',
+    inputSchema: {
+      q: z.string().optional().describe('Search query term or keywords'),
+      username: z.string().optional().describe('GitHub username or org to fetch repositories for'),
+      regex: z.string().optional().describe('Regex pattern to filter matching repository names'),
+      page: z.number().optional().default(1).describe('Page number (1-indexed)'),
+      limit: z.number().optional().default(20).describe('Items per page (default 20, max 20)')
+    },
     annotations: getToolAnnotations('search_repositories')
   }, async (args: any) => {
-    const { q, limit } = args;
+    const { q, username, regex, page, limit } = args;
     try {
-      const res = await octokit.search.repos({ q, per_page: limit });
-      return formatOptimizedResponse(res.data.items.map(r => `${r.full_name} [${r.default_branch}]`).join('\n'));
+      const perPage = Math.min(Math.max(1, limit || 20), 20);
+      const pageNum = Math.max(1, page || 1);
+      let items: any[] = [];
+      let totalCount = 0;
+
+      if (username) {
+        const userRepos = await octokit.repos.listForUser({
+          username,
+          per_page: perPage,
+          page: pageNum,
+          sort: 'updated'
+        });
+        items = userRepos.data || [];
+        totalCount = items.length;
+      } else {
+        const queryStr = q || 'is:public';
+        const res = await octokit.search.repos({
+          q: queryStr,
+          per_page: perPage,
+          page: pageNum
+        });
+        items = res.data.items || [];
+        totalCount = res.data.total_count || items.length;
+      }
+
+      if (items.length === 0) {
+        return formatOptimizedResponse('No repositories found matching criteria.');
+      }
+
+      let rx: RegExp | null = null;
+      if (regex) {
+        try { rx = new RegExp(regex, 'i'); } catch {}
+      }
+
+      if (rx) {
+        items = items.filter(r => rx!.test(r.name) || rx!.test(r.full_name));
+      }
+
+      const targetQuery = q || regex || '';
+      if (targetQuery) {
+        items.forEach(r => {
+          r._sim = getSimilarity(r.name, targetQuery);
+        });
+        items.sort((a, b) => (b._sim || 0) - (a._sim || 0));
+      }
+
+      const bestMatch = items[0]?.full_name;
+
+      const formatted = items.map((r, i) => {
+        const isBest = r.full_name === bestMatch ? ' 🌟 [Best Match]' : '';
+        const desc = r.description ? ` - ${r.description.slice(0, 120)}` : '';
+        const lang = r.language ? ` [${r.language}]` : '';
+        const stars = ` ⭐ ${r.stargazers_count || 0}`;
+        const branch = ` (${r.default_branch || 'main'})`;
+        const updated = r.updated_at ? ` [Updated: ${r.updated_at.split('T')[0]}]` : '';
+        return `${i + 1}. **${r.full_name}**${isBest}${branch}${lang}${stars}${updated}${desc}`;
+      });
+
+      const meta = `Page ${pageNum} (${formatted.length} items shown, ${totalCount} total matches). To view next 20 repos, call search_repositories with page: ${pageNum + 1}.`;
+      return formatOptimizedResponse(`${meta}\n\n${formatted.join('\n')}\n\nTip: Call set_active_context(owner, repo) to set default repository context and start working instantly.`, 100000);
     } catch (err) { return handleGitHubError(err); }
   });
 
