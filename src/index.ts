@@ -23,29 +23,16 @@ interface SessionEntry {
 }
 const transports = new Map<string, SessionEntry>();
 
-/**
- * Lazy toolset loading — every tool still registers (same 80 names, same
- * schemas), but only the small 'core' set starts enabled. This keeps the
- * initial tools/list payload — and therefore every subsequent turn's token
- * cost — small for sessions that only touch one domain, while still letting
- * an agent reach everything with one `load_toolset` call.
- *
- * `github` is auto-enabled by default: `set_active_context` (core) strongly
- * implies GitHub work is imminent, so gating it behind an extra round-trip
- * would cost more than it saves for the overwhelmingly common case. `render`
- * and `sandbox` stay gated since a session might touch only one or neither.
- */
-function tagCategory(registry: Record<string, any>, categoryOf: Record<string, ToolCategory>, category: ToolCategory) {
+function tagCategory(registry: Record<string, any>, categoryOf: Record<string, ToolCategory>, fallbackCategory: ToolCategory) {
   for (const name of Object.keys(registry)) {
-    if (!(name in categoryOf)) categoryOf[name] = TOOL_CATEGORY[name] || category;
+    if (!(name in categoryOf)) categoryOf[name] = TOOL_CATEGORY[name] || fallbackCategory;
   }
 }
 
-/** Each connection gets its own McpServer + isolated GitHub/sandbox session context, keyed by sessionId. */
 function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
   const server = new McpServer({
-    name: 'unified-mcp-server',
-    version: '3.1.0'
+    name: 'krix',
+    version: '1.0.0'
   });
 
   const octokit = new Octokit({ auth: githubToken || '' });
@@ -54,23 +41,29 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
   const categoryOf: Record<string, ToolCategory> = {};
 
   registerGitHubTools(server, octokit, sessionId, registry);
-  tagCategory(registry, categoryOf, 'github');
+  tagCategory(registry, categoryOf, 'github_admin');
+  
   registerRenderTools(server, () => renderToken, registry);
   tagCategory(registry, categoryOf, 'render');
+  
   registerSandboxTools(server, sessionId, githubToken, registry);
   tagCategory(registry, categoryOf, 'sandbox');
 
+  // Disable non-core toolsets on connect to save token footprint
   for (const [name, handle] of Object.entries(registry)) {
     const cat = categoryOf[name];
-    if (cat === 'render' || cat === 'sandbox') handle.disable();
+    if (cat !== 'core') handle.disable();
   }
 
   server.registerTool('load_toolset', {
-    description: "Enable a gated toolset for this session: 'render' (deploys/logs/env vars/postgres) or 'sandbox' (git clone/exec/run/push). GitHub tools are already enabled by default. Pass 'all' to enable everything at once.",
-    inputSchema: { category: z.enum(['render', 'sandbox', 'all']) },
+    description: "Enable lazy toolsets: 'github_issues_prs' (issue/PR reviews/comments), 'github_admin' (teams/releases/collaborators), 'sandbox' (git clone/exec/run/push), or 'render' (deploys/logs/env/postgres). Pass 'all' to enable everything.",
+    inputSchema: { category: z.enum(['github_issues_prs', 'github_admin', 'sandbox', 'render', 'all']) },
     annotations: getToolAnnotations('load_toolset')
   }, async (args: any) => {
-    const wanted: ToolCategory[] = args.category === 'all' ? ['github', 'render', 'sandbox'] : [args.category];
+    const wanted: ToolCategory[] = args.category === 'all'
+      ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
+      : [args.category];
+
     const justEnabled: string[] = [];
     for (const [name, handle] of Object.entries(registry)) {
       if (wanted.includes(categoryOf[name]) && !handle.enabled) {
@@ -127,8 +120,6 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  // Generate the session id ourselves *before* connecting, so the same id can be
-  // threaded into the GitHub/sandbox tool registrars for per-connection isolation.
   const newSessionId = crypto.randomUUID();
 
   const transport = new StreamableHTTPServerTransport({
@@ -157,7 +148,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
 });
 
 app.get('/', (_req, res) => {
-  res.send('⚡ Unified Ephemeral MCP Gateway Active.');
+  res.send('⚡ Krix Gateway Active.');
 });
 
 const cleanupTimer = setInterval(() => {
@@ -166,7 +157,7 @@ const cleanupTimer = setInterval(() => {
   for (const [id, entry] of transports.entries()) {
     if (now - entry.lastActive > maxIdle) {
       destroySandbox(id);
-      try { entry.transport.close(); } catch { /* noop */ }
+      try { entry.transport.close(); } catch {}
       transports.delete(id);
     }
   }
@@ -174,7 +165,7 @@ const cleanupTimer = setInterval(() => {
 cleanupTimer.unref();
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => console.log(`🚀 Gateway Active on Port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`🚀 Krix Active on Port ${PORT}`));
 
 function shutdown() {
   clearInterval(cleanupTimer);
