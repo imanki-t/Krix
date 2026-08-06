@@ -55,7 +55,7 @@ function run(cmd: string, cwd: string, timeout: number = 30000): Promise<{ err: 
 }
 
 async function sandboxRoot(sessionId: string): Promise<string> {
-  const dir = path.join(os.tmpdir(), `krix_sbx_${sessionId}`);
+  const dir = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
   await fs.mkdir(dir, { recursive: true });
   return dir;
 }
