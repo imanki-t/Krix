@@ -48,18 +48,19 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('get_file_contents', {
-    description: 'Fetch file contents or line window.',
+    description: 'Fetch file contents or specific line window. Default limit 100 lines, max limit 500 lines.',
     inputSchema: {
       owner: z.string().optional(),
       repo: z.string().optional(),
       path: z.string(),
       ref: z.string().optional(),
       startLine: z.number().optional().default(1),
+      endLine: z.number().optional(),
       limit: z.number().optional().default(100)
     },
     annotations: getToolAnnotations('get_file_contents')
   }, async (args: any) => {
-    const { owner, repo, path, ref, startLine, limit } = args;
+    const { owner, repo, path, ref, startLine, endLine, limit } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
       const activeRef = ref || getSessionContext(sessionId).branch || 'main';
@@ -67,10 +68,15 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       if ('content' in res.data && typeof res.data.content === 'string') {
         const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
         const lines = raw.split('\n');
-        const start = Math.max(1, startLine);
-        const end = Math.min(lines.length, start + limit - 1);
+        const start = Math.max(1, startLine || 1);
+        let lineCount = limit || 100;
+        if (endLine !== undefined && endLine !== null && endLine >= start) {
+          lineCount = endLine - start + 1;
+        }
+        lineCount = Math.min(500, Math.max(1, lineCount));
+        const end = Math.min(lines.length, start + lineCount - 1);
         const slice = lines.slice(start - 1, end).map((l, i) => `${(start + i).toString().padStart(5, ' ')} | ${l}`).join('\n');
-        return formatOptimizedResponse(`[L${start}-L${end} / ${lines.length}]\n\n${slice}`);
+        return formatOptimizedResponse(`[L${start}-L${end} / ${lines.length}]\n\n${slice}`, 100000);
       }
       return formatOptimizedResponse('Not a standard text file.');
     } catch (err) { return handleGitHubError(err); }
@@ -792,20 +798,20 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('update_pull_request', {
-    description: 'Update PR details.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), title: z.string().optional(), body: z.string().optional(), state: z.enum(['open', 'closed']).optional() },
+    description: 'Update PR.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), title: z.string().optional(), body: z.string().optional(), state: z.enum(['open', 'closed']).optional(), base: z.string().optional() },
     annotations: getToolAnnotations('update_pull_request')
   }, async (args: any) => {
-    const { owner, repo, pull_number, title, body, state } = args;
+    const { owner, repo, pull_number, title, body, state, base } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      await octokit.pulls.update({ owner: target.owner, repo: target.repo, pull_number, title, body, state });
-      return formatOptimizedResponse(`PR #${pull_number} updated.`);
+      const res = await octokit.pulls.update({ owner: target.owner, repo: target.repo, pull_number, title, body, state, base });
+      return formatOptimizedResponse(`PR #${res.data.number} updated.`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('update_pull_request_branch', {
-    description: 'Update PR branch with base.',
+    description: 'Update PR branch with base changes.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('update_pull_request_branch')
   }, async (args: any) => {

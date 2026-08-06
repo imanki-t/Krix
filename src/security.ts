@@ -243,8 +243,8 @@ export function compressResponseData(data: any, maxChars: number = 2500): any {
   return data;
 }
 
-export function formatOptimizedResponse(data: any) {
-  const compressed = compressResponseData(data);
+export function formatOptimizedResponse(data: any, maxChars?: number) {
+  const compressed = compressResponseData(data, maxChars);
   const text = typeof compressed === 'string' ? compressed : JSON.stringify(compressed);
   return { content: [{ type: 'text' as const, text }] };
 }
