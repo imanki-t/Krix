@@ -31,88 +31,92 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
 }
 
 export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
+  // Agentic Core Tools
   'set_active_context': PermissionLevel.READ_ONLY,
   'get_me': PermissionLevel.READ_ONLY,
   'get_file_contents': PermissionLevel.READ_ONLY,
+  'str_replace_editor': PermissionLevel.MUTATING,
+  'create_or_update_file': PermissionLevel.MUTATING,
+  'delete_file': PermissionLevel.MUTATING,
+  'grep': PermissionLevel.READ_ONLY,
+  'view_file_outline': PermissionLevel.READ_ONLY,
+  'list_branches': PermissionLevel.READ_ONLY,
+  'create_branch': PermissionLevel.MUTATING,
+  'delete_branch': PermissionLevel.MUTATING,
+  'push_files': PermissionLevel.MUTATING,
+  'create_pull_request': PermissionLevel.MUTATING,
   'get_commit': PermissionLevel.READ_ONLY,
+  'search_code': PermissionLevel.READ_ONLY,
+  'search_commits': PermissionLevel.READ_ONLY,
+  'search_repositories': PermissionLevel.READ_ONLY,
+  'sandbox_status': PermissionLevel.READ_ONLY,
+  'load_toolset': PermissionLevel.READ_ONLY,
+
+  // GitHub Issues & PRs
+  'list_issues': PermissionLevel.READ_ONLY,
+  'list_pull_requests': PermissionLevel.READ_ONLY,
+  'issue_read': PermissionLevel.READ_ONLY,
+  'issue_write': PermissionLevel.MUTATING,
+  'sub_issue_write': PermissionLevel.MUTATING,
+  'add_issue_comment': PermissionLevel.MUTATING,
+  'pull_request_read': PermissionLevel.READ_ONLY,
+  'pull_request_review_write': PermissionLevel.MUTATING,
+  'add_comment_to_pending_review': PermissionLevel.MUTATING,
+  'add_reply_to_pull_request_comment': PermissionLevel.MUTATING,
+  'update_pull_request': PermissionLevel.MUTATING,
+  'update_pull_request_branch': PermissionLevel.MUTATING,
+  'merge_pull_request': PermissionLevel.MUTATING,
+  'search_issues': PermissionLevel.READ_ONLY,
+  'search_pull_requests': PermissionLevel.READ_ONLY,
+
+  // GitHub Admin & Extended
   'get_label': PermissionLevel.READ_ONLY,
   'get_release': PermissionLevel.READ_ONLY,
   'get_tag': PermissionLevel.READ_ONLY,
   'get_team_members': PermissionLevel.READ_ONLY,
   'get_teams': PermissionLevel.READ_ONLY,
-  'list_branches': PermissionLevel.READ_ONLY,
   'list_commits': PermissionLevel.READ_ONLY,
   'list_issue_fields': PermissionLevel.READ_ONLY,
   'list_issue_types': PermissionLevel.READ_ONLY,
-  'list_issues': PermissionLevel.READ_ONLY,
-  'list_pull_requests': PermissionLevel.READ_ONLY,
   'list_releases': PermissionLevel.READ_ONLY,
   'list_repository_collaborators': PermissionLevel.READ_ONLY,
   'list_tags': PermissionLevel.READ_ONLY,
-  'issue_read': PermissionLevel.READ_ONLY,
-  'pull_request_read': PermissionLevel.READ_ONLY,
-  'search_code': PermissionLevel.READ_ONLY,
-  'search_commits': PermissionLevel.READ_ONLY,
-  'search_issues': PermissionLevel.READ_ONLY,
-  'search_pull_requests': PermissionLevel.READ_ONLY,
-  'search_repositories': PermissionLevel.READ_ONLY,
   'search_users': PermissionLevel.READ_ONLY,
   'run_secret_scanning': PermissionLevel.READ_ONLY,
-  'grep': PermissionLevel.READ_ONLY,
-  'view_file_outline': PermissionLevel.READ_ONLY,
+  'create_repository': PermissionLevel.MUTATING,
+  'fork_repository': PermissionLevel.MUTATING,
+  'request_copilot_review': PermissionLevel.MUTATING,
+  'assign_copilot_to_issue': PermissionLevel.MUTATING,
 
+  // Render Tools
   'list_workspaces': PermissionLevel.READ_ONLY,
+  'select_workspace': PermissionLevel.MUTATING,
   'get_selected_workspace': PermissionLevel.READ_ONLY,
   'list_services': PermissionLevel.READ_ONLY,
   'get_service': PermissionLevel.READ_ONLY,
-  'list_deploys': PermissionLevel.READ_ONLY,
-  'get_deploy': PermissionLevel.READ_ONLY,
-  'list_logs': PermissionLevel.READ_ONLY,
-  'get_metrics': PermissionLevel.READ_ONLY,
-  'list_env_vars': PermissionLevel.READ_ONLY,
-  'list_log_label_values': PermissionLevel.READ_ONLY,
-
-  'get_sandbox_status': PermissionLevel.READ_ONLY,
-  'load_toolset': PermissionLevel.READ_ONLY,
-
-  'add_comment_to_pending_review': PermissionLevel.MUTATING,
-  'add_issue_comment': PermissionLevel.MUTATING,
-  'add_reply_to_pull_request_comment': PermissionLevel.MUTATING,
-  'create_branch': PermissionLevel.MUTATING,
-  'create_or_update_file': PermissionLevel.MUTATING,
-  'create_pull_request': PermissionLevel.MUTATING,
-  'create_repository': PermissionLevel.MUTATING,
-  'delete_file': PermissionLevel.MUTATING,
-  'fork_repository': PermissionLevel.MUTATING,
-  'issue_write': PermissionLevel.MUTATING,
-  'merge_pull_request': PermissionLevel.MUTATING,
-  'pull_request_review_write': PermissionLevel.MUTATING,
-  'push_files': PermissionLevel.MUTATING,
-  'request_copilot_review': PermissionLevel.MUTATING,
-  'sub_issue_write': PermissionLevel.MUTATING,
-  'update_pull_request': PermissionLevel.MUTATING,
-  'update_pull_request_branch': PermissionLevel.MUTATING,
-  'str_replace_editor': PermissionLevel.MUTATING,
-  'assign_copilot_to_issue': PermissionLevel.MUTATING,
-
-  'select_workspace': PermissionLevel.MUTATING,
   'create_web_service': PermissionLevel.MUTATING,
   'create_static_site': PermissionLevel.MUTATING,
   'create_cron_job': PermissionLevel.MUTATING,
   'restart_service': PermissionLevel.MUTATING,
   'delete_service': PermissionLevel.MUTATING,
+  'list_deploys': PermissionLevel.READ_ONLY,
+  'get_deploy': PermissionLevel.READ_ONLY,
   'trigger_deploy': PermissionLevel.MUTATING,
   'cancel_deploy': PermissionLevel.MUTATING,
+  'list_logs': PermissionLevel.READ_ONLY,
+  'list_log_label_values': PermissionLevel.READ_ONLY,
+  'get_metrics': PermissionLevel.READ_ONLY,
+  'list_env_vars': PermissionLevel.READ_ONLY,
   'update_env_vars': PermissionLevel.MUTATING,
   'delete_env_var': PermissionLevel.MUTATING,
   'query_render_postgres': PermissionLevel.READ_ONLY,
 
+  // Sandbox & Git CLI Tools
   'sandbox_exec': PermissionLevel.MUTATING,
   'sandbox_run': PermissionLevel.MUTATING,
   'sandbox_install': PermissionLevel.MUTATING,
   'sandbox_ps': PermissionLevel.READ_ONLY,
   'sandbox_reset': PermissionLevel.MUTATING,
-
   'git_clone': PermissionLevel.MUTATING,
   'git_checkout': PermissionLevel.MUTATING,
   'git_pull': PermissionLevel.MUTATING,
@@ -121,7 +125,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'git_commit_push': PermissionLevel.MUTATING
 };
 
-/** Tools that never leave the local process / never touch a third-party API. */
 const CLOSED_WORLD_TOOLS = new Set([
   'set_active_context', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
   'git_status', 'git_diff', 'load_toolset'
@@ -132,33 +135,73 @@ export function getToolAnnotations(toolName: string) {
   return {
     title: toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
     readOnlyHint: isReadOnly,
-    // A read-only call is inherently non-destructive and, for GitHub/Render's
-    // GET-style endpoints, safe to repeat — this lets MCP clients that honor
-    // these hints (Claude Desktop, Gemini CLI, etc.) auto-approve simple reads
-    // like get_me/list_branches instead of prompting for permission every time.
     destructiveHint: !isReadOnly,
     idempotentHint: isReadOnly,
     openWorldHint: !CLOSED_WORLD_TOOLS.has(toolName)
   };
 }
 
-/**
- * Category used by the lazy toolset loader (see index.ts) to group tools for
- * enable/disable. Only the always-on core set is listed explicitly here —
- * index.ts tags every other tool by which registrar function produced it.
- */
-export type ToolCategory = 'core' | 'github' | 'render' | 'sandbox';
+export type ToolCategory = 'core' | 'github_issues_prs' | 'github_admin' | 'render' | 'sandbox';
 
 export const TOOL_CATEGORY: Record<string, ToolCategory> = {
-  set_active_context: 'core', get_me: 'core', sandbox_status: 'core', load_toolset: 'core'
+  // Always-Enabled Agentic Core Tools
+  set_active_context: 'core',
+  get_me: 'core',
+  get_file_contents: 'core',
+  str_replace_editor: 'core',
+  create_or_update_file: 'core',
+  delete_file: 'core',
+  grep: 'core',
+  view_file_outline: 'core',
+  list_branches: 'core',
+  create_branch: 'core',
+  delete_branch: 'core',
+  push_files: 'core',
+  create_pull_request: 'core',
+  get_commit: 'core',
+  search_code: 'core',
+  search_commits: 'core',
+  search_repositories: 'core',
+  sandbox_status: 'core',
+  load_toolset: 'core',
+
+  // Issues & PR Workflow Category
+  list_issues: 'github_issues_prs',
+  list_pull_requests: 'github_issues_prs',
+  issue_read: 'github_issues_prs',
+  issue_write: 'github_issues_prs',
+  sub_issue_write: 'github_issues_prs',
+  add_issue_comment: 'github_issues_prs',
+  pull_request_read: 'github_issues_prs',
+  pull_request_review_write: 'github_issues_prs',
+  add_comment_to_pending_review: 'github_issues_prs',
+  add_reply_to_pull_request_comment: 'github_issues_prs',
+  update_pull_request: 'github_issues_prs',
+  update_pull_request_branch: 'github_issues_prs',
+  merge_pull_request: 'github_issues_prs',
+  search_issues: 'github_issues_prs',
+  search_pull_requests: 'github_issues_prs',
+
+  // GitHub Extended / Admin Category
+  get_label: 'github_admin',
+  get_release: 'github_admin',
+  get_tag: 'github_admin',
+  get_teams: 'github_admin',
+  get_team_members: 'github_admin',
+  list_commits: 'github_admin',
+  list_releases: 'github_admin',
+  list_tags: 'github_admin',
+  list_issue_fields: 'github_admin',
+  list_issue_types: 'github_admin',
+  list_repository_collaborators: 'github_admin',
+  search_users: 'github_admin',
+  create_repository: 'github_admin',
+  fork_repository: 'github_admin',
+  run_secret_scanning: 'github_admin',
+  request_copilot_review: 'github_admin',
+  assign_copilot_to_issue: 'github_admin',
 };
 
-/**
- * Thin wrapper around server.registerTool that also stashes the returned
- * RegisteredTool handle in a shared registry, keyed by tool name. The
- * lazy toolset loader in index.ts uses these handles to .enable()/.disable()
- * whole categories at once (each call auto-fires sendToolListChanged()).
- */
 export function makeRegistrar(server: any, registry: Record<string, any>) {
   return (name: string, config: any, handler: any) => {
     registry[name] = server.registerTool(name, config, handler);
