@@ -6,7 +6,7 @@ import os from 'node:os';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations,
-  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar
+  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession
 } from './security.js';
 
 interface ActiveProcess { pid: number; command: string; proc: ChildProcess; startTime: Date; }
