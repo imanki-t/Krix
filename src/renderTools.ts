@@ -18,7 +18,7 @@ async function getRenderSession(renderToken: string): Promise<string> {
       signal: controller.signal,
       body: JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'unified-mcp-server', version: '2.5.0' } }
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'krix', version: '1.0.0' } }
       })
     });
     clearTimeout(timeoutId);
@@ -65,10 +65,6 @@ export function registerRenderTools(server: McpServer, renderTokenGetter: () => 
   reg('get_service', { description: 'Get service info.', inputSchema: { serviceId: z.string() }, annotations: getToolAnnotations('get_service') },
     async (args: any) => callRenderTool('get_service', args, renderTokenGetter()));
 
-  // All three create_* tools below were missing fields Render's own MCP
-  // actually accepts — plan/region/autoDeploy/envVars/branch — so every
-  // service came out on defaults the caller couldn't control (e.g. always
-  // 'oregon', never able to set env vars at creation time).
   reg('create_web_service', {
     description: 'Create web service.',
     inputSchema: {
@@ -133,14 +129,8 @@ export function registerRenderTools(server: McpServer, renderTokenGetter: () => 
   reg('cancel_deploy', { description: 'Cancel deploy.', inputSchema: { serviceId: z.string(), deployId: z.string() }, annotations: getToolAnnotations('cancel_deploy') },
     async (args: any) => callRenderTool('cancel_deploy', args, renderTokenGetter()));
 
-  // Full Render filter surface — was previously limited to {resource, limit},
-  // which forced the model to pull unfiltered pages and search client-side.
-  // Render's own MCP already implements all of these server-side; we were
-  // just never exposing them through this schema. Passing them through lets
-  // the agent ask for e.g. only ERROR-level lines matching text "timeout" in
-  // the last 10 minutes instead of dumping the raw tail.
   reg('list_logs', {
-    description: 'Search service logs with server-side filters (level/text/time range) — always prefer narrowing here over pulling unfiltered logs.',
+    description: 'Search service logs with server-side filters (level/text/time range).',
     inputSchema: {
       resource: z.array(z.string()),
       text: z.array(z.string()).optional(),
@@ -160,7 +150,7 @@ export function registerRenderTools(server: McpServer, renderTokenGetter: () => 
   }, async (args: any) => callRenderTool('list_logs', args, renderTokenGetter()));
 
   reg('list_log_label_values', {
-    description: 'List available values for a log filter label (e.g. discover valid `level` or `host` values before calling list_logs).',
+    description: 'List available values for a log filter label.',
     inputSchema: { resource: z.array(z.string()), label: z.string() },
     annotations: getToolAnnotations('list_log_label_values')
   }, async (args: any) => callRenderTool('list_log_label_values', args, renderTokenGetter()));
@@ -179,4 +169,4 @@ export function registerRenderTools(server: McpServer, renderTokenGetter: () => 
 
   reg('query_render_postgres', { description: 'Run SQL query.', inputSchema: { postgresId: z.string(), query: z.string() }, annotations: getToolAnnotations('query_render_postgres') },
     async (args: any) => callRenderTool('query_render_postgres', args, renderTokenGetter()));
-}
+      }
