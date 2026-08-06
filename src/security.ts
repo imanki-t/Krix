@@ -19,13 +19,28 @@ export interface SessionContext {
 
 const sessionContexts = new Map<string, SessionContext>();
 
+// This server is single-tenant (one GitHub token, one operator). The MCP
+// transport can mint a new session id whenever a caller doesn't resend the
+// mcp-session-id header, which would otherwise silently wipe owner/repo/
+// branch/sandboxDir set via set_active_context or git_clone. Track the most
+// recently used values here and seed every new session from them, so context
+// survives session churn instead of requiring owner/repo to be repeated on
+// every call.
+let lastKnownContext: { owner?: string; repo?: string; branch?: string; sandboxDir?: string } = {};
+
 export function getSessionContext(sessionId: string): SessionContext {
   if (!sessionContexts.has(sessionId)) {
     const enableAll = process.env.ENABLE_ALL_TOOLS === 'true';
     const initial: ToolCategory[] = enableAll
       ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
       : ['core', 'sandbox'];
-    sessionContexts.set(sessionId, { branch: 'main', enabledCategories: new Set(initial) });
+    sessionContexts.set(sessionId, {
+      branch: lastKnownContext.branch || 'main',
+      owner: lastKnownContext.owner,
+      repo: lastKnownContext.repo,
+      sandboxDir: lastKnownContext.sandboxDir,
+      enabledCategories: new Set(initial)
+    });
   }
   return sessionContexts.get(sessionId)!;
 }
@@ -33,6 +48,10 @@ export function getSessionContext(sessionId: string): SessionContext {
 export function updateSessionContext(sessionId: string, patch: Partial<SessionContext>): SessionContext {
   const current = getSessionContext(sessionId);
   Object.assign(current, patch);
+  if (patch.owner) lastKnownContext.owner = patch.owner;
+  if (patch.repo) lastKnownContext.repo = patch.repo;
+  if (patch.branch) lastKnownContext.branch = patch.branch;
+  if (patch.sandboxDir) lastKnownContext.sandboxDir = patch.sandboxDir;
   return current;
 }
 
