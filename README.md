@@ -1,49 +1,64 @@
-# Unified GitHub & Render MCP Gateway
+# Unified GitHub, Render & Sandbox MCP Gateway
 
-This repository contains a lightweight, single-port Model Context Protocol (MCP) server that merges local GitHub utility tools with a curated, token-efficient proxy to official Render developer actions. 
-
-By filtering down heavy JSON payloads locally and providing highly parameterized search, grep, and pagination limits, this gateway reduces startup overhead and conversational context consumption by up to 80% compared to a standard, unoptimized registration.
+A single-port Model Context Protocol (MCP) server combining GitHub repo tools,
+a token-efficient Render proxy, and an execution sandbox that can clone,
+branch, run, and push back to real GitHub repos — all with response payloads
+trimmed for minimum token consumption.
 
 ---
 
 ## Features
 
-### 1. GitHub Integration (14 Tools)
-*   **Repository Access:** `get_viewer`, `list_repos`, `search_repos`, `list_branches`
-*   **File Manipulation:** `get_tree`, `get_contents`, `put_contents`, `patch_contents`, `delete_contents`, `grep_file`
-*   **Git Control:** `create_ref`, `delete_ref`, `search_code`, `create_pull`
+### GitHub tools
+Repo/file access (`get_file_contents`, `str_replace_editor`, `grep`,
+`view_file_outline`, `list_branches`, `list_commits`, …), issues/PRs
+(`issue_read`, `issue_write`, `pull_request_read`, `create_pull_request`,
+`merge_pull_request`, …), and search (`search_code`, `search_repositories`,
+`search_issues`, …). Call `set_active_context` once per session with
+`owner`/`repo`/`branch` and every other tool call can omit those fields.
 
-### 2. Streamlined Render Integration (8 Tools)
-To prevent your chat limits from draining due to schema overhead and verbose responses, the following Render tools are registered:
-*   `list_workspaces` — Lists available personal and team Render workspaces.
-*   `select_workspace` — Switches context to a specific workspace ID.
-*   `get_selected_workspace` — Identifies the active workspace configuration.
-*   `list_services` — Lists and searches web services, background workers, and databases using substring or regex filters.
-*   `get_service` — Inspects the direct configuration and runtime status of a service.
-*   `list_deploys` — Retrieves deployment success/failure history.
-*   `get_deploy` — Gets exact details of a specific build phase.
-*   `list_logs` — Pulls application server logs with configurable search limits.
+### Sandbox tools
+- `sandbox_exec` — run a shell command
+- `sandbox_run` — run inline code or a file (py/js/ts/sh/go/java/cpp)
+- `sandbox_install` — npm/pip install
+- `sandbox_ps` / `sandbox_reset` / `sandbox_status`
+
+### GitHub-backed sandbox (clone, branch, run, push)
+- `git_clone` — clone a repo into the sandbox (defaults to the active
+  `set_active_context` repo/branch if you omit owner/repo)
+- `git_checkout` — switch or create a branch
+- `git_pull` / `git_status` / `git_diff`
+- `git_commit_push` — stage, commit, and push in one call
+
+Once cloned, `sandbox_exec` / `sandbox_run` / `sandbox_install` automatically
+operate inside the cloned repo, so Claude can clone → install → test → edit →
+commit → push in one continuous session. Authentication uses a per-request
+`git -c http.extraHeader=...` header, so the PAT is never written to disk or
+the repo's git config.
+
+### Render tools
+`list_workspaces`, `select_workspace`, `list_services`, `get_service`,
+`list_deploys`, `get_deploy`, `trigger_deploy`, `list_logs`, `get_metrics`,
+env var management, and Postgres queries — proxied through Render's own MCP
+server. Automatically disabled (tools still register but calls no-op with an
+error) if no Render key is configured.
 
 ---
 
-## Token Optimization & Context Protection
+## Token Optimization
 
-The gateway implements several server-side design practices to keep conversational context windows clean:
-
-### Local Payload Pruning
-Downstream REST responses (specifically from Render) often contain vast, deeply-nested configuration structures. This gateway intercept and cleans those payloads—removing redundant workspace billing blocks, configuration schemas, and environment arrays—mapping them into highly simplified structures before presenting them to the model.
-
-### Regex-Powered Service Filtering (`list_services`)
-Instead of fetching and outputting a full array of services to the model, the `list_services` tool performs local substring and regular expression matching on the server. The model can target specific resources—for example, searching `"grumm"` to immediately isolate services connected to a specific repository—and paginate results cleanly via `limit` and `offset` variables.
-
-### Scalable Code Inspection (`get_contents`)
-*   **Controllable Window**: Defaults to a safe reading size of **300 lines**.
-*   **Max Capacity**: Allows the model to request up to **750 lines** using the `limit` or `endLine` parameters when broader contextual scans are necessary.
-*   **Continuation Prompts**: Truncated results append clear paging guides indicating exactly how to call subsequent blocks.
-
-### Code Searches & Match Contexts
-*   **Code Search (`search_code`)**: Limits result structures to targeted fragments rather than entire files. Includes a `fragmentLines` parameter (up to 50 lines) so the model can request more surrounding code when needed.
-*   **Localized Grepping (`grep_file`)**: Rather than reading entire files to locate reference terms, the `grep_file` tool supports regex match limits (up to 100) and an optional `contextLines` parameter (up to 5 lines). When enabled, this generates visual blocks highlighting the target matched lines along with their immediate surrounding lines in the terminal.
+- **Session isolation**: each connection gets its own generated session id,
+  threaded through GitHub context, sandbox working directory, and background
+  process tracking — no cross-session bleed.
+- **Compact responses**: every tool response is passed through
+  `compressResponseData`, which drops empty/null fields, strips noisy GitHub
+  API boilerplate keys (`node_id`, `*_url`, …), and truncates long strings
+  and arrays with a `_meta` marker instead of dumping everything.
+- **Secret redaction**: tokens, keys, and PEM blocks are redacted from every
+  response and error message before they reach the model.
+- **Minimal schemas**: most parameters are optional with sensible defaults
+  (active repo/branch context, working directory, timeouts) so calls can be
+  made with the fewest possible fields.
 
 ---
 
@@ -53,3 +68,24 @@ Duplicate `.env.example` as `.env` and fill out your credentials:
 
 ```bash
 cp .env.example .env
+```
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `MCP_API_KEY` | Yes | Clients must send this via `x-api-key` / `Authorization: Bearer` / `?api_key=` |
+| `GITHUB_PAT` | Recommended | Default GitHub token (repo scope); can be overridden per-request via `x-github-token` |
+| `RENDER_PAT` | Optional | Default Render API key; can be overridden per-request via `x-render-token` |
+| `PORT` | Optional | Defaults to `3000` |
+
+> **Note:** `git_clone`/`git_pull`/`git_commit_push` shell out to the `git`
+> CLI. Make sure the deploy image includes git (the default Node.js Docker
+> images do; slim/alpine variants need `apt-get install git` /
+> `apk add git` added to the build).
+
+## Run
+
+```bash
+npm install
+npm run build
+npm start
+```
