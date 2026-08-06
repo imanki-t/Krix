@@ -71,6 +71,16 @@ export function persistEnabledCategory(identity: string, cat: string) {
   }
 }
 
+export function revokeEnabledCategory(identity: string, cat: string) {
+  const categories = getEnabledCategories(identity);
+  if (cat === 'all') {
+    categories.clear();
+    categories.add('core');
+  } else {
+    categories.delete(cat as ToolCategory);
+  }
+}
+
 export function cleanupIdleIdentities(maxIdleMs: number = 24 * 60 * 60 * 1000): void {
   const now = Date.now();
   for (const [id, entry] of enabledCategoriesByIdentity.entries()) {
@@ -103,6 +113,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'patch_contents': PermissionLevel.MUTATING,
   'sandbox_status': PermissionLevel.READ_ONLY,
   'load_toolset': PermissionLevel.READ_ONLY,
+  'lock_toolset': PermissionLevel.READ_ONLY,
 
   // GitHub Issues & PRs
   'list_issues': PermissionLevel.READ_ONLY,
@@ -179,7 +190,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
 
 const CLOSED_WORLD_TOOLS = new Set([
   'set_active_context', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
-  'git_status', 'git_diff', 'load_toolset'
+  'git_status', 'git_diff', 'load_toolset', 'lock_toolset'
 ]);
 
 export function getToolAnnotations(toolName: string) {
@@ -218,6 +229,7 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   patch_contents: 'core',
   sandbox_status: 'core',
   load_toolset: 'core',
+  lock_toolset: 'core',
 
   // Issues & PR Workflow Category
   list_issues: 'github_issues_prs',
