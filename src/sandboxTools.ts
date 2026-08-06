@@ -68,7 +68,7 @@ export async function destroySandbox(sessionId: string): Promise<void> {
   } catch {}
 }
 
-function fileRunCmd(ext: string, abs: string, extraArgs: string): string {
+function fileRunCmd(ext: string, abs: string, extraArgs: string, binPath?: string): string {
   switch (ext) {
     case '.py': return `python3 "${abs}" ${extraArgs}`;
     case '.js': return `node "${abs}" ${extraArgs}`;
@@ -76,7 +76,10 @@ function fileRunCmd(ext: string, abs: string, extraArgs: string): string {
     case '.sh': return `bash "${abs}" ${extraArgs}`;
     case '.go': return `go run "${abs}" ${extraArgs}`;
     case '.java': return `java "${abs}" ${extraArgs}`;
-    case '.cpp': return `g++ "${abs}" -o /tmp/_sbx_${Date.now()}.out && /tmp/_sbx_${Date.now()}.out ${extraArgs}`;
+    case '.cpp': {
+      const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
+      return `g++ "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
+    }
     default: throw new Error(`Unsupported extension '${ext}'. Use py/js/ts/sh/go/java/cpp.`);
   }
 }
@@ -116,6 +119,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     annotations: getToolAnnotations('sandbox_run')
   }, async (args: any) => {
     let tmp: string | null = null;
+    let createdBin: string | null = null;
     try {
       const cwd = await workDir(sessionId);
       const extraArgs = (args.args || []).join(' ');
@@ -123,12 +127,23 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       let cmd: string;
       if (args.filePath) {
         const abs = sanitizePath(args.filePath, cwd);
-        cmd = fileRunCmd(path.extname(abs).toLowerCase(), abs, extraArgs);
+        const ext = path.extname(abs).toLowerCase();
+        if (ext === '.cpp') {
+          createdBin = path.join(cwd, `_sbx_out_${Date.now()}`);
+          cmd = fileRunCmd(ext, abs, extraArgs, createdBin);
+        } else {
+          cmd = fileRunCmd(ext, abs, extraArgs);
+        }
       } else if (args.code) {
         const ext = EXT_BY_LANG[args.lang || 'py'] || '.py';
         tmp = path.join(cwd, `_snippet_${Date.now()}${ext}`);
         await fs.writeFile(tmp, args.code, 'utf-8');
-        cmd = fileRunCmd(ext, tmp, extraArgs);
+        if (ext === '.cpp') {
+          createdBin = path.join(cwd, `_sbx_out_${Date.now()}`);
+          cmd = fileRunCmd(ext, tmp, extraArgs, createdBin);
+        } else {
+          cmd = fileRunCmd(ext, tmp, extraArgs);
+        }
       } else {
         throw new Error('Provide either `code` or `filePath`.');
       }
@@ -136,7 +151,10 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const { err, stdout, stderr } = await run(cmd, cwd, 45000);
       return execResponse(err, stdout, stderr);
     } catch (err) { return formatError(err); }
-    finally { if (tmp) await fs.unlink(tmp).catch(() => {}); }
+    finally {
+      if (tmp) await fs.unlink(tmp).catch(() => {});
+      if (createdBin) await fs.unlink(createdBin).catch(() => {});
+    }
   });
 
   reg('sandbox_install', {
@@ -321,4 +339,4 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       return formatOptimizedResponse({ committed: true, pushed: branch });
     } catch (err) { return formatError(err); }
   });
-        }
+}
