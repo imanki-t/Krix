@@ -170,9 +170,7 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   delete_branch: 'core',
   push_files: 'core',
   create_pull_request: 'core',
-  get_commit: 'core',
   search_code: 'core',
-  search_commits: 'core',
   search_repositories: 'core',
   git_tree: 'core',
   patch_contents: 'core',
@@ -197,6 +195,8 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   search_pull_requests: 'github_issues_prs',
 
   // GitHub Extended / Admin Category
+  get_commit: 'github_admin',
+  search_commits: 'github_admin',
   get_label: 'github_admin',
   get_release: 'github_admin',
   get_tag: 'github_admin',
