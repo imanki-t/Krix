@@ -76,7 +76,7 @@ export async function destroySandbox(sessionId: string): Promise<void> {
     processTables.delete(sessionId);
   }
   try {
-    await fs.rm(path.join(os.tmpdir(), `krix_sbx_${sessionId}`), { recursive: true, force: true });
+    await fs.rm(path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`), { recursive: true, force: true });
   } catch {}
 }
 
