@@ -9,7 +9,10 @@ import dotenv from 'dotenv';
 import { registerGitHubTools } from './githubTools.js';
 import { registerRenderTools } from './renderTools.js';
 import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
-import { formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory } from './security.js';
+import {
+  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory,
+  identityKey, getEnabledCategories, persistEnabledCategory, cleanupIdleIdentities
+} from './security.js';
 
 dotenv.config();
 
@@ -29,7 +32,7 @@ function tagCategory(registry: Record<string, any>, categoryOf: Record<string, T
   }
 }
 
-function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
+function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string, identity: string) {
   const server = new McpServer({
     name: 'krix',
     version: '1.0.0'
@@ -49,10 +52,15 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
   registerSandboxTools(server, sessionId, githubToken, registry);
   tagCategory(registry, categoryOf, 'sandbox');
 
-  // Disable non-core toolsets on connect to save token footprint
+  // Re-enable any category already unlocked for this caller identity, disable others
+  const persistedCats = getEnabledCategories(identity);
   for (const [name, handle] of Object.entries(registry)) {
     const cat = categoryOf[name];
-    if (cat !== 'core') handle.disable();
+    if (persistedCats.has(cat)) {
+      handle.enable();
+    } else {
+      handle.disable();
+    }
   }
 
   server.registerTool('load_toolset', {
@@ -60,6 +68,8 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
     inputSchema: { category: z.enum(['github_issues_prs', 'github_admin', 'sandbox', 'render', 'all']) },
     annotations: getToolAnnotations('load_toolset')
   }, async (args: any) => {
+    persistEnabledCategory(identity, args.category);
+
     const wanted: ToolCategory[] = args.category === 'all'
       ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
       : [args.category];
@@ -105,6 +115,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
 
   const githubToken = (req.headers['x-github-token'] as string) || DEFAULT_GITHUB_PAT || '';
   const renderToken = (req.headers['x-render-token'] as string) || DEFAULT_RENDER_API_KEY;
+  const callerIdentity = identityKey(githubToken);
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
   if (sessionId && transports.has(sessionId)) {
@@ -136,7 +147,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     }
   };
 
-  const masterServer = createMasterServer(githubToken, renderToken, newSessionId);
+  const masterServer = createMasterServer(githubToken, renderToken, newSessionId, callerIdentity);
   try {
     await masterServer.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -161,6 +172,7 @@ const cleanupTimer = setInterval(() => {
       transports.delete(id);
     }
   }
+  cleanupIdleIdentities(24 * 60 * 60 * 1000);
 }, 3 * 60 * 1000);
 cleanupTimer.unref();
 
