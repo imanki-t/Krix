@@ -174,7 +174,6 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   git_tree: 'core',
   patch_contents: 'core',
   sandbox_status: 'core',
-  load_toolset: 'core',
 
   // Issues & PR Workflow Category
   list_issues: 'github_issues_prs',
