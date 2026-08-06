@@ -13,9 +13,15 @@ trimmed for minimum token consumption.
 Repo/file access (`get_file_contents`, `str_replace_editor`, `grep`,
 `view_file_outline`, `list_branches`, `list_commits`, …), issues/PRs
 (`issue_read`, `issue_write`, `pull_request_read`, `create_pull_request`,
-`merge_pull_request`, …), and search (`search_code`, `search_repositories`,
-`search_issues`, …). Call `set_active_context` once per session with
-`owner`/`repo`/`branch` and every other tool call can omit those fields.
+`merge_pull_request`, `assign_copilot_to_issue`, `request_copilot_review`, …),
+and search (`search_code`, `search_repositories`, `search_issues`, …). Call
+`set_active_context` once per session with `owner`/`repo`/`branch` and every
+other tool call can omit those fields.
+
+List tools (`list_issues`, `list_pull_requests`, `list_commits`) accept the
+full server-side filter set GitHub's API actually supports (labels, assignee,
+milestone, sort/direction, head/base, path/author/date range, …) instead of
+paging unfiltered and searching client-side.
 
 ### Sandbox tools
 - `sandbox_exec` — run a shell command
@@ -38,10 +44,47 @@ the repo's git config.
 
 ### Render tools
 `list_workspaces`, `select_workspace`, `list_services`, `get_service`,
-`list_deploys`, `get_deploy`, `trigger_deploy`, `list_logs`, `get_metrics`,
-env var management, and Postgres queries — proxied through Render's own MCP
-server. Automatically disabled (tools still register but calls no-op with an
-error) if no Render key is configured.
+`list_deploys`, `get_deploy`, `trigger_deploy`, `list_logs` /
+`list_log_label_values`, `get_metrics`, env var management, and Postgres
+queries — proxied through Render's own MCP server. `list_logs` exposes
+Render's full filter set (`text`, `level`, `type`, `instance`, `host`,
+`statusCode`, `method`, `path`, `startTime`/`endTime`, `direction`) so the
+agent can search for e.g. only ERROR-level lines in the last 10 minutes
+server-side instead of pulling and scanning raw log dumps.
+`create_web_service` / `create_static_site` / `create_cron_job` accept
+`plan`, `region`, `autoDeploy`, and `envVars` at creation time. Render tools
+are automatically disabled (still register but calls no-op with an error) if
+no Render key is configured.
+
+---
+
+## Lazy Toolset Loading
+
+All ~82 tools still register on connect, but only a small core set —
+`set_active_context`, `get_me`, `sandbox_status`, `load_toolset` — plus the
+full GitHub toolset start **enabled**. Render and Sandbox tools start
+**disabled** and don't count toward the `tools/list` payload a session pays
+for until requested:
+
+```
+load_toolset({ category: "render" })   // enable Render tools
+load_toolset({ category: "sandbox" })  // enable sandbox/git tools
+load_toolset({ category: "all" })      // enable everything
+```
+
+This uses the MCP SDK's native `enable()`/`disable()` + `sendToolListChanged()`
+— no custom router tool, no client-side config. GitHub auto-enables by
+default since `set_active_context` telegraphs GitHub intent almost every
+session; gating it behind an extra round-trip would cost more than it saves.
+
+## Permission Hints
+
+Every tool's MCP `annotations` now include `readOnlyHint`, `destructiveHint`,
+`idempotentHint`, and `openWorldHint` (previously only the first two).
+Clients that honor these hints (Claude Desktop, Gemini CLI, etc.) can
+auto-approve safe reads like `get_me` or `list_branches` instead of prompting
+for confirmation on every call — this is a signal the server provides, not
+something it can force a client to respect.
 
 ---
 
@@ -59,6 +102,9 @@ error) if no Render key is configured.
 - **Minimal schemas**: most parameters are optional with sensible defaults
   (active repo/branch context, working directory, timeouts) so calls can be
   made with the fewest possible fields.
+- **Lazy toolset loading**: Render and Sandbox tools stay disabled until
+  `load_toolset` is called, keeping `tools/list` — and every turn's token
+  cost — small for sessions that only touch one domain. See above.
 
 ---
 
