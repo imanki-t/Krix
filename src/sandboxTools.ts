@@ -39,7 +39,17 @@ function execResponse(err: any, stdout: string, stderr: string) {
 
 function run(cmd: string, cwd: string, timeout: number = 30000): Promise<{ err: any; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    exec(cmd, { cwd, timeout, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+    // process.env.HOME can point at a directory that doesn't exist in this
+    // container (e.g. /home/sbx_userXXXX), which makes npm/pip fail with
+    // ENOENT trying to create their cache/config dirs there. Pin HOME (and
+    // the npm cache) to the sandbox's own writable tmp dir instead.
+    const safeHome = path.join(os.tmpdir(), 'krix_home');
+    const env = {
+      ...process.env,
+      HOME: safeHome,
+      npm_config_cache: path.join(safeHome, '.npm'),
+    };
+    exec(cmd, { cwd, timeout, env, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
   });
 }
 
