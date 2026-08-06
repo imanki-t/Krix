@@ -36,6 +36,12 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
   const server = new McpServer({
     name: 'krix',
     version: '1.0.0'
+  }, {
+    capabilities: {
+      tools: {
+        listChanged: true
+      }
+    }
   });
 
   const octokit = new Octokit({ auth: githubToken || '' });
@@ -81,6 +87,11 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
         justEnabled.push(name);
       }
     }
+
+    try {
+      await server.sendToolListChanged();
+    } catch {}
+
     return formatOptimizedResponse(justEnabled.length ? { enabled: justEnabled } : { note: 'Requested toolset(s) already enabled.' });
   });
 
