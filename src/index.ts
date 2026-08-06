@@ -104,6 +104,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   if (sessionId && transports.has(sessionId)) {
     const entry = transports.get(sessionId)!;
     entry.lastActive = Date.now();
+    registerSessionAuth(sessionId, githubToken);
     try {
       await entry.transport.handleRequest(req, res, req.body);
     } catch (error: any) {
@@ -115,6 +116,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   }
 
   const newSessionId = crypto.randomUUID();
+  registerSessionAuth(newSessionId, githubToken);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => newSessionId,
