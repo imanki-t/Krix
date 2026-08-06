@@ -18,6 +18,81 @@ function resolveRepo(inputOwner, inputRepo, sessionId) {
     }
     return { owner, repo };
 }
+function editDistance(s1, s2) {
+    s1 = s1.toLowerCase();
+    s2 = s2.toLowerCase();
+    const costs = [];
+    for (let i = 0; i <= s1.length; i++) {
+        let lastValue = i;
+        for (let j = 0; j <= s2.length; j++) {
+            if (i === 0) {
+                costs[j] = j;
+            }
+            else {
+                if (j > 0) {
+                    let newValue = costs[j - 1];
+                    if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
+                        newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
+                    }
+                    costs[j - 1] = lastValue;
+                    lastValue = newValue;
+                }
+            }
+        }
+        if (i > 0)
+            costs[s2.length] = lastValue;
+    }
+    return costs[s2.length];
+}
+function getSimilarity(s1, s2) {
+    let longer = s1;
+    let shorter = s2;
+    if (s1.length < s2.length) {
+        longer = s2;
+        shorter = s1;
+    }
+    const longerLength = longer.length;
+    if (longerLength === 0)
+        return 1.0;
+    return (longerLength - editDistance(longer, shorter)) / longerLength;
+}
+function getBestMatchFeedback(content, oldStr) {
+    const contentLines = content.split('\n');
+    const oldLines = oldStr.split('\n');
+    const n = contentLines.length;
+    const m = oldLines.length;
+    let bestRatio = 0;
+    let bestStartIdx = -1;
+    let bestEndIdx = -1;
+    if (!oldStr.trim())
+        return "Error: Target old_str is blank.";
+    for (let i = 0; i <= n - m; i++) {
+        const window = contentLines.slice(i, i + m).join('\n');
+        const sim = getSimilarity(window, oldStr);
+        if (sim > bestRatio) {
+            bestRatio = sim;
+            bestStartIdx = i;
+            bestEndIdx = i + m;
+        }
+    }
+    if (bestRatio > 0.4) {
+        const closestSnippet = [];
+        const contextStart = Math.max(0, bestStartIdx - 3);
+        const contextEnd = Math.min(n, bestEndIdx + 3);
+        for (let idx = contextStart; idx < contextEnd; idx++) {
+            const isTarget = idx >= bestStartIdx && idx < bestEndIdx;
+            const prefix = isTarget ? ">> " : "   ";
+            closestSnippet.push(`${prefix}L${idx + 1}: ${contentLines[idx]}`);
+        }
+        return `Error: Target old_str sequence block not found in file.\n\n` +
+            `Closest match found (similarity ${(bestRatio * 100).toFixed(1)}%):\n` +
+            `-----------------------------------------\n` +
+            `${closestSnippet.join('\n')}\n` +
+            `-----------------------------------------\n\n` +
+            `Check formatting, indentation, and brackets inside old_str precisely.`;
+    }
+    return "Error: Target old_str sequence block not found in file. Check target file parameters and try again.";
+}
 export function registerGitHubTools(server, octokit, sessionId, registry) {
     const reg = makeRegistrar(server, registry);
     reg('set_active_context', {
@@ -110,7 +185,8 @@ export function registerGitHubTools(server, octokit, sessionId, registry) {
             const normalizedOld = resolvedOld.replace(/\r\n/g, '\n');
             const normalizedNew = resolvedNew.replace(/\r\n/g, '\n');
             if (!normalizedContent.includes(normalizedOld)) {
-                throw new Error('Target old_str sequence block not found in file.');
+                const feedback = getBestMatchFeedback(normalizedContent, normalizedOld);
+                throw new Error(feedback);
             }
             const updated = normalizedContent.replace(normalizedOld, normalizedNew);
             const res = await octokit.repos.createOrUpdateFileContents({
@@ -123,37 +199,90 @@ export function registerGitHubTools(server, octokit, sessionId, registry) {
         }
     });
     reg('grep', {
-        description: 'High-performance pattern search with line windowing.',
+        description: 'High-performance pattern search with line windowing and optional filters.',
         inputSchema: {
             owner: z.string().optional(),
             repo: z.string().optional(),
             pattern: z.string(),
             path: z.string().optional(),
             ref: z.string().optional(),
+            glob: z.string().optional().describe('Filter matching paths by substring/glob pattern'),
+            type: z.string().optional().describe('Filter by file extension (e.g. ts, py)'),
+            output_mode: z.enum(['content', 'files_with_matches', 'count']).optional().default('content'),
+            case_insensitive: z.boolean().optional().default(true),
+            show_line_numbers: z.boolean().optional().default(true),
+            context_before: z.number().optional().default(0),
+            context_after: z.number().optional().default(0),
+            offset: z.number().optional().default(0),
             limit: z.number().optional().default(10)
         },
         annotations: getToolAnnotations('grep')
     }, async (args) => {
-        const { owner, repo, pattern, path, ref, limit } = args;
+        const { owner, repo, pattern, path, ref, glob, type, output_mode, case_insensitive, show_line_numbers, context_before, context_after, offset, limit } = args;
         try {
             const target = resolveRepo(owner, repo, sessionId);
             const activeRef = ref || getSessionContext(sessionId).branch || 'main';
+            const mode = output_mode || 'content';
+            const isCaseInsensitive = case_insensitive !== false;
+            const before = Math.min(Math.max(0, context_before || 0), 10);
+            const after = Math.min(Math.max(0, context_after || 0), 10);
+            const showLineNums = show_line_numbers !== false;
+            const maxLimit = Math.min(limit || 10, 50);
+            const startOffset = Math.max(0, offset || 0);
             if (path) {
                 const res = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeRef });
                 if ('content' in res.data && typeof res.data.content === 'string') {
                     const raw = Buffer.from(res.data.content, 'base64').toString('utf-8');
                     const lines = raw.split('\n');
-                    const matches = [];
+                    const matchedIndices = [];
                     lines.forEach((line, idx) => {
-                        if (line.toLowerCase().includes(pattern.toLowerCase())) {
-                            matches.push(`L${idx + 1}: ${line}`);
+                        const matched = isCaseInsensitive
+                            ? line.toLowerCase().includes(pattern.toLowerCase())
+                            : line.includes(pattern);
+                        if (matched)
+                            matchedIndices.push(idx);
+                    });
+                    if (matchedIndices.length === 0) {
+                        return formatOptimizedResponse('No matches found in target path.');
+                    }
+                    if (mode === 'files_with_matches')
+                        return formatOptimizedResponse(`Matching target path:\n- ${path}`);
+                    if (mode === 'count')
+                        return formatOptimizedResponse(`File: ${path} - ${matchedIndices.length} matches`);
+                    const sliced = matchedIndices.slice(startOffset, startOffset + maxLimit);
+                    const processed = new Set();
+                    const outputLines = [];
+                    sliced.forEach(matchIdx => {
+                        const s = Math.max(0, matchIdx - before);
+                        const e = Math.min(lines.length - 1, matchIdx + after);
+                        for (let i = s; i <= e; i++) {
+                            if (processed.has(i))
+                                continue;
+                            processed.add(i);
+                            const prefix = i === matchIdx ? '>> ' : '   ';
+                            const numStr = showLineNums ? `L${i + 1} | ` : '';
+                            outputLines.push(`${prefix}${numStr}${lines[i]}`);
                         }
                     });
-                    return formatOptimizedResponse(matches.slice(0, limit).join('\n') || 'No matches found in target path.');
+                    return formatOptimizedResponse(`File: ${path} (${matchedIndices.length} total matches)\n\n${outputLines.join('\n')}`);
                 }
             }
-            const searchRes = await octokit.search.code({ q: `${pattern} repo:${target.owner}/${target.repo}`, per_page: limit });
-            return formatOptimizedResponse(searchRes.data.items.map(i => `- ${i.path}`).join('\n') || 'No code matches.');
+            let query = pattern;
+            query += ` repo:${target.owner}/${target.repo}`;
+            if (type)
+                query += ` extension:${type}`;
+            const searchRes = await octokit.search.code({ q: query, per_page: maxLimit });
+            let items = searchRes.data.items || [];
+            if (glob) {
+                const lowerGlob = glob.toLowerCase().replace(/\*/g, '');
+                items = items.filter(i => i.path.toLowerCase().includes(lowerGlob));
+            }
+            if (items.length === 0)
+                return formatOptimizedResponse('No code matches found.');
+            if (mode === 'files_with_matches') {
+                return formatOptimizedResponse(items.map(i => `- ${i.path}`).join('\n'));
+            }
+            return formatOptimizedResponse(items.map(i => `- ${i.path}`).join('\n'));
         }
         catch (err) {
             return handleGitHubError(err);
@@ -182,6 +311,79 @@ export function registerGitHubTools(server, octokit, sessionId, registry) {
                 return formatOptimizedResponse(outline.length ? outline.join('\n') : 'No major declarations found.');
             }
             return formatOptimizedResponse('Not a text file.');
+        }
+        catch (err) {
+            return handleGitHubError(err);
+        }
+    });
+    reg('get_tree', {
+        description: 'Retrieve file path tree index recursively.',
+        inputSchema: {
+            owner: z.string().optional(),
+            repo: z.string().optional(),
+            tree_sha: z.string().optional(),
+            offset: z.number().optional().default(0),
+            limit: z.number().optional().default(50),
+            q: z.string().optional()
+        },
+        annotations: getToolAnnotations('get_tree')
+    }, async (args) => {
+        const { owner, repo, tree_sha, offset, limit, q } = args;
+        try {
+            const target = resolveRepo(owner, repo, sessionId);
+            const activeSha = tree_sha || getSessionContext(sessionId).branch || 'main';
+            const res = await octokit.git.getTree({ owner: target.owner, repo: target.repo, tree_sha: activeSha, recursive: 'true' });
+            let tree = res.data.tree;
+            if (q) {
+                const lowerQ = q.toLowerCase();
+                tree = tree.filter(t => (t.path || '').toLowerCase().includes(lowerQ));
+            }
+            const total = tree.length;
+            const targetLimit = Math.min(limit || 50, 200);
+            const startIdx = Math.max(0, offset || 0);
+            const items = tree.slice(startIdx, startIdx + targetLimit).map(t => `${t.type === 'tree' ? '[D]' : '[F]'} ${t.path}`);
+            const out = items.join('\n');
+            const meta = `Showing items ${startIdx + 1}-${Math.min(startIdx + targetLimit, total)} of ${total} paths.`;
+            return formatOptimizedResponse(`${meta}\n\n${out || 'No paths located.'}`);
+        }
+        catch (err) {
+            return handleGitHubError(err);
+        }
+    });
+    reg('patch_contents', {
+        description: 'Replace specified line range directly by line numbers. Supports newContent_b64 for Base64 inputs.',
+        inputSchema: {
+            owner: z.string().optional(),
+            repo: z.string().optional(),
+            path: z.string(),
+            branch: z.string().optional(),
+            startLine: z.number().describe('1-indexed start line number'),
+            endLine: z.number().describe('1-indexed end line number'),
+            newContent: z.string().optional(),
+            newContent_b64: z.string().optional(),
+            message: z.string()
+        },
+        annotations: getToolAnnotations('patch_contents')
+    }, async (args) => {
+        const { owner, repo, path, branch, startLine, endLine, newContent, newContent_b64, message } = args;
+        try {
+            const target = resolveRepo(owner, repo, sessionId);
+            const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
+            const resolvedNew = resolveInputString(newContent, newContent_b64);
+            const fileData = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeBranch });
+            if (Array.isArray(fileData.data) || !('content' in fileData.data))
+                throw new Error('Target is not a file.');
+            const raw = Buffer.from(fileData.data.content, 'base64').toString('utf-8');
+            const lines = raw.split('\n');
+            if (startLine < 1 || endLine < startLine || endLine > lines.length) {
+                throw new Error(`Invalid line coordinates. Target file has ${lines.length} lines.`);
+            }
+            lines.splice(startLine - 1, endLine - startLine + 1, ...resolvedNew.split('\n'));
+            const updated = lines.join('\n');
+            const res = await octokit.repos.createOrUpdateFileContents({
+                owner: target.owner, repo: target.repo, path, message, content: Buffer.from(updated, 'utf-8').toString('base64'), branch: activeBranch, sha: fileData.data.sha
+            });
+            return formatOptimizedResponse(`Line range patch committed: ${res.data.commit.sha}`);
         }
         catch (err) {
             return handleGitHubError(err);
@@ -695,7 +897,7 @@ export function registerGitHubTools(server, octokit, sessionId, registry) {
             const res = await octokit.repos.createOrUpdateFileContents({
                 owner: target.owner, repo: target.repo, path, message, content: Buffer.from(text, 'utf-8').toString('base64'), branch: activeBranch, sha: activeSha
             });
-            return formatOptimizedResponse(`Surgical replacement committed: ${res.data.commit.sha}`);
+            return formatOptimizedResponse(`Committed SHA: ${res.data.commit.sha}`);
         }
         catch (err) {
             return handleGitHubError(err);
@@ -829,7 +1031,7 @@ export function registerGitHubTools(server, octokit, sessionId, registry) {
                 }
                 catch { }
                 await octokit.repos.createOrUpdateFileContents({
-                    owner: target.owner, repo: target.repo, path, message, content: Buffer.from(f.content).toString('base64'), branch, sha: existingSha
+                    owner: target.owner, repo: target.repo, path: f.path, message, content: Buffer.from(f.content).toString('base64'), branch, sha: existingSha
                 });
             }
             return formatOptimizedResponse(`Pushed ${files.length} files.`);
