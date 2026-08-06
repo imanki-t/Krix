@@ -11,7 +11,7 @@ import { registerRenderTools } from './renderTools.js';
 import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
 import {
   formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory,
-  identityKey, getEnabledCategories, persistEnabledCategory, cleanupIdleIdentities
+  identityKey, getEnabledCategories, persistEnabledCategory, revokeEnabledCategory, cleanupIdleIdentities
 } from './security.js';
 
 dotenv.config();
@@ -93,6 +93,32 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
     } catch {}
 
     return formatOptimizedResponse(justEnabled.length ? { enabled: justEnabled } : { note: 'Requested toolset(s) already enabled.' });
+  });
+
+  server.registerTool('lock_toolset', {
+    description: "Lock/disable lazy toolsets when done to shrink prompt token footprint. Pass 'sandbox', 'github_issues_prs', 'github_admin', 'render', or 'all'.",
+    inputSchema: { category: z.enum(['github_issues_prs', 'github_admin', 'sandbox', 'render', 'all']) },
+    annotations: getToolAnnotations('lock_toolset')
+  }, async (args: any) => {
+    revokeEnabledCategory(identity, args.category);
+
+    const toLock: ToolCategory[] = args.category === 'all'
+      ? ['github_issues_prs', 'github_admin', 'sandbox', 'render']
+      : [args.category];
+
+    const justDisabled: string[] = [];
+    for (const [name, handle] of Object.entries(registry)) {
+      if (toLock.includes(categoryOf[name]) && handle.enabled) {
+        handle.disable();
+        justDisabled.push(name);
+      }
+    }
+
+    try {
+      await server.sendToolListChanged();
+    } catch {}
+
+    return formatOptimizedResponse(justDisabled.length ? { locked: justDisabled, note: 'Toolsets locked. Minimal token footprint restored.' } : { note: 'Requested toolset(s) already locked.' });
   });
 
   return server;
