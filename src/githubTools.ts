@@ -720,15 +720,48 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       let items: any[] = [];
       let totalCount = 0;
 
+      let rx: RegExp | null = null;
+      if (regex) {
+        try { rx = new RegExp(regex, 'i'); } catch {}
+      }
+
       if (username) {
-        const userRepos = await octokit.repos.listForUser({
-          username,
-          per_page: perPage,
-          page: pageNum,
-          sort: 'updated'
-        });
-        items = userRepos.data || [];
-        totalCount = items.length;
+        if (q || rx) {
+          // A filter was requested: pull a broad page of the user's repos and
+          // filter client-side, since GitHub's listForUser has no free-text query.
+          // Otherwise q/regex only reordered results without narrowing them.
+          const userRepos = await octokit.repos.listForUser({
+            username,
+            per_page: 100,
+            sort: 'updated'
+          });
+          items = userRepos.data || [];
+
+          if (rx) {
+            items = items.filter(r => rx!.test(r.name) || rx!.test(r.full_name));
+          }
+          if (q) {
+            const needle = q.toLowerCase();
+            items = items.filter(r =>
+              r.name.toLowerCase().includes(needle) ||
+              (r.description || '').toLowerCase().includes(needle)
+            );
+          }
+
+          totalCount = items.length;
+          const start = (pageNum - 1) * perPage;
+          items = items.slice(start, start + perPage);
+        } else {
+          // No filter: an explicit "list everything" request, paginate normally.
+          const userRepos = await octokit.repos.listForUser({
+            username,
+            per_page: perPage,
+            page: pageNum,
+            sort: 'updated'
+          });
+          items = userRepos.data || [];
+          totalCount = items.length;
+        }
       } else {
         const queryStr = q || 'is:public';
         const res = await octokit.search.repos({
@@ -738,19 +771,14 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
         });
         items = res.data.items || [];
         totalCount = res.data.total_count || items.length;
+
+        if (rx) {
+          items = items.filter(r => rx!.test(r.name) || rx!.test(r.full_name));
+        }
       }
 
       if (items.length === 0) {
         return formatOptimizedResponse('No repositories found matching criteria.');
-      }
-
-      let rx: RegExp | null = null;
-      if (regex) {
-        try { rx = new RegExp(regex, 'i'); } catch {}
-      }
-
-      if (rx) {
-        items = items.filter(r => rx!.test(r.name) || rx!.test(r.full_name));
       }
 
       const targetQuery = q || regex || '';
