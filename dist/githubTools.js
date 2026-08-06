@@ -316,7 +316,7 @@ export function registerGitHubTools(server, octokit, sessionId, registry) {
             return handleGitHubError(err);
         }
     });
-    reg('get_tree', {
+    reg('git_tree', {
         description: 'Retrieve file path tree index recursively.',
         inputSchema: {
             owner: z.string().optional(),
@@ -326,7 +326,7 @@ export function registerGitHubTools(server, octokit, sessionId, registry) {
             limit: z.number().optional().default(50),
             q: z.string().optional()
         },
-        annotations: getToolAnnotations('get_tree')
+        annotations: getToolAnnotations('git_tree')
     }, async (args) => {
         const { owner, repo, tree_sha, offset, limit, q } = args;
         try {
