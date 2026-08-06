@@ -1,0 +1,6 @@
+# https://nixpacks.com/docs/configuration/file
+# Adds system packages needed by src/sandboxTools.ts (git clone, python3 script execution)
+# on top of whatever Nixpacks auto-detects for this Node app.
+
+[phases.setup]
+aptPkgs = ["...", "git", "python3", "python3-pip"]
