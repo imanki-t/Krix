@@ -49,6 +49,7 @@ function run(cmd: string, cwd: string, timeout: number = 30000): Promise<{ err: 
       HOME: safeHome,
       npm_config_cache: path.join(safeHome, '.npm'),
     };
+    try { require('node:fs').mkdirSync(safeHome, { recursive: true }); } catch {}
     exec(cmd, { cwd, timeout, env, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
   });
 }
