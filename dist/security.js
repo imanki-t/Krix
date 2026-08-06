@@ -37,6 +37,8 @@ export const TOOL_PERMISSIONS = {
     'search_code': PermissionLevel.READ_ONLY,
     'search_commits': PermissionLevel.READ_ONLY,
     'search_repositories': PermissionLevel.READ_ONLY,
+    'get_tree': PermissionLevel.READ_ONLY,
+    'patch_contents': PermissionLevel.MUTATING,
     'sandbox_status': PermissionLevel.READ_ONLY,
     'load_toolset': PermissionLevel.READ_ONLY,
     // GitHub Issues & PRs
@@ -141,6 +143,8 @@ export const TOOL_CATEGORY = {
     search_code: 'core',
     search_commits: 'core',
     search_repositories: 'core',
+    get_tree: 'core',
+    patch_contents: 'core',
     sandbox_status: 'core',
     load_toolset: 'core',
     // Issues & PR Workflow Category
