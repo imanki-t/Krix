@@ -1,4 +1,4 @@
-# Krix - High-Performance, Token-Optimized MCP Server
+# Krix
 
 **Krix** is a production-grade Model Context Protocol (MCP) server engineered to give AI agents full control over **GitHub repositories**, **Render Cloud infrastructure**, and **isolated execution sandboxes** over a single Streamable HTTP / SSE port. 
 
