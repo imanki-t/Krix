@@ -1,7 +1,7 @@
 {
-  "name": "github-optimized-mcp-server",
+  "name": "krix",
   "version": "1.0.0",
-  "description": "Optimized Lean GitHub MCP Server for High-Efficiency Agentic Coding",
+  "description": "Krix",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
