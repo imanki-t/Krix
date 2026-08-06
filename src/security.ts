@@ -31,6 +31,10 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
   return current;
 }
 
+export function deleteSessionContext(sessionId: string): void {
+  sessionContexts.delete(sessionId);
+}
+
 export interface IdentityEntry {
   categories: Set<ToolCategory>;
   lastActive: number;
