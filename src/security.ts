@@ -38,6 +38,13 @@ export function registerSessionAuth(sessionId: string, githubToken: string): voi
   sessionAuthKey.set(sessionId, hashAuth(githubToken));
 }
 
+// Exposed so other modules (e.g. sandboxTools) can key persistent
+// filesystem resources by the caller's identity rather than the raw
+// sessionId, which can churn between calls if mcp-session-id isn't resent.
+export function getAuthKeyForSession(sessionId: string): string {
+  return sessionAuthKey.get(sessionId) || 'anonymous';
+}
+
 function authBucket(sessionId: string) {
   const key = sessionAuthKey.get(sessionId) || 'anonymous';
   let bucket = lastKnownContextByAuth.get(key);
