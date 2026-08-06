@@ -320,7 +320,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  reg('get_tree', {
+  reg('git_tree', {
     description: 'Retrieve file path tree index recursively.',
     inputSchema: {
       owner: z.string().optional(),
@@ -330,7 +330,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       limit: z.number().optional().default(50),
       q: z.string().optional()
     },
-    annotations: getToolAnnotations('get_tree')
+    annotations: getToolAnnotations('git_tree')
   }, async (args: any) => {
     const { owner, repo, tree_sha, offset, limit, q } = args;
     try {
@@ -798,7 +798,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('delete_branch', {
-    description: 'Delete branch.',
+    description: 'Delete a repository branch.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string() },
     annotations: getToolAnnotations('delete_branch')
   }, async (args: any) => {
@@ -810,37 +810,11 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  reg('create_pull_request', {
-    description: 'Create pull request.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), title: z.string(), body: z.string().optional(), head: z.string(), base: z.string().default('main') },
-    annotations: getToolAnnotations('create_pull_request')
-  }, async (args: any) => {
-    const { owner, repo, title, body, head, base } = args;
-    try {
-      const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.pulls.create({ owner: target.owner, repo: target.repo, title, body, head, base });
-      return formatOptimizedResponse(`PR #${res.data.number} opened: ${res.data.html_url}`);
-    } catch (err) { return handleGitHubError(err); }
-  });
-
-  reg('delete_file', {
-    description: 'Delete file.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string().optional() },
-    annotations: getToolAnnotations('delete_file')
-  }, async (args: any) => {
-    const { owner, repo, path, message, sha, branch } = args;
-    try {
-      const target = resolveRepo(owner, repo, sessionId);
-      const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
-      await octokit.repos.deleteFile({ owner: target.owner, repo: target.repo, path, message, sha, branch: activeBranch });
-      return formatOptimizedResponse(`Deleted ${path}`);
-    } catch (err) { return handleGitHubError(err); }
-  });
-
   reg('create_or_update_file', {
-    description: 'Create or update file. Supports Base64 parameters.',
+    description: 'Create or update file. Supports Base64 (content_b64).',
     inputSchema: {
-      owner: z.string().optional(), repo: z.string().optional(),
+      owner: z.string().optional(),
+      repo: z.string().optional(),
       path: z.string(),
       content: z.string().optional(),
       content_b64: z.string().optional(),
@@ -854,128 +828,106 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     try {
       const target = resolveRepo(owner, repo, sessionId);
       const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
-      const resolvedContent = resolveInputString(content, content_b64);
+      const text = resolveInputString(content, content_b64);
+      let activeSha = sha;
+      if (!activeSha) {
+        try {
+          const existing = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeBranch });
+          if (!Array.isArray(existing.data) && 'sha' in existing.data) activeSha = existing.data.sha;
+        } catch {}
+      }
       const res = await octokit.repos.createOrUpdateFileContents({
-        owner: target.owner, repo: target.repo, path, message,
-        content: Buffer.from(resolvedContent, 'utf-8').toString('base64'),
-        branch: activeBranch, sha
+        owner: target.owner, repo: target.repo, path, message, content: Buffer.from(text, 'utf-8').toString('base64'), branch: activeBranch, sha: activeSha
       });
-      return formatOptimizedResponse(`Committed ${path}: ${res.data.commit.sha}`);
+      return formatOptimizedResponse(`Committed SHA: ${res.data.commit.sha}`);
     } catch (err) { return handleGitHubError(err); }
   });
 
-  reg('push_files', {
-    description: 'Batch commit and push multiple files in a single atomic commit.',
-    inputSchema: {
-      owner: z.string().optional(), repo: z.string().optional(),
-      branch: z.string().optional(),
-      message: z.string(),
-      files: z.array(z.object({
-        path: z.string(),
-        content: z.string().optional(),
-        content_b64: z.string().optional()
-      }))
-    },
-    annotations: getToolAnnotations('push_files')
+  reg('create_pull_request', {
+    description: 'Create pull request.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), title: z.string(), body: z.string().optional(), head: z.string(), base: z.string().default('main') },
+    annotations: getToolAnnotations('create_pull_request')
   }, async (args: any) => {
-    const { owner, repo, branch, message, files } = args;
+    const { owner, repo, title, body, head, base } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
-
-      const refRes = await octokit.git.getRef({ owner: target.owner, repo: target.repo, ref: `heads/${activeBranch}` });
-      const latestCommitSha = refRes.data.object.sha;
-      const latestCommit = await octokit.git.getCommit({ owner: target.owner, repo: target.repo, commit_sha: latestCommitSha });
-      const baseTreeSha = latestCommit.data.tree.sha;
-
-      const treeItems = await Promise.all(files.map(async (f: any) => {
-        const resolved = resolveInputString(f.content, f.content_b64);
-        const blob = await octokit.git.createBlob({ owner: target.owner, repo: target.repo, content: Buffer.from(resolved, 'utf-8').toString('base64'), encoding: 'base64' });
-        return { path: f.path, mode: '100644' as const, type: 'blob' as const, sha: blob.data.sha };
-      }));
-
-      const newTree = await octokit.git.createTree({ owner: target.owner, repo: target.repo, base_tree: baseTreeSha, tree: treeItems });
-      const newCommit = await octokit.git.createCommit({ owner: target.owner, repo: target.repo, message, tree: newTree.data.sha, parents: [latestCommitSha] });
-      await octokit.git.updateRef({ owner: target.owner, repo: target.repo, ref: `heads/${activeBranch}`, sha: newCommit.data.sha });
-
-      return formatOptimizedResponse(`Atomic push successful for ${files.length} files. Commit SHA: ${newCommit.data.sha}`);
+      const res = await octokit.pulls.create({ owner: target.owner, repo: target.repo, title, body, head, base });
+      return formatOptimizedResponse(`PR #${res.data.number} created.`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('create_repository', {
-    description: 'Create repository.',
-    inputSchema: { name: z.string(), description: z.string().optional(), private: z.boolean().optional().default(false), auto_init: z.boolean().optional().default(true) },
+    description: 'Create new repo.',
+    inputSchema: { name: z.string(), private: z.boolean().default(true), description: z.string().optional() },
     annotations: getToolAnnotations('create_repository')
   }, async (args: any) => {
-    const { name, description, private: isPrivate, auto_init } = args;
+    const { name, private: isPrivate, description } = args;
     try {
-      const res = await octokit.repos.createForAuthenticatedUser({ name, description, private: isPrivate, auto_init });
-      return formatOptimizedResponse(`Repository created: ${res.data.html_url}`);
+      const res = await octokit.repos.createForAuthenticatedUser({ name, private: isPrivate, description });
+      updateSessionContext(sessionId, { owner: res.data.owner.login, repo: res.data.name });
+      return formatOptimizedResponse(`Repo created: ${res.data.full_name}`);
+    } catch (err) { return handleGitHubError(err); }
+  });
+
+  reg('delete_file', {
+    description: 'Delete file.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string() },
+    annotations: getToolAnnotations('delete_file')
+  }, async (args: any) => {
+    const { owner, repo, path, message, sha, branch } = args;
+    try {
+      const target = resolveRepo(owner, repo, sessionId);
+      await octokit.repos.deleteFile({ owner: target.owner, repo: target.repo, path, message, sha, branch });
+      return formatOptimizedResponse(`Deleted ${path}`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('fork_repository', {
-    description: 'Fork repository.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), organization: z.string().optional() },
+    description: 'Fork repo.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('fork_repository')
   }, async (args: any) => {
-    const { owner, repo, organization } = args;
+    const { owner, repo } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.repos.createFork({ owner: target.owner, repo: target.repo, organization });
-      return formatOptimizedResponse(`Fork created: ${res.data.html_url}`);
+      const res = await octokit.repos.createFork({ owner: target.owner, repo: target.repo });
+      return formatOptimizedResponse(`Forked to ${res.data.full_name}`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('issue_write', {
     description: 'Create or update issue.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), title: z.string().optional(), body: z.string().optional(), issue_number: z.number().optional(), state: z.enum(['open', 'closed']).optional(), labels: z.array(z.string()).optional(), assignees: z.array(z.string()).optional() },
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), title: z.string(), body: z.string().optional(), issue_number: z.number().optional() },
     annotations: getToolAnnotations('issue_write')
   }, async (args: any) => {
-    const { owner, repo, title, body, issue_number, state, labels, assignees } = args;
+    const { owner, repo, title, body, issue_number } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
       if (issue_number) {
-        const res = await octokit.issues.update({ owner: target.owner, repo: target.repo, issue_number, title, body, state, labels, assignees });
-        return formatOptimizedResponse(`Updated issue #${res.data.number}`);
+        const res = await octokit.issues.update({ owner: target.owner, repo: target.repo, issue_number, title, body });
+        return formatOptimizedResponse(`Issue #${res.data.number} updated.`);
       } else {
-        if (!title) throw new Error('Title required for new issue.');
-        const res = await octokit.issues.create({ owner: target.owner, repo: target.repo, title, body, labels, assignees });
-        return formatOptimizedResponse(`Created issue #${res.data.number}`);
+        const res = await octokit.issues.create({ owner: target.owner, repo: target.repo, title, body });
+        return formatOptimizedResponse(`Issue #${res.data.number} created.`);
       }
     } catch (err) { return handleGitHubError(err); }
   });
 
-  reg('sub_issue_write', {
-    description: 'Create sub-issue parented to an issue.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), parent_issue_number: z.number(), title: z.string(), body: z.string().optional() },
-    annotations: getToolAnnotations('sub_issue_write')
-  }, async (args: any) => {
-    const { owner, repo, parent_issue_number, title, body } = args;
-    try {
-      const target = resolveRepo(owner, repo, sessionId);
-      const subBody = `${body || ''}\n\nParent Issue: #${parent_issue_number}`;
-      const res = await octokit.issues.create({ owner: target.owner, repo: target.repo, title: `[Sub-issue] ${title}`, body: subBody });
-      await octokit.issues.createComment({ owner: target.owner, repo: target.repo, issue_number: parent_issue_number, body: `Created sub-issue #${res.data.number}: ${res.data.html_url}` });
-      return formatOptimizedResponse(`Sub-issue #${res.data.number} created and linked to parent #${parent_issue_number}.`);
-    } catch (err) { return handleGitHubError(err); }
-  });
-
   reg('merge_pull_request', {
-    description: 'Merge pull request.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), commit_title: z.string().optional(), merge_method: z.enum(['merge', 'squash', 'rebase']).optional().default('merge') },
+    description: 'Merge PR.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('merge_pull_request')
   }, async (args: any) => {
-    const { owner, repo, pull_number, commit_title, merge_method } = args;
+    const { owner, repo, pull_number } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.pulls.merge({ owner: target.owner, repo: target.repo, pull_number, commit_title, merge_method });
-      return formatOptimizedResponse(`PR #${pull_number} merged: ${res.data.sha}`);
+      const res = await octokit.pulls.merge({ owner: target.owner, repo: target.repo, pull_number });
+      return formatOptimizedResponse(`Merged PR #${pull_number}`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('pull_request_review_write', {
-    description: 'Submit formal pull request review.',
+    description: 'Submit PR review.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), event: z.enum(['APPROVE', 'REQUEST_CHANGES', 'COMMENT']), body: z.string().optional() },
     annotations: getToolAnnotations('pull_request_review_write')
   }, async (args: any) => {
@@ -987,47 +939,82 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
+  reg('push_files', {
+    description: 'Batch push multiple files.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string(), message: z.string(), files: z.array(z.object({ path: z.string(), content: z.string() })) },
+    annotations: getToolAnnotations('push_files')
+  }, async (args: any) => {
+    const { owner, repo, branch, message, files } = args;
+    try {
+      const target = resolveRepo(owner, repo, sessionId);
+      for (const f of files) {
+        let existingSha: string | undefined;
+        try {
+          const cur = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path: f.path, ref: branch });
+          if (!Array.isArray(cur.data) && 'sha' in cur.data) existingSha = cur.data.sha;
+        } catch {}
+        await octokit.repos.createOrUpdateFileContents({
+          owner: target.owner, repo: target.repo, path: f.path, message, content: Buffer.from(f.content).toString('base64'), branch, sha: existingSha
+        });
+      }
+      return formatOptimizedResponse(`Pushed ${files.length} files.`);
+    } catch (err) { return handleGitHubError(err); }
+  });
+
   reg('request_copilot_review', {
-    description: 'Request Copilot review on PR.',
+    description: 'Trigger a GitHub Copilot code review on a pull request.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('request_copilot_review')
   }, async (args: any) => {
     const { owner, repo, pull_number } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      await octokit.pulls.requestReviewers({ owner: target.owner, repo: target.repo, pull_number, reviewers: ['copilot'] });
-      return formatOptimizedResponse(`Copilot review requested on PR #${pull_number}.`);
+      await octokit.pulls.requestReviewers({ owner: target.owner, repo: target.repo, pull_number, reviewers: ['copilot-pull-request-reviewer[bot]'] });
+      return formatOptimizedResponse(`Copilot review requested for PR #${pull_number}.`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('assign_copilot_to_issue', {
-    description: 'Assign Copilot to issue.',
+    description: 'Assign GitHub Copilot coding agent to an issue so it works the task autonomously.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), issue_number: z.number() },
     annotations: getToolAnnotations('assign_copilot_to_issue')
   }, async (args: any) => {
     const { owner, repo, issue_number } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      await octokit.issues.addAssignees({ owner: target.owner, repo: target.repo, issue_number, assignees: ['copilot'] });
-      return formatOptimizedResponse(`Copilot assigned to Issue #${issue_number}.`);
+      await octokit.issues.addAssignees({ owner: target.owner, repo: target.repo, issue_number, assignees: ['copilot-swe-agent[bot]'] });
+      return formatOptimizedResponse(`Copilot assigned to issue #${issue_number}.`);
+    } catch (err) { return handleGitHubError(err); }
+  });
+
+  reg('sub_issue_write', {
+    description: 'Create sub-issue.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), parent_issue_number: z.number(), title: z.string(), body: z.string().optional() },
+    annotations: getToolAnnotations('sub_issue_write')
+  }, async (args: any) => {
+    const { owner, repo, parent_issue_number, title, body } = args;
+    try {
+      const target = resolveRepo(owner, repo, sessionId);
+      const res = await octokit.issues.create({ owner: target.owner, repo: target.repo, title: `[Sub-issue #${parent_issue_number}] ${title}`, body });
+      return formatOptimizedResponse(`Sub-issue #${res.data.number} created.`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('update_pull_request', {
-    description: 'Update pull request metadata.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), title: z.string().optional(), body: z.string().optional(), state: z.enum(['open', 'closed']).optional(), base: z.string().optional() },
+    description: 'Update PR details.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), title: z.string().optional(), body: z.string().optional(), state: z.enum(['open', 'closed']).optional() },
     annotations: getToolAnnotations('update_pull_request')
   }, async (args: any) => {
-    const { owner, repo, pull_number, title, body, state, base } = args;
+    const { owner, repo, pull_number, title, body, state } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.pulls.update({ owner: target.owner, repo: target.repo, pull_number, title, body, state, base });
-      return formatOptimizedResponse(`Updated PR #${res.data.number}`);
+      await octokit.pulls.update({ owner: target.owner, repo: target.repo, pull_number, title, body, state });
+      return formatOptimizedResponse(`PR #${pull_number} updated.`);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('update_pull_request_branch', {
-    description: 'Update PR branch with base changes.',
+    description: 'Update PR branch with base.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('update_pull_request_branch')
   }, async (args: any) => {
@@ -1035,7 +1022,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     try {
       const target = resolveRepo(owner, repo, sessionId);
       await octokit.pulls.updateBranch({ owner: target.owner, repo: target.repo, pull_number });
-      return formatOptimizedResponse(`PR #${pull_number} branch updated with base changes.`);
+      return formatOptimizedResponse(`PR #${pull_number} branch updated.`);
     } catch (err) { return handleGitHubError(err); }
   });
 }
