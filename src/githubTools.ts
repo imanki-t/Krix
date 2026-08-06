@@ -209,9 +209,6 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  // Merged with get_release_by_tag — same resource, only the lookup differs.
-  // Two near-identical single-field tools cost two full schema definitions in
-  // every tools/list payload for one optional-parameter's worth of behavior.
   reg('get_release', {
     description: 'Get a release. Omit `tag` for the latest published release, or pass it to fetch a specific one.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), tag: z.string().optional() },
@@ -312,7 +309,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('list_issue_types', {
-    description: "List an org's configured issue types (Bug/Feature/Task/…). Falls back to GitHub's default set for personal accounts, which don't support custom issue types.",
+    description: "List configured issue types.",
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('list_issue_types')
   }, async (args: any) => {
@@ -322,16 +319,13 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       const res = await octokit.request('GET /orgs/{org}/issue-types', { org: target.owner });
       return formatOptimizedResponse(res.data.map((t: any) => t.name));
     } catch (err: any) {
-      // 404 here just means `owner` isn't an org (personal accounts have no issue-types API).
       if (err?.status === 404) return formatOptimizedResponse(['Bug', 'Feature', 'Task', 'Improvement']);
       return handleGitHubError(err);
     }
   });
 
-  // Widened to match GitHub's real filter surface — was previously {state, limit}
-  // only, forcing the model to page through everything and filter client-side.
   reg('list_issues', {
-    description: 'List issues in repo, filterable server-side by labels/assignee/milestone/sort/since — always prefer narrowing here over paging unfiltered.',
+    description: 'List issues in repo.',
     inputSchema: {
       owner: z.string().optional(), repo: z.string().optional(),
       state: z.enum(['open', 'closed', 'all']).default('open'),
@@ -359,7 +353,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('list_pull_requests', {
-    description: 'List pull requests, filterable server-side by head/base branch and sort order.',
+    description: 'List pull requests.',
     inputSchema: {
       owner: z.string().optional(), repo: z.string().optional(),
       state: z.enum(['open', 'closed', 'all']).default('open'),
@@ -594,6 +588,19 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
+  reg('delete_branch', {
+    description: 'Delete a repository branch.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string() },
+    annotations: getToolAnnotations('delete_branch')
+  }, async (args: any) => {
+    const { owner, repo, branch } = args;
+    try {
+      const target = resolveRepo(owner, repo, sessionId);
+      await octokit.git.deleteRef({ owner: target.owner, repo: target.repo, ref: `heads/${branch}` });
+      return formatOptimizedResponse(`Branch '${branch}' deleted.`);
+    } catch (err) { return handleGitHubError(err); }
+  });
+
   reg('create_or_update_file', {
     description: 'Create or update file. Supports Base64 (content_b64).',
     inputSchema: {
@@ -613,15 +620,12 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       const target = resolveRepo(owner, repo, sessionId);
       const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
       const text = resolveInputString(content, content_b64);
-      // Auto-resolve sha when updating an existing file and the caller
-      // didn't supply one — previously this call would 422 on any update
-      // unless the model remembered to pass sha explicitly.
       let activeSha = sha;
       if (!activeSha) {
         try {
           const existing = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeBranch });
           if (!Array.isArray(existing.data) && 'sha' in existing.data) activeSha = existing.data.sha;
-        } catch { /* file doesn't exist yet — creating new, no sha needed */ }
+        } catch {}
       }
       const res = await octokit.repos.createOrUpdateFileContents({
         owner: target.owner, repo: target.repo, path, message, content: Buffer.from(text, 'utf-8').toString('base64'), branch: activeBranch, sha: activeSha
@@ -748,8 +752,6 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  // Previously a no-op stub that just echoed a canned success string without
-  // calling GitHub at all. Now actually requests the Copilot reviewer bot.
   reg('request_copilot_review', {
     description: 'Trigger a GitHub Copilot code review on a pull request.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
@@ -763,8 +765,6 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  // Missing from the original set relative to GitHub's own MCP server —
-  // assigns the Copilot coding agent to an issue so it opens a PR.
   reg('assign_copilot_to_issue', {
     description: 'Assign GitHub Copilot coding agent to an issue so it works the task autonomously.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), issue_number: z.number() },
