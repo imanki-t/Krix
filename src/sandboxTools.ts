@@ -6,7 +6,7 @@ import os from 'node:os';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations,
-  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext
+  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, makeRegistrar
 } from './security.js';
 
 interface ActiveProcess { pid: number; command: string; proc: ChildProcess; startTime: Date; }
@@ -93,9 +93,11 @@ function authFlag(token?: string): string {
   return `-c http.extraHeader="Authorization: Basic ${b64}" `;
 }
 
-export function registerSandboxTools(server: McpServer, sessionId: string, githubToken?: string) {
+export function registerSandboxTools(server: McpServer, sessionId: string, githubToken: string | undefined, registry: Record<string, any>) {
+  const reg = makeRegistrar(server, registry);
+
   // ── General-purpose execution ──────────────────────────────────────────
-  server.registerTool('sandbox_exec', {
+  reg('sandbox_exec', {
     description: 'Run a shell command in the sandbox. Cwd is the active cloned repo if one exists, else scratch dir.',
     inputSchema: { command: z.string(), timeoutMs: z.number().optional() },
     annotations: getToolAnnotations('sandbox_exec')
@@ -108,7 +110,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('sandbox_run', {
+  reg('sandbox_run', {
     description: 'Run code: pass inline `code` (+ optional `lang`, default py) or an existing `filePath`. Langs: py,js,ts,sh,go,java,cpp.',
     inputSchema: {
       lang: z.enum(['py', 'js', 'ts', 'sh', 'go', 'java', 'cpp']).optional(),
@@ -142,7 +144,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     finally { if (tmp) await fs.unlink(tmp).catch(() => {}); }
   });
 
-  server.registerTool('sandbox_install', {
+  reg('sandbox_install', {
     description: 'Install npm or pip packages into the sandbox/repo.',
     inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()).min(1) },
     annotations: getToolAnnotations('sandbox_install')
@@ -157,7 +159,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('sandbox_ps', {
+  reg('sandbox_ps', {
     description: 'List or kill background sandbox processes.',
     inputSchema: { action: z.enum(['list', 'kill']).default('list'), pid: z.number().optional() },
     annotations: getToolAnnotations('sandbox_ps')
@@ -174,7 +176,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     return formatOptimizedResponse(list.length ? list : 'No active processes.');
   });
 
-  server.registerTool('sandbox_reset', {
+  reg('sandbox_reset', {
     description: 'Wipe the sandbox: scratch files, cloned repo, and background processes.',
     inputSchema: {},
     annotations: getToolAnnotations('sandbox_reset')
@@ -186,7 +188,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('sandbox_status', {
+  reg('sandbox_status', {
     description: 'Check available runtimes, memory, and the active repo/branch.',
     inputSchema: {},
     annotations: getToolAnnotations('sandbox_status')
@@ -214,7 +216,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   // ── GitHub-repo-backed sandbox (clone, branch, commit, push) ───────────
-  server.registerTool('git_clone', {
+  reg('git_clone', {
     description: 'Clone a repo into the sandbox so it can be run/tested. Omit owner/repo to use the active context set via set_active_context.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string().optional(), depth: z.number().optional().default(1) },
     annotations: getToolAnnotations('git_clone')
@@ -245,7 +247,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('git_checkout', {
+  reg('git_checkout', {
     description: 'Switch or create a branch in the active cloned repo.',
     inputSchema: { branch: z.string(), create: z.boolean().optional().default(false) },
     annotations: getToolAnnotations('git_checkout')
@@ -261,7 +263,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('git_pull', {
+  reg('git_pull', {
     description: 'Fast-forward pull the active branch of the cloned repo.',
     inputSchema: {},
     annotations: getToolAnnotations('git_pull')
@@ -275,7 +277,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('git_status', {
+  reg('git_status', {
     description: 'Compact status (branch + changed files) of the cloned repo.',
     inputSchema: {},
     annotations: getToolAnnotations('git_status')
@@ -288,7 +290,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('git_diff', {
+  reg('git_diff', {
     description: 'Diff of the cloned repo, optionally scoped to a path or staged changes.',
     inputSchema: { path: z.string().optional(), staged: z.boolean().optional().default(false) },
     annotations: getToolAnnotations('git_diff')
@@ -302,7 +304,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  server.registerTool('git_commit_push', {
+  reg('git_commit_push', {
     description: 'Stage, commit, and (by default) push changes in the cloned repo.',
     inputSchema: { message: z.string(), push: z.boolean().optional().default(true) },
     annotations: getToolAnnotations('git_commit_push')

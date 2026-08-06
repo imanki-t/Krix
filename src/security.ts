@@ -36,8 +36,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'get_file_contents': PermissionLevel.READ_ONLY,
   'get_commit': PermissionLevel.READ_ONLY,
   'get_label': PermissionLevel.READ_ONLY,
-  'get_latest_release': PermissionLevel.READ_ONLY,
-  'get_release_by_tag': PermissionLevel.READ_ONLY,
+  'get_release': PermissionLevel.READ_ONLY,
   'get_tag': PermissionLevel.READ_ONLY,
   'get_team_members': PermissionLevel.READ_ONLY,
   'get_teams': PermissionLevel.READ_ONLY,
@@ -71,8 +70,10 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'list_logs': PermissionLevel.READ_ONLY,
   'get_metrics': PermissionLevel.READ_ONLY,
   'list_env_vars': PermissionLevel.READ_ONLY,
+  'list_log_label_values': PermissionLevel.READ_ONLY,
 
   'get_sandbox_status': PermissionLevel.READ_ONLY,
+  'load_toolset': PermissionLevel.READ_ONLY,
 
   'add_comment_to_pending_review': PermissionLevel.MUTATING,
   'add_issue_comment': PermissionLevel.MUTATING,
@@ -92,6 +93,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'update_pull_request': PermissionLevel.MUTATING,
   'update_pull_request_branch': PermissionLevel.MUTATING,
   'str_replace_editor': PermissionLevel.MUTATING,
+  'assign_copilot_to_issue': PermissionLevel.MUTATING,
 
   'select_workspace': PermissionLevel.MUTATING,
   'create_web_service': PermissionLevel.MUTATING,
@@ -119,11 +121,48 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'git_commit_push': PermissionLevel.MUTATING
 };
 
+/** Tools that never leave the local process / never touch a third-party API. */
+const CLOSED_WORLD_TOOLS = new Set([
+  'set_active_context', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
+  'git_status', 'git_diff', 'load_toolset'
+]);
+
 export function getToolAnnotations(toolName: string) {
   const isReadOnly = TOOL_PERMISSIONS[toolName] === PermissionLevel.READ_ONLY;
   return {
+    title: toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
     readOnlyHint: isReadOnly,
-    destructiveHint: !isReadOnly
+    // A read-only call is inherently non-destructive and, for GitHub/Render's
+    // GET-style endpoints, safe to repeat — this lets MCP clients that honor
+    // these hints (Claude Desktop, Gemini CLI, etc.) auto-approve simple reads
+    // like get_me/list_branches instead of prompting for permission every time.
+    destructiveHint: !isReadOnly,
+    idempotentHint: isReadOnly,
+    openWorldHint: !CLOSED_WORLD_TOOLS.has(toolName)
+  };
+}
+
+/**
+ * Category used by the lazy toolset loader (see index.ts) to group tools for
+ * enable/disable. Only the always-on core set is listed explicitly here —
+ * index.ts tags every other tool by which registrar function produced it.
+ */
+export type ToolCategory = 'core' | 'github' | 'render' | 'sandbox';
+
+export const TOOL_CATEGORY: Record<string, ToolCategory> = {
+  set_active_context: 'core', get_me: 'core', sandbox_status: 'core', load_toolset: 'core'
+};
+
+/**
+ * Thin wrapper around server.registerTool that also stashes the returned
+ * RegisteredTool handle in a shared registry, keyed by tool name. The
+ * lazy toolset loader in index.ts uses these handles to .enable()/.disable()
+ * whole categories at once (each call auto-fires sendToolListChanged()).
+ */
+export function makeRegistrar(server: any, registry: Record<string, any>) {
+  return (name: string, config: any, handler: any) => {
+    registry[name] = server.registerTool(name, config, handler);
+    return registry[name];
   };
 }
 

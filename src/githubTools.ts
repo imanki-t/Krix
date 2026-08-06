@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Octokit } from '@octokit/rest';
 import { z } from 'zod';
-import { formatOptimizedResponse, formatError, getToolAnnotations, resolveInputString, getSessionContext, updateSessionContext } from './security.js';
+import { formatOptimizedResponse, formatError, getToolAnnotations, resolveInputString, getSessionContext, updateSessionContext, makeRegistrar } from './security.js';
 
 function handleGitHubError(err: any): any {
   if (err?.status === 403 && err?.headers?.['x-ratelimit-remaining'] === '0') {
@@ -23,8 +23,10 @@ function resolveRepo(inputOwner: string | undefined, inputRepo: string | undefin
   return { owner, repo };
 }
 
-export function registerGitHubTools(server: McpServer, octokit: Octokit, sessionId: string) {
-  server.registerTool('set_active_context', {
+export function registerGitHubTools(server: McpServer, octokit: Octokit, sessionId: string, registry: Record<string, any>) {
+  const reg = makeRegistrar(server, registry);
+
+  reg('set_active_context', {
     description: 'Set default GitHub repository context once per session.',
     inputSchema: { owner: z.string(), repo: z.string(), branch: z.string().optional().default('main') },
     annotations: getToolAnnotations('set_active_context')
@@ -34,7 +36,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     return formatOptimizedResponse(`Active repository context set to '${owner}/${repo}' on branch '${branch}'.`);
   });
 
-  server.registerTool('get_me', {
+  reg('get_me', {
     description: 'Get authenticated user profile details.',
     inputSchema: {},
     annotations: getToolAnnotations('get_me')
@@ -45,7 +47,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('get_file_contents', {
+  reg('get_file_contents', {
     description: 'Fetch file contents or line window.',
     inputSchema: {
       owner: z.string().optional(),
@@ -74,7 +76,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('str_replace_editor', {
+  reg('str_replace_editor', {
     description: 'Surgically search and replace code block. Supports Base64 parameters.',
     inputSchema: {
       owner: z.string().optional(),
@@ -118,7 +120,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('grep', {
+  reg('grep', {
     description: 'High-performance pattern search with line windowing.',
     inputSchema: {
       owner: z.string().optional(),
@@ -155,7 +157,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('view_file_outline', {
+  reg('view_file_outline', {
     description: 'Extract high-level AST symbol structure.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), path: z.string(), ref: z.string().optional() },
     annotations: getToolAnnotations('view_file_outline')
@@ -181,7 +183,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('get_commit', {
+  reg('get_commit', {
     description: 'Get commit details by SHA.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), commit_sha: z.string() },
     annotations: getToolAnnotations('get_commit')
@@ -194,7 +196,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('get_label', {
+  reg('get_label', {
     description: 'Get details of an issue label.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), name: z.string() },
     annotations: getToolAnnotations('get_label')
@@ -207,33 +209,25 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('get_latest_release', {
-    description: 'Get latest published release.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
-    annotations: getToolAnnotations('get_latest_release')
-  }, async (args: any) => {
-    const { owner, repo } = args;
-    try {
-      const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.repos.getLatestRelease({ owner: target.owner, repo: target.repo });
-      return formatOptimizedResponse({ tag: res.data.tag_name, name: res.data.name });
-    } catch (err) { return handleGitHubError(err); }
-  });
-
-  server.registerTool('get_release_by_tag', {
-    description: 'Get release by tag name.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), tag: z.string() },
-    annotations: getToolAnnotations('get_release_by_tag')
+  // Merged with get_release_by_tag — same resource, only the lookup differs.
+  // Two near-identical single-field tools cost two full schema definitions in
+  // every tools/list payload for one optional-parameter's worth of behavior.
+  reg('get_release', {
+    description: 'Get a release. Omit `tag` for the latest published release, or pass it to fetch a specific one.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), tag: z.string().optional() },
+    annotations: getToolAnnotations('get_release')
   }, async (args: any) => {
     const { owner, repo, tag } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.repos.getReleaseByTag({ owner: target.owner, repo: target.repo, tag });
-      return formatOptimizedResponse(res.data);
+      const res = tag
+        ? await octokit.repos.getReleaseByTag({ owner: target.owner, repo: target.repo, tag })
+        : await octokit.repos.getLatestRelease({ owner: target.owner, repo: target.repo });
+      return formatOptimizedResponse({ tag: res.data.tag_name, name: res.data.name, body: res.data.body });
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('get_tag', {
+  reg('get_tag', {
     description: 'Get tag object details.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), tag_sha: z.string() },
     annotations: getToolAnnotations('get_tag')
@@ -246,7 +240,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('get_team_members', {
+  reg('get_team_members', {
     description: 'List members of an organization team.',
     inputSchema: { org: z.string(), team_slug: z.string() },
     annotations: getToolAnnotations('get_team_members')
@@ -258,7 +252,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('get_teams', {
+  reg('get_teams', {
     description: 'List teams in an organization.',
     inputSchema: { org: z.string() },
     annotations: getToolAnnotations('get_teams')
@@ -270,7 +264,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_branches', {
+  reg('list_branches', {
     description: 'List repository branches.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), limit: z.number().optional().default(10) },
     annotations: getToolAnnotations('list_branches')
@@ -283,20 +277,28 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_commits', {
-    description: 'List recent commits.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), limit: z.number().optional().default(5) },
+  reg('list_commits', {
+    description: 'List recent commits, filterable server-side by path/author/date range.',
+    inputSchema: {
+      owner: z.string().optional(), repo: z.string().optional(),
+      sha: z.string().optional(),
+      path: z.string().optional(),
+      author: z.string().optional(),
+      since: z.string().optional(),
+      until: z.string().optional(),
+      limit: z.number().optional().default(5)
+    },
     annotations: getToolAnnotations('list_commits')
   }, async (args: any) => {
-    const { owner, repo, limit } = args;
+    const { owner, repo, sha, path, author, since, until, limit } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.repos.listCommits({ owner: target.owner, repo: target.repo, per_page: limit });
+      const res = await octokit.repos.listCommits({ owner: target.owner, repo: target.repo, sha, path, author, since, until, per_page: limit });
       return formatOptimizedResponse(res.data.map(c => `- ${c.sha.substring(0, 7)}: ${c.commit.message.split('\n')[0]}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_issue_fields', {
+  reg('list_issue_fields', {
     description: 'List custom issue fields.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('list_issue_fields')
@@ -309,39 +311,75 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_issue_types', {
-    description: 'List issue types.',
+  reg('list_issue_types', {
+    description: "List an org's configured issue types (Bug/Feature/Task/…). Falls back to GitHub's default set for personal accounts, which don't support custom issue types.",
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('list_issue_types')
-  }, async () => formatOptimizedResponse(["Bug", "Feature", "Task", "Improvement"]));
-
-  server.registerTool('list_issues', {
-    description: 'List issues in repo.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), state: z.enum(['open', 'closed', 'all']).default('open'), limit: z.number().optional().default(10) },
-    annotations: getToolAnnotations('list_issues')
   }, async (args: any) => {
-    const { owner, repo, state, limit } = args;
+    const { owner, repo } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.issues.listForRepo({ owner: target.owner, repo: target.repo, state, per_page: limit });
+      const res = await octokit.request('GET /orgs/{org}/issue-types', { org: target.owner });
+      return formatOptimizedResponse(res.data.map((t: any) => t.name));
+    } catch (err: any) {
+      // 404 here just means `owner` isn't an org (personal accounts have no issue-types API).
+      if (err?.status === 404) return formatOptimizedResponse(['Bug', 'Feature', 'Task', 'Improvement']);
+      return handleGitHubError(err);
+    }
+  });
+
+  // Widened to match GitHub's real filter surface — was previously {state, limit}
+  // only, forcing the model to page through everything and filter client-side.
+  reg('list_issues', {
+    description: 'List issues in repo, filterable server-side by labels/assignee/milestone/sort/since — always prefer narrowing here over paging unfiltered.',
+    inputSchema: {
+      owner: z.string().optional(), repo: z.string().optional(),
+      state: z.enum(['open', 'closed', 'all']).default('open'),
+      labels: z.array(z.string()).optional(),
+      assignee: z.string().optional(),
+      creator: z.string().optional(),
+      milestone: z.string().optional(),
+      sort: z.enum(['created', 'updated', 'comments']).optional(),
+      direction: z.enum(['asc', 'desc']).optional(),
+      since: z.string().optional(),
+      limit: z.number().optional().default(10)
+    },
+    annotations: getToolAnnotations('list_issues')
+  }, async (args: any) => {
+    const { owner, repo, state, labels, assignee, creator, milestone, sort, direction, since, limit } = args;
+    try {
+      const target = resolveRepo(owner, repo, sessionId);
+      const res = await octokit.issues.listForRepo({
+        owner: target.owner, repo: target.repo, state,
+        labels: labels?.join(','), assignee, creator, milestone, sort, direction, since,
+        per_page: limit
+      });
       return formatOptimizedResponse(res.data.map(i => `#${i.number} [${i.state}]: ${i.title}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_pull_requests', {
-    description: 'List pull requests.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), state: z.enum(['open', 'closed', 'all']).default('open'), limit: z.number().optional().default(10) },
+  reg('list_pull_requests', {
+    description: 'List pull requests, filterable server-side by head/base branch and sort order.',
+    inputSchema: {
+      owner: z.string().optional(), repo: z.string().optional(),
+      state: z.enum(['open', 'closed', 'all']).default('open'),
+      head: z.string().optional(),
+      base: z.string().optional(),
+      sort: z.enum(['created', 'updated', 'popularity', 'long-running']).optional(),
+      direction: z.enum(['asc', 'desc']).optional(),
+      limit: z.number().optional().default(10)
+    },
     annotations: getToolAnnotations('list_pull_requests')
   }, async (args: any) => {
-    const { owner, repo, state, limit } = args;
+    const { owner, repo, state, head, base, sort, direction, limit } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.pulls.list({ owner: target.owner, repo: target.repo, state, per_page: limit });
+      const res = await octokit.pulls.list({ owner: target.owner, repo: target.repo, state, head, base, sort, direction, per_page: limit });
       return formatOptimizedResponse(res.data.map(p => `#${p.number} [${p.state}]: ${p.title}`).join('\n'));
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_releases', {
+  reg('list_releases', {
     description: 'List releases.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), limit: z.number().optional().default(5) },
     annotations: getToolAnnotations('list_releases')
@@ -354,7 +392,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_repository_collaborators', {
+  reg('list_repository_collaborators', {
     description: 'List collaborators.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('list_repository_collaborators')
@@ -367,7 +405,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('list_tags', {
+  reg('list_tags', {
     description: 'List git tags.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), limit: z.number().optional().default(10) },
     annotations: getToolAnnotations('list_tags')
@@ -380,7 +418,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('issue_read', {
+  reg('issue_read', {
     description: 'Read detailed issue information.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), issue_number: z.number() },
     annotations: getToolAnnotations('issue_read')
@@ -393,7 +431,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('pull_request_read', {
+  reg('pull_request_read', {
     description: 'Read detailed pull request.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('pull_request_read')
@@ -406,7 +444,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('search_code', {
+  reg('search_code', {
     description: 'Search code across repositories.',
     inputSchema: { q: z.string(), owner: z.string().optional(), repo: z.string().optional(), limit: z.number().optional().default(5) },
     annotations: getToolAnnotations('search_code')
@@ -424,7 +462,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('search_commits', {
+  reg('search_commits', {
     description: 'Search commits.',
     inputSchema: { q: z.string(), limit: z.number().optional().default(5) },
     annotations: getToolAnnotations('search_commits')
@@ -436,7 +474,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('search_issues', {
+  reg('search_issues', {
     description: 'Search issues.',
     inputSchema: { q: z.string(), limit: z.number().optional().default(5) },
     annotations: getToolAnnotations('search_issues')
@@ -448,7 +486,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('search_pull_requests', {
+  reg('search_pull_requests', {
     description: 'Search pull requests.',
     inputSchema: { q: z.string(), limit: z.number().optional().default(5) },
     annotations: getToolAnnotations('search_pull_requests')
@@ -460,7 +498,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('search_repositories', {
+  reg('search_repositories', {
     description: 'Search repositories.',
     inputSchema: { q: z.string(), limit: z.number().optional().default(5) },
     annotations: getToolAnnotations('search_repositories')
@@ -472,7 +510,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('search_users', {
+  reg('search_users', {
     description: 'Search users.',
     inputSchema: { q: z.string(), limit: z.number().optional().default(5) },
     annotations: getToolAnnotations('search_users')
@@ -484,7 +522,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('run_secret_scanning', {
+  reg('run_secret_scanning', {
     description: 'Run secret scanning check.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('run_secret_scanning')
@@ -497,7 +535,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('add_comment_to_pending_review', {
+  reg('add_comment_to_pending_review', {
     description: 'Add line comment to pending review.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), body: z.string(), path: z.string(), line: z.number(), commit_id: z.string().optional() },
     annotations: getToolAnnotations('add_comment_to_pending_review')
@@ -517,7 +555,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('add_issue_comment', {
+  reg('add_issue_comment', {
     description: 'Add comment to issue or PR.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), issue_number: z.number(), body: z.string() },
     annotations: getToolAnnotations('add_issue_comment')
@@ -530,7 +568,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('add_reply_to_pull_request_comment', {
+  reg('add_reply_to_pull_request_comment', {
     description: 'Reply to PR comment.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), comment_id: z.number(), body: z.string() },
     annotations: getToolAnnotations('add_reply_to_pull_request_comment')
@@ -543,7 +581,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('create_branch', {
+  reg('create_branch', {
     description: 'Create branch.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string(), refSha: z.string() },
     annotations: getToolAnnotations('create_branch')
@@ -556,7 +594,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('create_or_update_file', {
+  reg('create_or_update_file', {
     description: 'Create or update file. Supports Base64 (content_b64).',
     inputSchema: {
       owner: z.string().optional(),
@@ -575,14 +613,24 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       const target = resolveRepo(owner, repo, sessionId);
       const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
       const text = resolveInputString(content, content_b64);
+      // Auto-resolve sha when updating an existing file and the caller
+      // didn't supply one — previously this call would 422 on any update
+      // unless the model remembered to pass sha explicitly.
+      let activeSha = sha;
+      if (!activeSha) {
+        try {
+          const existing = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeBranch });
+          if (!Array.isArray(existing.data) && 'sha' in existing.data) activeSha = existing.data.sha;
+        } catch { /* file doesn't exist yet — creating new, no sha needed */ }
+      }
       const res = await octokit.repos.createOrUpdateFileContents({
-        owner: target.owner, repo: target.repo, path, message, content: Buffer.from(text, 'utf-8').toString('base64'), branch: activeBranch, sha
+        owner: target.owner, repo: target.repo, path, message, content: Buffer.from(text, 'utf-8').toString('base64'), branch: activeBranch, sha: activeSha
       });
       return formatOptimizedResponse(`Committed SHA: ${res.data.commit.sha}`);
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('create_pull_request', {
+  reg('create_pull_request', {
     description: 'Create pull request.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), title: z.string(), body: z.string().optional(), head: z.string(), base: z.string().default('main') },
     annotations: getToolAnnotations('create_pull_request')
@@ -595,7 +643,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('create_repository', {
+  reg('create_repository', {
     description: 'Create new repo.',
     inputSchema: { name: z.string(), private: z.boolean().default(true), description: z.string().optional() },
     annotations: getToolAnnotations('create_repository')
@@ -608,7 +656,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('delete_file', {
+  reg('delete_file', {
     description: 'Delete file.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string() },
     annotations: getToolAnnotations('delete_file')
@@ -621,7 +669,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('fork_repository', {
+  reg('fork_repository', {
     description: 'Fork repo.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('fork_repository')
@@ -634,7 +682,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('issue_write', {
+  reg('issue_write', {
     description: 'Create or update issue.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), title: z.string(), body: z.string().optional(), issue_number: z.number().optional() },
     annotations: getToolAnnotations('issue_write')
@@ -652,7 +700,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('merge_pull_request', {
+  reg('merge_pull_request', {
     description: 'Merge PR.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('merge_pull_request')
@@ -665,7 +713,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('pull_request_review_write', {
+  reg('pull_request_review_write', {
     description: 'Submit PR review.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), event: z.enum(['APPROVE', 'REQUEST_CHANGES', 'COMMENT']), body: z.string().optional() },
     annotations: getToolAnnotations('pull_request_review_write')
@@ -678,7 +726,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('push_files', {
+  reg('push_files', {
     description: 'Batch push multiple files.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string(), message: z.string(), files: z.array(z.object({ path: z.string(), content: z.string() })) },
     annotations: getToolAnnotations('push_files')
@@ -700,13 +748,37 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('request_copilot_review', {
-    description: 'Trigger Copilot PR review.',
+  // Previously a no-op stub that just echoed a canned success string without
+  // calling GitHub at all. Now actually requests the Copilot reviewer bot.
+  reg('request_copilot_review', {
+    description: 'Trigger a GitHub Copilot code review on a pull request.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('request_copilot_review')
-  }, async (args: any) => formatOptimizedResponse(`Copilot review requested for PR #${args.pull_number}.`));
+  }, async (args: any) => {
+    const { owner, repo, pull_number } = args;
+    try {
+      const target = resolveRepo(owner, repo, sessionId);
+      await octokit.pulls.requestReviewers({ owner: target.owner, repo: target.repo, pull_number, reviewers: ['copilot-pull-request-reviewer[bot]'] });
+      return formatOptimizedResponse(`Copilot review requested for PR #${pull_number}.`);
+    } catch (err) { return handleGitHubError(err); }
+  });
 
-  server.registerTool('sub_issue_write', {
+  // Missing from the original set relative to GitHub's own MCP server —
+  // assigns the Copilot coding agent to an issue so it opens a PR.
+  reg('assign_copilot_to_issue', {
+    description: 'Assign GitHub Copilot coding agent to an issue so it works the task autonomously.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), issue_number: z.number() },
+    annotations: getToolAnnotations('assign_copilot_to_issue')
+  }, async (args: any) => {
+    const { owner, repo, issue_number } = args;
+    try {
+      const target = resolveRepo(owner, repo, sessionId);
+      await octokit.issues.addAssignees({ owner: target.owner, repo: target.repo, issue_number, assignees: ['copilot-swe-agent[bot]'] });
+      return formatOptimizedResponse(`Copilot assigned to issue #${issue_number}.`);
+    } catch (err) { return handleGitHubError(err); }
+  });
+
+  reg('sub_issue_write', {
     description: 'Create sub-issue.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), parent_issue_number: z.number(), title: z.string(), body: z.string().optional() },
     annotations: getToolAnnotations('sub_issue_write')
@@ -719,7 +791,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('update_pull_request', {
+  reg('update_pull_request', {
     description: 'Update PR details.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), title: z.string().optional(), body: z.string().optional(), state: z.enum(['open', 'closed']).optional() },
     annotations: getToolAnnotations('update_pull_request')
@@ -732,7 +804,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     } catch (err) { return handleGitHubError(err); }
   });
 
-  server.registerTool('update_pull_request_branch', {
+  reg('update_pull_request_branch', {
     description: 'Update PR branch with base.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number() },
     annotations: getToolAnnotations('update_pull_request_branch')
