@@ -10,8 +10,7 @@ import { registerGitHubTools } from './githubTools.js';
 import { registerRenderTools } from './renderTools.js';
 import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
 import {
-  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory,
-  identityKey, getEnabledCategories, persistEnabledCategory, revokeEnabledCategory, cleanupIdleIdentities
+  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory, getSessionContext
 } from './security.js';
 
 dotenv.config();
@@ -32,7 +31,7 @@ function tagCategory(registry: Record<string, any>, categoryOf: Record<string, T
   }
 }
 
-function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string, identity: string) {
+function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
   const server = new McpServer({
     name: 'krix',
     version: '1.0.0'
@@ -58,11 +57,11 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
   registerSandboxTools(server, sessionId, githubToken, registry);
   tagCategory(registry, categoryOf, 'sandbox');
 
-  // Re-enable any category already unlocked for this caller identity, disable others
-  const persistedCats = getEnabledCategories(identity);
+  // Re-enable any category already unlocked for this session, disable others
+  const ctx = getSessionContext(sessionId);
   for (const [name, handle] of Object.entries(registry)) {
     const cat = categoryOf[name];
-    if (persistedCats.has(cat)) {
+    if (ctx.enabledCategories.has(cat)) {
       handle.enable();
     } else {
       handle.disable();
@@ -74,7 +73,13 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
     inputSchema: { category: z.enum(['github_issues_prs', 'github_admin', 'sandbox', 'render', 'all']) },
     annotations: getToolAnnotations('load_toolset')
   }, async (args: any) => {
-    persistEnabledCategory(identity, args.category);
+    const ctx = getSessionContext(sessionId);
+    if (args.category === 'all') {
+      const allCats: ToolCategory[] = ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render'];
+      allCats.forEach(c => ctx.enabledCategories.add(c));
+    } else {
+      ctx.enabledCategories.add(args.category as ToolCategory);
+    }
 
     const wanted: ToolCategory[] = args.category === 'all'
       ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
@@ -93,32 +98,6 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
     } catch {}
 
     return formatOptimizedResponse(justEnabled.length ? { enabled: justEnabled } : { note: 'Requested toolset(s) already enabled.' });
-  });
-
-  server.registerTool('lock_toolset', {
-    description: "Lock/disable lazy toolsets when done to shrink prompt token footprint. Pass 'sandbox', 'github_issues_prs', 'github_admin', 'render', or 'all'.",
-    inputSchema: { category: z.enum(['github_issues_prs', 'github_admin', 'sandbox', 'render', 'all']) },
-    annotations: getToolAnnotations('lock_toolset')
-  }, async (args: any) => {
-    revokeEnabledCategory(identity, args.category);
-
-    const toLock: ToolCategory[] = args.category === 'all'
-      ? ['github_issues_prs', 'github_admin', 'sandbox', 'render']
-      : [args.category];
-
-    const justDisabled: string[] = [];
-    for (const [name, handle] of Object.entries(registry)) {
-      if (toLock.includes(categoryOf[name]) && handle.enabled) {
-        handle.disable();
-        justDisabled.push(name);
-      }
-    }
-
-    try {
-      await server.sendToolListChanged();
-    } catch {}
-
-    return formatOptimizedResponse(justDisabled.length ? { locked: justDisabled, note: 'Toolsets locked. Minimal token footprint restored.' } : { note: 'Requested toolset(s) already locked.' });
   });
 
   return server;
@@ -152,7 +131,6 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
 
   const githubToken = (req.headers['x-github-token'] as string) || DEFAULT_GITHUB_PAT || '';
   const renderToken = (req.headers['x-render-token'] as string) || DEFAULT_RENDER_API_KEY;
-  const callerIdentity = identityKey(githubToken);
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
   if (sessionId && transports.has(sessionId)) {
@@ -184,7 +162,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     }
   };
 
-  const masterServer = createMasterServer(githubToken, renderToken, newSessionId, callerIdentity);
+  const masterServer = createMasterServer(githubToken, renderToken, newSessionId);
   try {
     await masterServer.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -209,7 +187,6 @@ const cleanupTimer = setInterval(() => {
       transports.delete(id);
     }
   }
-  cleanupIdleIdentities(24 * 60 * 60 * 1000);
 }, 3 * 60 * 1000);
 cleanupTimer.unref();
 
