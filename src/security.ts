@@ -254,6 +254,42 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   run_secret_scanning: 'github_admin',
   request_copilot_review: 'github_admin',
   assign_copilot_to_issue: 'github_admin',
+
+  // Render Cloud Services Category
+  list_workspaces: 'render',
+  select_workspace: 'render',
+  get_selected_workspace: 'render',
+  list_services: 'render',
+  get_service: 'render',
+  create_web_service: 'render',
+  create_static_site: 'render',
+  create_cron_job: 'render',
+  restart_service: 'render',
+  delete_service: 'render',
+  list_deploys: 'render',
+  get_deploy: 'render',
+  trigger_deploy: 'render',
+  cancel_deploy: 'render',
+  list_logs: 'render',
+  list_log_label_values: 'render',
+  get_metrics: 'render',
+  list_env_vars: 'render',
+  update_env_vars: 'render',
+  delete_env_var: 'render',
+  query_render_postgres: 'render',
+
+  // Sandbox & Local Git CLI Category
+  sandbox_exec: 'sandbox',
+  sandbox_run: 'sandbox',
+  sandbox_install: 'sandbox',
+  sandbox_ps: 'sandbox',
+  sandbox_reset: 'sandbox',
+  git_clone: 'sandbox',
+  git_checkout: 'sandbox',
+  git_pull: 'sandbox',
+  git_status: 'sandbox',
+  git_diff: 'sandbox',
+  git_commit_push: 'sandbox'
 };
 
 export function makeRegistrar(server: any, registry: Record<string, any>) {
