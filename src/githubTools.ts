@@ -702,17 +702,18 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('search_repositories', {
-    description: 'Search repositories or list user/org repos with pagination (max 20 per page), regex filter, similarity ranking, and detailed metadata.',
+    description: 'Search repositories or list user/org repos. Set exact:true to return only the single best match (use when the user wants one specific repo). Returns compact name + default branch only.',
     inputSchema: {
       q: z.string().optional().describe('Search query term or keywords'),
       username: z.string().optional().describe('GitHub username or org to fetch repositories for'),
       regex: z.string().optional().describe('Regex pattern to filter matching repository names'),
+      exact: z.boolean().optional().default(false).describe('Return only the single best-matching repository'),
       page: z.number().optional().default(1).describe('Page number (1-indexed)'),
       limit: z.number().optional().default(20).describe('Items per page (default 20, max 20)')
     },
     annotations: getToolAnnotations('search_repositories')
   }, async (args: any) => {
-    const { q, username, regex, page, limit } = args;
+    const { q, username, regex, exact, page, limit } = args;
     try {
       const perPage = Math.min(Math.max(1, limit || 20), 20);
       const pageNum = Math.max(1, page || 1);
@@ -760,20 +761,16 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
         items.sort((a, b) => (b._sim || 0) - (a._sim || 0));
       }
 
-      const bestMatch = items[0]?.full_name;
+      const line = (r: any) => `${r.full_name} (${r.default_branch || 'main'})`;
 
-      const formatted = items.map((r, i) => {
-        const isBest = r.full_name === bestMatch ? ' 🌟 [Best Match]' : '';
-        const desc = r.description ? ` - ${r.description.slice(0, 120)}` : '';
-        const lang = r.language ? ` [${r.language}]` : '';
-        const stars = ` ⭐ ${r.stargazers_count || 0}`;
-        const branch = ` (${r.default_branch || 'main'})`;
-        const updated = r.updated_at ? ` [Updated: ${r.updated_at.split('T')[0]}]` : '';
-        return `${i + 1}. **${r.full_name}**${isBest}${branch}${lang}${stars}${updated}${desc}`;
-      });
+      if (exact) {
+        const top = items[0];
+        return formatOptimizedResponse(line(top));
+      }
 
-      const meta = `Page ${pageNum} (${formatted.length} items shown, ${totalCount} total matches). To view next 20 repos, call search_repositories with page: ${pageNum + 1}.`;
-      return formatOptimizedResponse(`${meta}\n\n${formatted.join('\n')}\n\nTip: Call set_active_context(owner, repo) to set default repository context and start working instantly.`, 100000);
+      const formatted = items.map((r, i) => `${i + 1}. ${line(r)}`);
+      const meta = `Page ${pageNum} (${formatted.length}/${totalCount} shown).`;
+      return formatOptimizedResponse(`${meta}\n${formatted.join('\n')}`, 100000);
     } catch (err) { return handleGitHubError(err); }
   });
 
