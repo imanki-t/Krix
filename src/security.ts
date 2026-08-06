@@ -1,5 +1,6 @@
 import vm from 'node:vm';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 export enum PermissionLevel {
   READ_ONLY = 'READ_ONLY',
@@ -28,6 +29,47 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
   const current = getSessionContext(sessionId);
   Object.assign(current, patch);
   return current;
+}
+
+export interface IdentityEntry {
+  categories: Set<ToolCategory>;
+  lastActive: number;
+}
+
+const enabledCategoriesByIdentity = new Map<string, IdentityEntry>();
+
+export function identityKey(token: string): string {
+  if (!token) return 'anon';
+  return crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
+}
+
+export function getEnabledCategories(identity: string): Set<ToolCategory> {
+  let entry = enabledCategoriesByIdentity.get(identity);
+  if (!entry) {
+    entry = { categories: new Set(['core']), lastActive: Date.now() };
+    enabledCategoriesByIdentity.set(identity, entry);
+  }
+  entry.lastActive = Date.now();
+  return entry.categories;
+}
+
+export function persistEnabledCategory(identity: string, cat: string) {
+  const categories = getEnabledCategories(identity);
+  if (cat === 'all') {
+    const allCats: ToolCategory[] = ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render'];
+    allCats.forEach(c => categories.add(c));
+  } else {
+    categories.add(cat as ToolCategory);
+  }
+}
+
+export function cleanupIdleIdentities(maxIdleMs: number = 24 * 60 * 60 * 1000): void {
+  const now = Date.now();
+  for (const [id, entry] of enabledCategoriesByIdentity.entries()) {
+    if (now - entry.lastActive > maxIdleMs) {
+      enabledCategoriesByIdentity.delete(id);
+    }
+  }
 }
 
 export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
