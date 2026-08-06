@@ -19,14 +19,31 @@ export interface SessionContext {
 
 const sessionContexts = new Map<string, SessionContext>();
 
-// This server is single-tenant (one GitHub token, one operator). The MCP
-// transport can mint a new session id whenever a caller doesn't resend the
-// mcp-session-id header, which would otherwise silently wipe owner/repo/
-// branch/sandboxDir set via set_active_context or git_clone. Track the most
-// recently used values here and seed every new session from them, so context
-// survives session churn instead of requiring owner/repo to be repeated on
-// every call.
-let lastKnownContext: { owner?: string; repo?: string; branch?: string; sandboxDir?: string } = {};
+// This server can in principle be called with different GitHub tokens
+// (x-github-token header). Persisting "last known" owner/repo/branch/
+// sandboxDir must therefore be scoped to the authenticated identity, not
+// global — otherwise one caller's active repo could leak into another
+// caller's session after an mcp-session-id reset. sessionAuthKey maps the
+// live session to a hash of its token; lastKnownContextByAuth buckets
+// persisted context under that hash so it only ever resumes for the same
+// authenticated caller, never across identities.
+const sessionAuthKey = new Map<string, string>();
+const lastKnownContextByAuth = new Map<string, { owner?: string; repo?: string; branch?: string; sandboxDir?: string }>();
+
+function hashAuth(token: string): string {
+  return crypto.createHash('sha256').update(token || 'anonymous').digest('hex').slice(0, 16);
+}
+
+export function registerSessionAuth(sessionId: string, githubToken: string): void {
+  sessionAuthKey.set(sessionId, hashAuth(githubToken));
+}
+
+function authBucket(sessionId: string) {
+  const key = sessionAuthKey.get(sessionId) || 'anonymous';
+  let bucket = lastKnownContextByAuth.get(key);
+  if (!bucket) { bucket = {}; lastKnownContextByAuth.set(key, bucket); }
+  return bucket;
+}
 
 export function getSessionContext(sessionId: string): SessionContext {
   if (!sessionContexts.has(sessionId)) {
@@ -34,11 +51,12 @@ export function getSessionContext(sessionId: string): SessionContext {
     const initial: ToolCategory[] = enableAll
       ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
       : ['core', 'sandbox'];
+    const known = authBucket(sessionId);
     sessionContexts.set(sessionId, {
-      branch: lastKnownContext.branch || 'main',
-      owner: lastKnownContext.owner,
-      repo: lastKnownContext.repo,
-      sandboxDir: lastKnownContext.sandboxDir,
+      branch: known.branch || 'main',
+      owner: known.owner,
+      repo: known.repo,
+      sandboxDir: known.sandboxDir,
       enabledCategories: new Set(initial)
     });
   }
@@ -48,15 +66,17 @@ export function getSessionContext(sessionId: string): SessionContext {
 export function updateSessionContext(sessionId: string, patch: Partial<SessionContext>): SessionContext {
   const current = getSessionContext(sessionId);
   Object.assign(current, patch);
-  if (patch.owner) lastKnownContext.owner = patch.owner;
-  if (patch.repo) lastKnownContext.repo = patch.repo;
-  if (patch.branch) lastKnownContext.branch = patch.branch;
-  if (patch.sandboxDir) lastKnownContext.sandboxDir = patch.sandboxDir;
+  const known = authBucket(sessionId);
+  if (patch.owner) known.owner = patch.owner;
+  if (patch.repo) known.repo = patch.repo;
+  if (patch.branch) known.branch = patch.branch;
+  if (patch.sandboxDir) known.sandboxDir = patch.sandboxDir;
   return current;
 }
 
 export function deleteSessionContext(sessionId: string): void {
   sessionContexts.delete(sessionId);
+  sessionAuthKey.delete(sessionId);
 }
 
 export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
