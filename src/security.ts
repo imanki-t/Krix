@@ -24,7 +24,7 @@ export function getSessionContext(sessionId: string): SessionContext {
     const enableAll = process.env.ENABLE_ALL_TOOLS === 'true';
     const initial: ToolCategory[] = enableAll
       ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
-      : ['core'];
+      : ['core', 'sandbox'];
     sessionContexts.set(sessionId, { branch: 'main', enabledCategories: new Set(initial) });
   }
   return sessionContexts.get(sessionId)!;
