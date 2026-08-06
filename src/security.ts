@@ -50,7 +50,11 @@ export function identityKey(token: string): string {
 export function getEnabledCategories(identity: string): Set<ToolCategory> {
   let entry = enabledCategoriesByIdentity.get(identity);
   if (!entry) {
-    entry = { categories: new Set(['core']), lastActive: Date.now() };
+    const enableAll = process.env.ENABLE_ALL_TOOLS === 'true';
+    const initial: ToolCategory[] = enableAll
+      ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
+      : ['core'];
+    entry = { categories: new Set(initial), lastActive: Date.now() };
     enabledCategoriesByIdentity.set(identity, entry);
   }
   entry.lastActive = Date.now();
