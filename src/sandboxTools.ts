@@ -131,6 +131,7 @@ function sandboxEnv(sessionId?: string): NodeJS.ProcessEnv {
     ...process.env,
     HOME: safeHome,
     npm_config_cache: path.join(safeHome, '.npm'),
+    NODE_OPTIONS: sessionEnv.NODE_OPTIONS || '--max-old-space-size=400',
     ...sessionEnv,
   };
 }
