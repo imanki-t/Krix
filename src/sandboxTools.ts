@@ -22,9 +22,10 @@ interface ActiveProcess {
   stderr: string;
 }
 
-const OUT_CAP = 2000;
-const BG_BUF_CAP = 20000;
+const OUT_CAP = 100000;
+const BG_BUF_CAP = 200000;
 const EXEC_LIMITS = { maxBuffer: 4 * 1024 * 1024 };
+const EXITED_TTL_MS = 10 * 60 * 1000;
 
 const processTables = new Map<string, Map<number, ActiveProcess>>();
 function procTable(sessionId: string): Map<number, ActiveProcess> {
