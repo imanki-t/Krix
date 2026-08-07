@@ -255,7 +255,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     // many background runs — running processes are never pruned.
     const now = Date.now();
     for (const [pid, item] of table) {
-      if (item.status === 'exited' && now - item.startTime.getTime() > EXITED_TTL_MS) table.delete(pid);
+      if (item.status === 'exited' && item.exitedAt && now - item.exitedAt.getTime() > EXITED_TTL_MS) table.delete(pid);
     }
 
     if (args.action === 'kill') {
