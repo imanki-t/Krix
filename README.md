@@ -1,4 +1,4 @@
-# Krix — Unified Agentic Gateway & Sandbox MCP Server
+# Krix 
 
 **Krix** is a production-grade Model Context Protocol (MCP) server that empowers AI agents with complete control over **GitHub Repositories**, **Render Cloud Infrastructure**, and an **Isolated Execution Sandbox** with persistent bash shells, language runtimes, and local Git CLI tools over a unified HTTP transport.
 
