@@ -9,9 +9,19 @@ import {
   sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession
 } from './security.js';
 
-interface ActiveProcess { pid: number; command: string; proc: ChildProcess; startTime: Date; }
+interface ActiveProcess {
+  pid: number;
+  command: string;
+  proc: ChildProcess;
+  startTime: Date;
+  status: 'running' | 'exited';
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+}
 
 const OUT_CAP = 2000;
+const BG_BUF_CAP = 20000;
 const EXEC_LIMITS = { maxBuffer: 4 * 1024 * 1024 };
 
 const processTables = new Map<string, Map<number, ActiveProcess>>();
@@ -19,6 +29,14 @@ function procTable(sessionId: string): Map<number, ActiveProcess> {
   let t = processTables.get(sessionId);
   if (!t) { t = new Map(); processTables.set(sessionId, t); }
   return t;
+}
+
+// Keeps only the most recent BG_BUF_CAP chars of a background process's
+// output — bounds memory for long-running/chatty jobs instead of buffering
+// unbounded stdout/stderr for the lifetime of the sandbox.
+function appendCapped(buf: string, chunk: string, cap: number = BG_BUF_CAP): string {
+  const next = buf + chunk;
+  return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
 function trunc(s: string, cap: number = OUT_CAP): string {
