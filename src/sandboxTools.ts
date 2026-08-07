@@ -642,9 +642,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         try { await fs.access(ctx.sandboxDir); cloned = true; }
         catch { updateSessionContext(sessionId, { sandboxDir: undefined }); }
       }
-      const rawFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
       const maxMemMB = 400;
-      const freeMemMB = Math.min(maxMemMB, rawFreeMemMB);
+      const usedMemMB = Math.round(process.memoryUsage().heapUsed / (1024 * 1024));
+      const freeMemMB = Math.max(0, Math.min(maxMemMB, maxMemMB - usedMemMB));
 
       return formatOptimizedResponse({
         freeMemMB,
