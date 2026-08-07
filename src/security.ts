@@ -101,6 +101,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'set_active_context': PermissionLevel.READ_ONLY,
   'get_me': PermissionLevel.READ_ONLY,
   'load_toolset': PermissionLevel.READ_ONLY,
+  'list_toolsets': PermissionLevel.READ_ONLY,
   'get_file_contents': PermissionLevel.READ_ONLY,
   'str_replace_editor': PermissionLevel.MUTATING,
   'create_or_update_file': PermissionLevel.MUTATING,
@@ -195,7 +196,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
 };
 
 const CLOSED_WORLD_TOOLS = new Set([
-  'set_active_context', 'load_toolset', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
+  'set_active_context', 'load_toolset', 'list_toolsets', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
   'git_status', 'git_diff'
 ]);
 
@@ -217,6 +218,7 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   set_active_context: 'core',
   get_me: 'core',
   load_toolset: 'core',
+  list_toolsets: 'core',
   get_file_contents: 'core',
   str_replace_editor: 'core',
   create_or_update_file: 'core',
