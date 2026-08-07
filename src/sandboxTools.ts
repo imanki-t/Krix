@@ -16,6 +16,7 @@ interface ActiveProcess {
   startTime: Date;
   status: 'running' | 'exited';
   exitCode: number | null;
+  exitedAt: Date | null;
   stdout: string;
   stderr: string;
 }
