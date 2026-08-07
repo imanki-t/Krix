@@ -315,11 +315,22 @@ function fileRunCmd(ext: string, abs: string, extraArgs: string, binPath?: strin
       const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
       return `g++ "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
     }
-    default: throw new Error(`Unsupported extension '${ext}'. Use py/js/ts/sh/go/java/cpp.`);
+    case '.c': {
+      const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
+      return `gcc "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
+    }
+    case '.rs': {
+      const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
+      return `rustc -O "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
+    }
+    case '.rb': return `ruby "${abs}" ${extraArgs}`;
+    case '.php': return `php "${abs}" ${extraArgs}`;
+    default: throw new Error(`Unsupported extension '${ext}'. Use py/js/ts/sh/go/java/cpp/c/rust/ruby/php.`);
   }
 }
 
-const EXT_BY_LANG: Record<string, string> = { py: '.py', js: '.js', ts: '.ts', sh: '.sh', go: '.go', java: '.java', cpp: '.cpp' };
+const EXT_BY_LANG: Record<string, string> = { py: '.py', js: '.js', ts: '.ts', sh: '.sh', go: '.go', java: '.java', cpp: '.cpp', c: '.c', rust: '.rs', ruby: '.rb', php: '.php' };
+const COMPILED_EXTS = new Set(['.cpp', '.c', '.rs']);
 
 function authFlag(token?: string): string {
   if (!token) return '';
