@@ -390,9 +390,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_run', {
-    description: 'Run code: pass inline `code` (+ optional `lang`, default py) or an existing `filePath`. Langs: py,js,ts,sh,go,java,cpp. Pass `dir` to run in any sandbox directory instead of the default workDir.',
+    description: 'Run code: pass inline `code` (+ optional `lang`, default py) or an existing `filePath`. Langs: py,js,ts,sh,go,java,cpp,c,rust,ruby,php. Pass `dir` to run in any sandbox directory instead of the default workDir.',
     inputSchema: {
-      lang: z.enum(['py', 'js', 'ts', 'sh', 'go', 'java', 'cpp']).optional(),
+      lang: z.enum(['py', 'js', 'ts', 'sh', 'go', 'java', 'cpp', 'c', 'rust', 'ruby', 'php']).optional(),
       code: z.string().optional(),
       filePath: z.string().optional(),
       args: z.array(z.string()).optional(),
@@ -410,7 +410,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       if (args.filePath) {
         const abs = sanitizePath(args.filePath, cwd);
         const ext = path.extname(abs).toLowerCase();
-        if (ext === '.cpp') {
+        if (COMPILED_EXTS.has(ext)) {
           createdBin = path.join(cwd, `_sbx_out_${Date.now()}`);
           cmd = fileRunCmd(ext, abs, extraArgs, createdBin);
         } else {
@@ -420,7 +420,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         const ext = EXT_BY_LANG[args.lang || 'py'] || '.py';
         tmp = path.join(cwd, `_snippet_${Date.now()}${ext}`);
         await fs.writeFile(tmp, args.code, 'utf-8');
-        if (ext === '.cpp') {
+        if (COMPILED_EXTS.has(ext)) {
           createdBin = path.join(cwd, `_sbx_out_${Date.now()}`);
           cmd = fileRunCmd(ext, tmp, extraArgs, createdBin);
         } else {
