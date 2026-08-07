@@ -9,6 +9,7 @@ import dotenv from 'dotenv';
 import { registerGitHubTools } from './githubTools.js';
 import { registerRenderTools } from './renderTools.js';
 import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
+import { registerToolsetTools } from './toolsetTools.js';
 import {
   formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory, getSessionContext, registerSessionAuth, makeRegistrar
 } from './security.js';
@@ -56,6 +57,12 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
   
   registerSandboxTools(server, sessionId, githubToken, registry);
   tagCategory(registry, categoryOf, 'sandbox');
+
+  // Must come after every other registerXTools() call above: it needs
+  // `registry` and `categoryOf` fully populated so load_toolset has every
+  // tool's category available to enable against.
+  registerToolsetTools(server, sessionId, registry, categoryOf);
+  tagCategory(registry, categoryOf, 'core');
 
   // Re-enable any category already unlocked for this session, disable others
   const ctx = getSessionContext(sessionId);
