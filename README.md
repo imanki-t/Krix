@@ -43,7 +43,7 @@ These 21 tools are active by default upon connection:
 
 | Tool Name | Type | Description |
 | :--- | :--- | :--- |
-| `set_active_context` | `READ_ONLY` | Sets global `owner`, `repo`, and `branch` defaults for the active session. |
+| `set_active_context` | `READ_ONLY` | Sets `owner`, `repo`, and `branch` defaults. Persists across session-id churn, scoped to the authenticated GitHub token. |
 | `get_me` | `READ_ONLY` | Retrieves authenticated GitHub user profile info. |
 | `get_file_contents` | `READ_ONLY` | Fetches windowed line ranges of a file (100 default, 500 max lines). |
 | `str_replace_editor` | `MUTATING` | Surgically replaces code blocks with Levenshtein similarity feedback on match errors. |
@@ -61,7 +61,7 @@ These 21 tools are active by default upon connection:
 | `get_commit` | `READ_ONLY` | Retrieves commit details by SHA. |
 | `search_code` | `READ_ONLY` | Searches code across GitHub repositories. |
 | `search_commits` | `READ_ONLY` | Searches commit messages across GitHub. |
-| `search_repositories` | `READ_ONLY` | Searches public and private GitHub repositories. |
+| `search_repositories` | `READ_ONLY` | Searches repositories; `exact: true` returns only the single best match. Compact `owner/repo (branch)` output. |
 | `sandbox_status` | `READ_ONLY` | Checks status of the local execution sandbox. |
 | `load_toolset` | `READ_ONLY` | Dynamically enables lazy-loaded tool categories. |
 
@@ -180,6 +180,19 @@ MCP_API_KEY=your_optional_mcp_secret_key
 # HTTP Server Port
 PORT=3000
 ```
+
+### System Requirements (Sandbox)
+The Execution Sandbox tools shell out to real OS binaries, so the host/container must have these installed:
+
+| Language | Binary | Debian/Ubuntu package |
+| :--- | :--- | :--- |
+| Git ops | `git` | `git` |
+| Python | `python3` | `python3`, `python3-pip` |
+| Go | `go` | `golang-go` |
+| Java | `java`, `javac` | `default-jdk-headless` |
+| C++ | `g++` | `g++` |
+
+A ready-to-use `Dockerfile` in the repo root installs all of these in a **single build stage** (important: some platforms use multi-stage builds that silently drop OS packages installed in an earlier stage if the final stage doesn't explicitly copy them over — this Dockerfile avoids that by doing everything in one stage). Deploy with Docker-based hosting (e.g. Render's Docker environment) rather than a native buildpack/Nixpacks runtime if you need the sandbox's git/python3/go/java/g++ support.
 
 ---
 
