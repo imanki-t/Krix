@@ -367,14 +367,14 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         const { stdout, exit, timedOut } = await runInShell(sessionId, cmd, Math.min(timeoutMs, SHELL_HANG_MS));
         if (timedOut) return formatError(`Command timed out after ${timeoutMs}ms and the persistent shell was restarted (its prior state is lost). Use background:true for long-running commands instead.`);
         const out: Record<string, any> = {};
-        const o = trunc(stdout);
+        const o = truncWithCache(sessionId, stdout);
         if (o) out.stdout = o;
         if (exit !== 0) out.exit = exit;
         return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
       }
 
       const { err, stdout, stderr } = await run(args.command, cwd, timeoutMs, sessionId);
-      return execResponse(err, stdout, stderr);
+      return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
 
