@@ -241,21 +241,94 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
+  const EXITED_TTL_MS = 10 * 60 * 1000;
+
   reg('sandbox_ps', {
-    description: 'List or kill background sandbox processes.',
-    inputSchema: { action: z.enum(['list', 'kill']).default('list'), pid: z.number().optional() },
+    description: 'List, kill (pid or "all"), or fetch output of background sandbox processes started via sandbox_exec(background:true).',
+    inputSchema: { action: z.enum(['list', 'kill', 'output']).default('list'), pid: z.union([z.number(), z.literal('all')]).optional() },
     annotations: getToolAnnotations('sandbox_ps')
   }, async (args: any) => {
     const table = procTable(sessionId);
-    if (args.action === 'kill' && args.pid) {
+
+    // Prune old exited entries so the table doesn't grow unbounded across
+    // many background runs — running processes are never pruned.
+    const now = Date.now();
+    for (const [pid, item] of table) {
+      if (item.status === 'exited' && now - item.startTime.getTime() > EXITED_TTL_MS) table.delete(pid);
+    }
+
+    if (args.action === 'kill') {
+      if (args.pid === 'all') {
+        const killed: number[] = [];
+        for (const [pid, item] of table) {
+          if (item.status === 'running') { try { item.proc.kill('SIGKILL'); } catch {} }
+          killed.push(pid);
+          table.delete(pid);
+        }
+        return formatOptimizedResponse({ killed });
+      }
+      if (!args.pid) return formatError('Provide `pid` (a number or "all") for kill.');
       const item = table.get(args.pid);
       if (!item) return formatError('No such process.');
-      item.proc.kill('SIGKILL');
+      try { item.proc.kill('SIGKILL'); } catch {}
       table.delete(args.pid);
       return formatOptimizedResponse({ killed: args.pid });
     }
-    const list = Array.from(table.values()).map(p => ({ pid: p.pid, command: p.command }));
+
+    if (args.action === 'output') {
+      if (!args.pid || args.pid === 'all') return formatError('Provide a specific numeric `pid` for output.');
+      const item = table.get(args.pid);
+      if (!item) return formatError('No such process.');
+      const out: Record<string, any> = { pid: item.pid, status: item.status, exitCode: item.exitCode };
+      const o = trunc(item.stdout, BG_BUF_CAP);
+      const e = trunc(item.stderr, BG_BUF_CAP);
+      if (o) out.stdout = o;
+      if (e) out.stderr = e;
+      return formatOptimizedResponse(out);
+    }
+
+    const list = Array.from(table.values()).map(p => ({
+      pid: p.pid, command: p.command, status: p.status, exitCode: p.exitCode
+    }));
     return formatOptimizedResponse(list.length ? list : 'No active processes.');
+  });
+
+  reg('sandbox_file', {
+    description: 'Read, write, append to, or delete a file in the sandbox — safer than shell-escaping content through sandbox_exec.',
+    inputSchema: {
+      action: z.enum(['read', 'write', 'append', 'delete']),
+      path: z.string(),
+      content: z.string().optional(),
+      dir: z.string().optional()
+    },
+    annotations: getToolAnnotations('sandbox_file')
+  }, async (args: any) => {
+    try {
+      const base = await resolveDir(sessionId, args.dir);
+      const abs = sanitizePath(args.path, base);
+
+      if (args.action === 'read') {
+        const stat = await fs.stat(abs).catch(() => null);
+        if (!stat || !stat.isFile()) return formatError(`No such file: ${args.path}`);
+        const content = await fs.readFile(abs, 'utf-8');
+        const out: Record<string, any> = { sizeBytes: stat.size };
+        const c = trunc(content, 10000);
+        if (c) out.content = c;
+        return formatOptimizedResponse(out);
+      }
+
+      if (args.action === 'delete') {
+        await fs.unlink(abs);
+        return formatOptimizedResponse({ deleted: args.path });
+      }
+
+      if (args.content === undefined) return formatError('`content` is required for write/append.');
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      if (args.action === 'append') await fs.appendFile(abs, args.content, 'utf-8');
+      else await fs.writeFile(abs, args.content, 'utf-8');
+      const stat = await fs.stat(abs);
+      return formatOptimizedResponse({ [args.action === 'append' ? 'appended' : 'wrote']: args.path, sizeBytes: stat.size });
+    } catch (err) { return formatError(err); }
   });
 
   reg('sandbox_reset', {
