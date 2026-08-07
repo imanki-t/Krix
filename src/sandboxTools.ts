@@ -159,11 +159,11 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         const proc = spawn(args.command, { cwd, shell: true, env: sandboxEnv() });
         if (!proc.pid) throw new Error('Failed to start background process.');
         const pid = proc.pid;
-        const entry: ActiveProcess = { pid, command: args.command, proc, startTime: new Date(), status: 'running', exitCode: null, stdout: '', stderr: '' };
+        const entry: ActiveProcess = { pid, command: args.command, proc, startTime: new Date(), status: 'running', exitCode: null, exitedAt: null, stdout: '', stderr: '' };
         procTable(sessionId).set(pid, entry);
         proc.stdout?.on('data', (d) => { entry.stdout = appendCapped(entry.stdout, d.toString()); });
         proc.stderr?.on('data', (d) => { entry.stderr = appendCapped(entry.stderr, d.toString()); });
-        proc.on('exit', (code) => { entry.status = 'exited'; entry.exitCode = code; });
+        proc.on('exit', (code) => { entry.status = 'exited'; entry.exitCode = code; entry.exitedAt = new Date(); });
         return formatOptimizedResponse({ started: pid, command: args.command, dir: cwd });
       }
 
