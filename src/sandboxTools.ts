@@ -128,13 +128,25 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   const reg = makeRegistrar(server, registry);
 
   reg('sandbox_exec', {
-    description: 'Run a shell command in the sandbox. Cwd is the active cloned repo if one exists, else scratch dir.',
-    inputSchema: { command: z.string(), timeoutMs: z.number().optional() },
+    description: 'Run a shell command in the sandbox. Defaults to the active cloned repo if one exists, else scratch dir — pass `dir` to target any other sandbox path. Pass `background: true` to run detached and track it via sandbox_ps.',
+    inputSchema: { command: z.string(), timeoutMs: z.number().optional(), dir: z.string().optional(), background: z.boolean().optional().default(false) },
     annotations: getToolAnnotations('sandbox_exec')
   }, async (args: any) => {
     try {
       sanitizeCommand(args.command);
-      const cwd = await workDir(sessionId);
+      const cwd = await resolveDir(sessionId, args.dir);
+
+      if (args.background) {
+        const proc = spawn(args.command, { cwd, shell: true, env: sandboxEnv() });
+        if (!proc.pid) throw new Error('Failed to start background process.');
+        const pid = proc.pid;
+        procTable(sessionId).set(pid, { pid, command: args.command, proc, startTime: new Date() });
+        proc.on('exit', () => { procTable(sessionId).delete(pid); });
+        proc.stdout?.on('data', () => {});
+        proc.stderr?.on('data', () => {});
+        return formatOptimizedResponse({ started: pid, command: args.command, dir: cwd });
+      }
+
       const { err, stdout, stderr } = await run(args.command, cwd, Math.min(args.timeoutMs || 30000, 120000));
       return execResponse(err, stdout, stderr);
     } catch (err) { return formatError(err); }
