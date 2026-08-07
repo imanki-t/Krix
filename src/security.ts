@@ -14,6 +14,8 @@ export interface SessionContext {
   branch?: string;
   workspaceId?: string;
   sandboxDir?: string;
+  cwd?: string;
+  env?: Record<string, string>;
   enabledCategories: Set<ToolCategory>;
 }
 
