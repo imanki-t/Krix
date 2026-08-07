@@ -541,7 +541,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       content: z.string().optional(),
       old_str: z.string().optional().describe('Required for action:edit. Must match the file content in exactly one place.'),
       new_str: z.string().optional().describe('Required for action:edit. Replaces old_str; empty string deletes the matched text.'),
-      dir: z.string().optional()
+      dir: z.string().optional(),
+      offset: z.number().optional().describe('For action:read — char offset to start from, for paginating large files.'),
+      limit: z.number().optional().describe(`For action:read — max chars to return (default/cap: ${OUT_CAP}).`)
     },
     annotations: getToolAnnotations('sandbox_file')
   }, async (args: any) => {
