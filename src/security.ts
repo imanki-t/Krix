@@ -100,6 +100,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   // Agentic Core Tools
   'set_active_context': PermissionLevel.READ_ONLY,
   'get_me': PermissionLevel.READ_ONLY,
+  'load_toolset': PermissionLevel.READ_ONLY,
   'get_file_contents': PermissionLevel.READ_ONLY,
   'str_replace_editor': PermissionLevel.MUTATING,
   'create_or_update_file': PermissionLevel.MUTATING,
