@@ -613,7 +613,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     annotations: getToolAnnotations('sandbox_reset')
   }, async () => {
     try {
-      await destroySandbox(sessionId);
+      await destroySandbox(sessionId, { deleteContext: false });
       updateSessionContext(sessionId, { sandboxDir: undefined });
       return formatOptimizedResponse({ reset: true });
     } catch (err) { return formatError(err); }
