@@ -545,7 +545,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_file', {
-    description: 'Read, write, append to, edit (targeted find-and-replace via old_str/new_str), or delete a file in the sandbox — safer than shell-escaping content through sandbox_exec.',
+    description: 'Read, write, append to, edit (find-and-replace via old_str/new_str), or delete a file in the sandbox — safer than shell-escaping content through sandbox_exec. For edit, old_str can be any length — a single line or an entire block — as long as it matches the file exactly once; it is not limited to short snippets.',
     inputSchema: {
       action: z.enum(['read', 'write', 'append', 'edit', 'delete']),
       path: z.string(),

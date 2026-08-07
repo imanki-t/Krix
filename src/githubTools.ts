@@ -176,7 +176,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('str_replace_editor', {
-    description: 'Surgically search and replace code block. Supports Base64 parameters.',
+    description: 'Find and replace an exact block of text in a file, then commit the change. old_str can span any length — a single line or an entire function — as long as it matches the file content exactly once; it is not limited to short snippets. Supports Base64 parameters for binary-safe input.',
     inputSchema: {
       owner: z.string().optional(),
       repo: z.string().optional(),
@@ -216,7 +216,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       const res = await octokit.repos.createOrUpdateFileContents({
         owner: target.owner, repo: target.repo, path, message, content: Buffer.from(updated, 'utf-8').toString('base64'), branch: activeBranch, sha: fileData.data.sha
       });
-      return formatOptimizedResponse(`Surgical replacement committed: ${res.data.commit.sha}`);
+      return formatOptimizedResponse(`Replacement committed: ${res.data.commit.sha}`);
     } catch (err) { return handleGitHubError(err); }
   });
 
