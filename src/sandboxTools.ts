@@ -69,6 +69,11 @@ async function workDir(sessionId: string): Promise<string> {
 }
 
 export async function destroySandbox(sessionId: string): Promise<void> {
+  // Capture the real auth-scoped directory BEFORE deleting session context —
+  // deleteSessionContext() removes the sessionId->authKey mapping, after
+  // which getAuthKeyForSession() falls back to 'anonymous' and would delete
+  // the wrong (nonexistent) directory, leaving the real one untouched.
+  const dirToRemove = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
   deleteSessionContext(sessionId);
   const table = processTables.get(sessionId);
   if (table) {
@@ -76,7 +81,7 @@ export async function destroySandbox(sessionId: string): Promise<void> {
     processTables.delete(sessionId);
   }
   try {
-    await fs.rm(path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`), { recursive: true, force: true });
+    await fs.rm(dirToRemove, { recursive: true, force: true });
   } catch {}
 }
 
