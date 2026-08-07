@@ -127,18 +127,38 @@ interface PersistentShell { proc: ChildProcess; buf: string; busy: boolean; }
 const persistentShells = new Map<string, PersistentShell>();
 const SHELL_HANG_MS = 60000;
 
+// Guards shell creation against a race: getShell awaits workDir() before it
+// registers the new shell, so two concurrent calls for the same identity
+// (no shell running yet) can both pass the `existing` check, both spawn a
+// bash process, and the second persistentShells.set() silently overwrites
+// the first — orphaning a live, untracked child process. Callers that land
+// mid-creation await the same in-flight promise instead of racing to spawn
+// their own.
+const shellCreation = new Map<string, Promise<PersistentShell>>();
+
 async function getShell(sessionId: string): Promise<PersistentShell> {
   const key = getAuthKeyForSession(sessionId);
   const existing = persistentShells.get(key);
   if (existing && !existing.proc.killed) return existing;
 
-  const cwd = await workDir(sessionId);
-  const proc = spawn('bash', ['--noprofile', '--norc'], { cwd, env: sandboxEnv(sessionId) });
-  const shell: PersistentShell = { proc, buf: '', busy: false };
-  proc.stdout?.on('data', (d) => { shell.buf += d.toString(); });
-  proc.on('exit', () => { if (persistentShells.get(key) === shell) persistentShells.delete(key); });
-  persistentShells.set(key, shell);
-  return shell;
+  const inFlight = shellCreation.get(key);
+  if (inFlight) return inFlight;
+
+  const creation = (async () => {
+    const cwd = await workDir(sessionId);
+    const proc = spawn('bash', ['--noprofile', '--norc'], { cwd, env: sandboxEnv(sessionId) });
+    const shell: PersistentShell = { proc, buf: '', busy: false };
+    proc.stdout?.on('data', (d) => { shell.buf += d.toString(); });
+    proc.on('exit', () => { if (persistentShells.get(key) === shell) persistentShells.delete(key); });
+    persistentShells.set(key, shell);
+    return shell;
+  })();
+  shellCreation.set(key, creation);
+  try {
+    return await creation;
+  } finally {
+    shellCreation.delete(key);
+  }
 }
 
 function killShell(authKey: string): void {
