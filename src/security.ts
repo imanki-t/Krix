@@ -183,6 +183,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'sandbox_run': PermissionLevel.MUTATING,
   'sandbox_install': PermissionLevel.MUTATING,
   'sandbox_ps': PermissionLevel.READ_ONLY,
+  'sandbox_output': PermissionLevel.READ_ONLY,
   'sandbox_reset': PermissionLevel.MUTATING,
   'git_clone': PermissionLevel.MUTATING,
   'git_checkout': PermissionLevel.MUTATING,
