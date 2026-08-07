@@ -63,6 +63,52 @@ function trunc(s: string, cap: number = OUT_CAP): string {
   return clean.length > cap ? `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated]` : clean;
 }
 
+// --- Paginated output cache -------------------------------------------
+// trunc() alone drops anything past its cap with no way to retrieve it.
+// truncWithCache() additionally stashes the full string (only when it was
+// actually truncated) under a short-lived id, scoped per session so one
+// session can never read another's cached output. sandbox_output serves
+// paginated reads from this cache.
+interface CachedOutput { content: string; createdAt: number; }
+const outputCache = new Map<string, Map<string, CachedOutput>>();
+const OUTPUT_CACHE_TTL_MS = 15 * 60 * 1000;
+const OUTPUT_CACHE_MAX_PER_SESSION = 10;
+
+function cacheOutput(sessionId: string, content: string): string {
+  let bucket = outputCache.get(sessionId);
+  if (!bucket) { bucket = new Map(); outputCache.set(sessionId, bucket); }
+  if (bucket.size >= OUTPUT_CACHE_MAX_PER_SESSION) {
+    const oldest = [...bucket.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
+    if (oldest) bucket.delete(oldest[0]);
+  }
+  const id = crypto.randomBytes(6).toString('hex');
+  bucket.set(id, { content, createdAt: Date.now() });
+  return id;
+}
+
+function getCachedOutput(sessionId: string, id: string): string | undefined {
+  return outputCache.get(sessionId)?.get(id)?.content;
+}
+
+const outputCachePruneTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [sid, bucket] of outputCache) {
+    for (const [id, entry] of bucket) {
+      if (now - entry.createdAt > OUTPUT_CACHE_TTL_MS) bucket.delete(id);
+    }
+    if (bucket.size === 0) outputCache.delete(sid);
+  }
+}, 5 * 60 * 1000);
+outputCachePruneTimer.unref();
+
+function truncWithCache(sessionId: string, s: string, cap: number = OUT_CAP): string {
+  const clean = s.trim();
+  if (!clean) return '';
+  if (clean.length <= cap) return clean;
+  const id = cacheOutput(sessionId, clean);
+  return `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated — call sandbox_output({ outputId: "${id}", offset: ${cap} }) to continue reading; cached 15min]`;
+}
+
 function execResponse(err: any, stdout: string, stderr: string) {
   const out: Record<string, any> = {};
   const o = trunc(stdout || '');
