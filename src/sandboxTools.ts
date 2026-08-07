@@ -549,7 +549,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         cloned,
         cwd: ctx.cwd,
         envVars: ctx.env ? Object.keys(ctx.env).length : undefined,
-        persistentShellAlive: !!persistentShells.get(getAuthKeyForSession(sessionId))
+        persistentShellAlive: !!persistentShells.get(shellKey(sessionId))
       });
     } catch (err) { return formatError(err); }
   });
