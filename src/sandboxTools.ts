@@ -27,8 +27,9 @@ const EXEC_LIMITS = { maxBuffer: 4 * 1024 * 1024 };
 
 const processTables = new Map<string, Map<number, ActiveProcess>>();
 function procTable(sessionId: string): Map<number, ActiveProcess> {
-  let t = processTables.get(sessionId);
-  if (!t) { t = new Map(); processTables.set(sessionId, t); }
+  const key = getAuthKeyForSession(sessionId);
+  let t = processTables.get(key);
+  if (!t) { t = new Map(); processTables.set(key, t); }
   return t;
 }
 
