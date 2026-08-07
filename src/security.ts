@@ -74,10 +74,14 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
   const current = getSessionContext(sessionId);
   Object.assign(current, patch);
   const known = authBucket(sessionId);
-  if (patch.owner) known.owner = patch.owner;
-  if (patch.repo) known.repo = patch.repo;
-  if (patch.branch) known.branch = patch.branch;
-  if (patch.sandboxDir) known.sandboxDir = patch.sandboxDir;
+  // Use 'in' rather than truthiness so an explicit clear (e.g. { sandboxDir:
+  // undefined } from sandbox_reset) actually propagates to the persisted
+  // bucket instead of being silently ignored — otherwise a session-id churn
+  // right after a reset would resurrect the stale value from the bucket.
+  if ('owner' in patch) known.owner = patch.owner;
+  if ('repo' in patch) known.repo = patch.repo;
+  if ('branch' in patch) known.branch = patch.branch;
+  if ('sandboxDir' in patch) known.sandboxDir = patch.sandboxDir;
   return current;
 }
 
