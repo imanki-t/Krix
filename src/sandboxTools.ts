@@ -110,6 +110,84 @@ async function resolveDir(sessionId: string, dir?: string): Promise<string> {
   return target;
 }
 
+// --- Persistent shell sessions -------------------------------------------
+// sandbox_exec previously spawned a brand-new process via exec() on every
+// call, so `cd`, `export`, activating a venv, etc. never survived between
+// calls — the dir/env args added some of that back, but not real shell
+// state. This keeps one long-lived bash process alive per authenticated
+// identity (same key as everything else, so it survives session-id churn
+// too) and pipes commands into its stdin, reading output back out until a
+// unique sentinel line appears. stdout+stderr are merged (`2>&1`) for the
+// duration of each individual command only — bash redirections on a simple
+// command don't persist past that command — which sidesteps a race between
+// two separately-buffered pipes with no reliable way to know both streams
+// are done at the same moment.
+interface PersistentShell { proc: ChildProcess; buf: string; busy: boolean; }
+const persistentShells = new Map<string, PersistentShell>();
+const SHELL_HANG_MS = 60000;
+
+async function getShell(sessionId: string): Promise<PersistentShell> {
+  const key = getAuthKeyForSession(sessionId);
+  const existing = persistentShells.get(key);
+  if (existing && !existing.proc.killed) return existing;
+
+  const cwd = await workDir(sessionId);
+  const proc = spawn('bash', ['--noprofile', '--norc'], { cwd, env: sandboxEnv(sessionId) });
+  const shell: PersistentShell = { proc, buf: '', busy: false };
+  proc.stdout?.on('data', (d) => { shell.buf += d.toString(); });
+  proc.on('exit', () => { if (persistentShells.get(key) === shell) persistentShells.delete(key); });
+  persistentShells.set(key, shell);
+  return shell;
+}
+
+function killShell(authKey: string): void {
+  const shell = persistentShells.get(authKey);
+  if (shell) { try { shell.proc.kill('SIGKILL'); } catch {} persistentShells.delete(authKey); }
+}
+
+async function runInShell(sessionId: string, command: string, timeoutMs: number): Promise<{ stdout: string; exit: number; timedOut: boolean }> {
+  const shell = await getShell(sessionId);
+  if (shell.busy) throw new Error('A previous command is still running in this persistent shell — wait for it to finish, or use background:true for long-running commands.');
+
+  shell.busy = true;
+  shell.buf = '';
+  const marker = `__KRIX_DONE_${crypto.randomBytes(6).toString('hex')}__`;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // We don't know what state the shell is in (mid-command, hung on
+      // input, etc.), so don't try to reuse it — kill it and let the next
+      // call spawn a fresh one.
+      killShell(getAuthKeyForSession(sessionId));
+      resolve({ stdout: shell.buf, exit: -1, timedOut: true });
+    }, timeoutMs);
+
+    const check = () => {
+      const idx = shell.buf.indexOf(marker);
+      if (idx === -1) return;
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      shell.proc.stdout?.removeListener('data', check);
+      const before = shell.buf.slice(0, idx);
+      const afterMarker = shell.buf.slice(idx + marker.length);
+      const codeMatch = afterMarker.match(/^:(-?\d+)/);
+      const exit = codeMatch ? parseInt(codeMatch[1], 10) : 0;
+      shell.busy = false;
+      resolve({ stdout: before.replace(/\n$/, ''), exit, timedOut: false });
+    };
+
+    shell.proc.stdout?.on('data', check);
+    shell.proc.stdin?.write(`${command} 2>&1\necho "${marker}:$?"\n`);
+    // In case the marker arrived in the same tick data already buffered.
+    check();
+  });
+}
+// ---------------------------------------------------------------------------
+
 export async function destroySandbox(sessionId: string): Promise<void> {
   // Capture the auth key BEFORE deleting session context — deleteSessionContext()
   // removes the sessionId->authKey mapping, after which getAuthKeyForSession()
