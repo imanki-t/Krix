@@ -142,8 +142,20 @@ interface PersistentShell { proc: ChildProcess; buf: string; busy: boolean; }
 const persistentShells = new Map<string, PersistentShell>();
 const SHELL_HANG_MS = 60000;
 
+// Shell identity: authKey scopes it to the user (so one user's shell can
+// never be reached or torn down by another user), sessionId further scopes
+// it to a single session of that user (so concurrent sessions/tabs of the
+// SAME user each get their own shell instead of contending for one, and so
+// one session's idle-timeout/disconnect can't kill a shell another of that
+// user's sessions is still using). The sandbox filesystem is intentionally
+// still shared per-authKey (see sandboxRoot) — only the live shell process
+// is session-scoped.
+function shellKey(sessionId: string): string {
+  return `${getAuthKeyForSession(sessionId)}::${sessionId}`;
+}
+
 // Guards shell creation against a race: getShell awaits workDir() before it
-// registers the new shell, so two concurrent calls for the same identity
+// registers the new shell, so two concurrent calls for the same key
 // (no shell running yet) can both pass the `existing` check, both spawn a
 // bash process, and the second persistentShells.set() silently overwrites
 // the first — orphaning a live, untracked child process. Callers that land
@@ -152,7 +164,7 @@ const SHELL_HANG_MS = 60000;
 const shellCreation = new Map<string, Promise<PersistentShell>>();
 
 async function getShell(sessionId: string): Promise<PersistentShell> {
-  const key = getAuthKeyForSession(sessionId);
+  const key = shellKey(sessionId);
   const existing = persistentShells.get(key);
   if (existing && !existing.proc.killed) return existing;
 
@@ -176,9 +188,9 @@ async function getShell(sessionId: string): Promise<PersistentShell> {
   }
 }
 
-function killShell(authKey: string): void {
-  const shell = persistentShells.get(authKey);
-  if (shell) { try { shell.proc.kill('SIGKILL'); } catch {} persistentShells.delete(authKey); }
+function killShell(key: string): void {
+  const shell = persistentShells.get(key);
+  if (shell) { try { shell.proc.kill('SIGKILL'); } catch {} persistentShells.delete(key); }
 }
 
 async function runInShell(sessionId: string, command: string, timeoutMs: number): Promise<{ stdout: string; exit: number; timedOut: boolean }> {
@@ -196,8 +208,8 @@ async function runInShell(sessionId: string, command: string, timeoutMs: number)
       settled = true;
       // We don't know what state the shell is in (mid-command, hung on
       // input, etc.), so don't try to reuse it — kill it and let the next
-      // call spawn a fresh one.
-      killShell(getAuthKeyForSession(sessionId));
+      // call spawn a fresh one. Only this session's shell is affected.
+      killShell(shellKey(sessionId));
       resolve({ stdout: shell.buf, exit: -1, timedOut: true });
     }, timeoutMs);
 
