@@ -37,20 +37,23 @@ function execResponse(err: any, stdout: string, stderr: string) {
   return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
 }
 
+function sandboxEnv(): NodeJS.ProcessEnv {
+  // process.env.HOME can point at a directory that doesn't exist in this
+  // container (e.g. /home/sbx_userXXXX), which makes npm/pip fail with
+  // ENOENT trying to create their cache/config dirs there. Pin HOME (and
+  // the npm cache) to the sandbox's own writable tmp dir instead.
+  const safeHome = path.join(os.tmpdir(), 'krix_home');
+  try { require('node:fs').mkdirSync(safeHome, { recursive: true }); } catch {}
+  return {
+    ...process.env,
+    HOME: safeHome,
+    npm_config_cache: path.join(safeHome, '.npm'),
+  };
+}
+
 function run(cmd: string, cwd: string, timeout: number = 30000): Promise<{ err: any; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    // process.env.HOME can point at a directory that doesn't exist in this
-    // container (e.g. /home/sbx_userXXXX), which makes npm/pip fail with
-    // ENOENT trying to create their cache/config dirs there. Pin HOME (and
-    // the npm cache) to the sandbox's own writable tmp dir instead.
-    const safeHome = path.join(os.tmpdir(), 'krix_home');
-    const env = {
-      ...process.env,
-      HOME: safeHome,
-      npm_config_cache: path.join(safeHome, '.npm'),
-    };
-    try { require('node:fs').mkdirSync(safeHome, { recursive: true }); } catch {}
-    exec(cmd, { cwd, timeout, env, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+    exec(cmd, { cwd, timeout, env: sandboxEnv(), ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
   });
 }
 
@@ -66,6 +69,18 @@ async function workDir(sessionId: string): Promise<string> {
     try { await fs.access(ctx.sandboxDir); return ctx.sandboxDir; } catch {}
   }
   return sandboxRoot(sessionId);
+}
+
+// Resolves an optional user-supplied `dir` against the sandbox root (so
+// callers can target the cloned repo, a scratch subfolder, or any other
+// path within the sandbox — not just whatever workDir() currently returns),
+// creating it if needed. Falls back to workDir() when no dir is given.
+async function resolveDir(sessionId: string, dir?: string): Promise<string> {
+  if (!dir) return workDir(sessionId);
+  const root = await sandboxRoot(sessionId);
+  const target = sanitizePath(dir, root);
+  await fs.mkdir(target, { recursive: true });
+  return target;
 }
 
 export async function destroySandbox(sessionId: string): Promise<void> {
