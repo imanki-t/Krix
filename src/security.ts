@@ -66,6 +66,8 @@ export function getSessionContext(sessionId: string): SessionContext {
       owner: known.owner,
       repo: known.repo,
       sandboxDir: known.sandboxDir,
+      cwd: known.cwd,
+      env: known.env,
       enabledCategories: new Set(initial)
     });
   }
@@ -84,6 +86,8 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
   if ('repo' in patch) known.repo = patch.repo;
   if ('branch' in patch) known.branch = patch.branch;
   if ('sandboxDir' in patch) known.sandboxDir = patch.sandboxDir;
+  if ('cwd' in patch) known.cwd = patch.cwd;
+  if ('env' in patch) known.env = patch.env;
   return current;
 }
 
