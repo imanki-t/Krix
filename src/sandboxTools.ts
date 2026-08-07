@@ -498,6 +498,27 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     return formatOptimizedResponse(list.length ? list : 'No active processes.');
   });
 
+  reg('sandbox_output', {
+    description: 'Page through output that was truncated by sandbox_exec/sandbox_run/sandbox_install — use the outputId from the truncation notice. Cached per-session for 15 minutes (10 most recent truncated outputs kept; older ones are evicted).',
+    inputSchema: {
+      outputId: z.string(),
+      offset: z.number().optional().default(0).describe('Char offset to resume from — defaults to 0, but the truncation notice tells you where the first response left off.'),
+      limit: z.number().optional().describe(`Max chars to return (default/cap: ${OUT_CAP}).`)
+    },
+    annotations: getToolAnnotations('sandbox_output')
+  }, async (args: any) => {
+    try {
+      const full = getCachedOutput(sessionId, args.outputId);
+      if (full === undefined) return formatError('No cached output for that outputId — it may have expired (15min TTL) or been evicted (only the 10 most recent truncated outputs per session are kept).');
+      const offset = Math.max(0, args.offset || 0);
+      const limit = Math.min(args.limit || OUT_CAP, OUT_CAP);
+      const slice = full.slice(offset, offset + limit);
+      const out: Record<string, any> = { content: slice, offset, totalLength: full.length };
+      if (offset + slice.length < full.length) out.nextOffset = offset + slice.length;
+      return formatOptimizedResponse(out);
+    } catch (err) { return formatError(err); }
+  });
+
   reg('sandbox_file', {
     description: 'Read, write, append to, edit (surgical old_str/new_str replace), or delete a file in the sandbox — safer than shell-escaping content through sandbox_exec.',
     inputSchema: {
