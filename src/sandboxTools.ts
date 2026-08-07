@@ -449,8 +449,13 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_ps', {
-    description: 'List, kill (pid or "all"), or fetch output of background sandbox processes started via sandbox_exec(background:true).',
-    inputSchema: { action: z.enum(['list', 'kill', 'output']).default('list'), pid: z.union([z.coerce.number(), z.literal('all')]).optional() },
+    description: 'List, kill (pid or "all"), or fetch output of background sandbox processes started via sandbox_exec(background:true). `offset`/`limit` paginate action:list (by item) and action:output (by char).',
+    inputSchema: {
+      action: z.enum(['list', 'kill', 'output']).default('list'),
+      pid: z.union([z.coerce.number(), z.literal('all')]).optional(),
+      offset: z.number().optional().describe('Pagination offset — item index for action:list, char offset for action:output.'),
+      limit: z.number().optional().describe(`Page size — max 200 items for action:list, max ${OUT_CAP} chars for action:output.`)
+    },
     annotations: getToolAnnotations('sandbox_ps')
   }, async (args: any) => {
     const table = procTable(sessionId);
@@ -484,18 +489,27 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       if (!args.pid || args.pid === 'all') return formatError('Provide a specific numeric `pid` for output.');
       const item = table.get(args.pid);
       if (!item) return formatError('No such process.');
-      const out: Record<string, any> = { pid: item.pid, status: item.status, exitCode: item.exitCode };
-      const o = trunc(item.stdout, BG_BUF_CAP);
-      const e = trunc(item.stderr, BG_BUF_CAP);
-      if (o) out.stdout = o;
-      if (e) out.stderr = e;
+      const offset = Math.max(0, args.offset || 0);
+      const limit = Math.min(args.limit || OUT_CAP, OUT_CAP);
+      const out: Record<string, any> = { pid: item.pid, status: item.status, exitCode: item.exitCode, stdoutLength: item.stdout.length, stderrLength: item.stderr.length };
+      const stdoutSlice = item.stdout.slice(offset, offset + limit);
+      const stderrSlice = item.stderr.slice(offset, offset + limit);
+      if (stdoutSlice) out.stdout = stdoutSlice;
+      if (stderrSlice) out.stderr = stderrSlice;
+      if (offset + limit < Math.max(item.stdout.length, item.stderr.length)) out.nextOffset = offset + limit;
       return formatOptimizedResponse(out);
     }
 
-    const list = Array.from(table.values()).map(p => ({
+    const all = Array.from(table.values()).map(p => ({
       pid: p.pid, command: p.command, status: p.status, exitCode: p.exitCode
     }));
-    return formatOptimizedResponse(list.length ? list : 'No active processes.');
+    if (!all.length) return formatOptimizedResponse('No active processes.');
+    const offset = Math.max(0, args.offset || 0);
+    const limit = Math.min(args.limit || 50, 200);
+    const page = all.slice(offset, offset + limit);
+    const out: Record<string, any> = { processes: page, total: all.length, offset };
+    if (offset + page.length < all.length) out.nextOffset = offset + page.length;
+    return formatOptimizedResponse(out);
   });
 
   reg('sandbox_output', {
