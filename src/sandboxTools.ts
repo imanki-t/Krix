@@ -244,8 +244,9 @@ export async function destroySandbox(sessionId: string): Promise<void> {
   // ones untouched.
   const authKey = getAuthKeyForSession(sessionId);
   const dirToRemove = path.join(os.tmpdir(), `krix_sbx_${authKey}`);
+  const shellToKill = shellKey(sessionId);
   deleteSessionContext(sessionId);
-  killShell(authKey);
+  killShell(shellToKill);
   const table = processTables.get(authKey);
   if (table) {
     for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch {} }
