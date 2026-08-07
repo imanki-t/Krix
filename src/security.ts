@@ -30,7 +30,7 @@ const sessionContexts = new Map<string, SessionContext>();
 // persisted context under that hash so it only ever resumes for the same
 // authenticated caller, never across identities.
 const sessionAuthKey = new Map<string, string>();
-const lastKnownContextByAuth = new Map<string, { owner?: string; repo?: string; branch?: string; sandboxDir?: string }>();
+const lastKnownContextByAuth = new Map<string, { owner?: string; repo?: string; branch?: string; sandboxDir?: string; cwd?: string; env?: Record<string, string> }>();
 
 function hashAuth(token: string): string {
   return crypto.createHash('sha256').update(token || 'anonymous').digest('hex').slice(0, 16);
