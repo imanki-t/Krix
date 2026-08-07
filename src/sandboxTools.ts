@@ -235,12 +235,17 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       check('go', 'go version');
 
       const ctx = getSessionContext(sessionId);
+      let cloned = false;
+      if (ctx.sandboxDir) {
+        try { await fs.access(ctx.sandboxDir); cloned = true; }
+        catch { updateSessionContext(sessionId, { sandboxDir: undefined }); }
+      }
       return formatOptimizedResponse({
         freeMemMB: Math.round(os.freemem() / (1024 * 1024)),
         runtimes,
         repo: ctx.owner && ctx.repo ? `${ctx.owner}/${ctx.repo}` : undefined,
         branch: ctx.branch,
-        cloned: !!ctx.sandboxDir
+        cloned
       });
     } catch (err) { return formatError(err); }
   });
