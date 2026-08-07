@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations, getSessionContext,
-  makeRegistrar, ToolCategory
+  makeRegistrar, persistEnabledCategories, ToolCategory
 } from './security.js';
 
 // Categories that are enabled for every session by default (see
