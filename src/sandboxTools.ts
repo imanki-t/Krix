@@ -282,7 +282,7 @@ async function runInShell(sessionId: string, command: string, timeoutMs: number)
 }
 // ---------------------------------------------------------------------------
 
-export async function destroySandbox(sessionId: string): Promise<void> {
+export async function destroySandbox(sessionId: string, options: { deleteContext?: boolean } = { deleteContext: true }): Promise<void> {
   // Capture the auth key BEFORE deleting session context — deleteSessionContext()
   // removes the sessionId->authKey mapping, after which getAuthKeyForSession()
   // falls back to 'anonymous', which would target the wrong (nonexistent)
@@ -291,8 +291,11 @@ export async function destroySandbox(sessionId: string): Promise<void> {
   const authKey = getAuthKeyForSession(sessionId);
   const dirToRemove = path.join(os.tmpdir(), `krix_sbx_${authKey}`);
   const shellToKill = shellKey(sessionId);
-  deleteSessionContext(sessionId);
+  if (options.deleteContext) {
+    deleteSessionContext(sessionId);
+  }
   killShell(shellToKill);
+  outputCache.delete(sessionId);
   const table = processTables.get(authKey);
   if (table) {
     for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch {} }
