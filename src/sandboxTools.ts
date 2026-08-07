@@ -750,13 +750,17 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
   reg('git_commit_push', {
     description: 'Stage, commit, and (by default) push changes in the cloned repo.',
-    inputSchema: { message: z.string(), push: z.boolean().optional().default(true) },
+    inputSchema: { message: z.string(), push: z.boolean().optional().default(true), branch: z.string().optional() },
     annotations: getToolAnnotations('git_commit_push')
   }, async (args: any) => {
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      const branch = ctx.branch || 'main';
+      const branch = args.branch || ctx.branch || 'main';
+      if (args.branch) {
+        updateSessionContext(sessionId, { branch: args.branch });
+        await run(`git checkout ${args.branch}`, ctx.sandboxDir, 10000);
+      }
 
       const add = await run('git add -A', ctx.sandboxDir, 10000);
       if (add.err) return execResponse(sessionId, add.err, add.stdout, add.stderr);
