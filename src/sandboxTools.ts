@@ -35,6 +35,20 @@ function procTable(sessionId: string): Map<number, ActiveProcess> {
   return t;
 }
 
+// Proactive safety net alongside the on-demand pruning in sandbox_ps: a
+// caller who backgrounds jobs but never polls sandbox_ps would otherwise
+// keep exited entries (and their buffered output) alive forever. Sweeps
+// every identity's table on a timer regardless of whether anyone's asking.
+const processTablePruneTimer = setInterval(() => {
+  const now = Date.now();
+  for (const table of processTables.values()) {
+    for (const [pid, item] of table) {
+      if (item.status === 'exited' && item.exitedAt && now - item.exitedAt.getTime() > EXITED_TTL_MS) table.delete(pid);
+    }
+  }
+}, 5 * 60 * 1000);
+processTablePruneTimer.unref();
+
 // Keeps only the most recent BG_BUF_CAP chars of a background process's
 // output — bounds memory for long-running/chatty jobs instead of buffering
 // unbounded stdout/stderr for the lifetime of the sandbox.
