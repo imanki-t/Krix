@@ -109,10 +109,10 @@ function truncWithCache(sessionId: string, s: string, cap: number = OUT_CAP): st
   return `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated — call sandbox_output({ outputId: "${id}", offset: ${cap} }) to continue reading; cached 15min]`;
 }
 
-function execResponse(err: any, stdout: string, stderr: string) {
+function execResponse(sessionId: string, err: any, stdout: string, stderr: string) {
   const out: Record<string, any> = {};
-  const o = trunc(stdout || '');
-  const e = trunc(stderr || '');
+  const o = truncWithCache(sessionId, stdout || '');
+  const e = truncWithCache(sessionId, stderr || '');
   if (o) out.stdout = o;
   if (e) out.stderr = e;
   if (err) out.exit = typeof err.code === 'number' ? err.code : 1;
