@@ -555,9 +555,12 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         const stat = await fs.stat(abs).catch(() => null);
         if (!stat || !stat.isFile()) return formatError(`No such file: ${args.path}`);
         const content = await fs.readFile(abs, 'utf-8');
-        const out: Record<string, any> = { sizeBytes: stat.size };
-        const c = trunc(content, 10000);
-        if (c) out.content = c;
+        const offset = Math.max(0, args.offset || 0);
+        const limit = Math.min(args.limit || OUT_CAP, OUT_CAP);
+        const slice = content.slice(offset, offset + limit);
+        const out: Record<string, any> = { sizeBytes: stat.size, totalChars: content.length, offset };
+        if (slice) out.content = slice;
+        if (offset + slice.length < content.length) out.nextOffset = offset + slice.length;
         return formatOptimizedResponse(out);
       }
 
