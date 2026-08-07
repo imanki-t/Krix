@@ -1,7 +1,7 @@
 FROM node:22-slim
 
 # Install OS-level deps needed by src/sandboxTools.ts (git clone/commit/push,
-# and every language fileRunCmd() supports: py/js/ts/sh/go/java/cpp).
+# and every language fileRunCmd() supports: py/js/ts/sh/go/java/cpp/rs/rb/php).
 # Single stage on purpose — everything installed here stays in the final
 # image, unlike a multi-stage build that only copies specific paths
 # (e.g. node_modules) into a separate runtime stage.
@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     golang-go \
     default-jdk-headless \
     g++ \
+    rustc \
+    ruby \
+    php-cli \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
