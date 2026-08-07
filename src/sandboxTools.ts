@@ -237,8 +237,14 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   const reg = makeRegistrar(server, registry);
 
   reg('sandbox_exec', {
-    description: 'Run a shell command in the sandbox. Defaults to the active cloned repo if one exists, else scratch dir — pass `dir` to target any other sandbox path. Pass `background: true` to run detached and track it via sandbox_ps.',
-    inputSchema: { command: z.string(), timeoutMs: z.number().optional(), dir: z.string().optional(), background: z.boolean().optional().default(false) },
+    description: 'Run a shell command. By default runs in a persistent shell that keeps cd/export/venv state across calls (like a real terminal) — pass `persistent:false` for an isolated one-off exec instead. Pass `dir` to target any sandbox path (one-off cd for that call only). Pass `background:true` to run detached and track it via sandbox_ps (always isolated, unaffected by `persistent`).',
+    inputSchema: {
+      command: z.string(),
+      timeoutMs: z.number().optional(),
+      dir: z.string().optional(),
+      background: z.boolean().optional().default(false),
+      persistent: z.boolean().optional().default(true)
+    },
     annotations: getToolAnnotations('sandbox_exec')
   }, async (args: any) => {
     try {
@@ -246,7 +252,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const cwd = await resolveDir(sessionId, args.dir);
 
       if (args.background) {
-        const proc = spawn(args.command, { cwd, shell: true, env: sandboxEnv() });
+        const proc = spawn(args.command, { cwd, shell: true, env: sandboxEnv(sessionId) });
         if (!proc.pid) throw new Error('Failed to start background process.');
         const pid = proc.pid;
         const entry: ActiveProcess = { pid, command: args.command, proc, startTime: new Date(), status: 'running', exitCode: null, exitedAt: null, stdout: '', stderr: '' };
@@ -257,7 +263,23 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         return formatOptimizedResponse({ started: pid, command: args.command, dir: cwd });
       }
 
-      const { err, stdout, stderr } = await run(args.command, cwd, Math.min(args.timeoutMs || 30000, 120000));
+      const timeoutMs = Math.min(args.timeoutMs || 30000, 120000);
+
+      if (args.persistent) {
+        // `dir` (if given) only cd's for this one command — it doesn't
+        // change the persistent shell's real cwd for future calls, same as
+        // a subshell cd would behave.
+        const cmd = args.dir ? `cd "${cwd}" && ${args.command}` : args.command;
+        const { stdout, exit, timedOut } = await runInShell(sessionId, cmd, Math.min(timeoutMs, SHELL_HANG_MS));
+        if (timedOut) return formatError(`Command timed out after ${timeoutMs}ms and the persistent shell was restarted (its prior state is lost). Use background:true for long-running commands instead.`);
+        const out: Record<string, any> = {};
+        const o = trunc(stdout);
+        if (o) out.stdout = o;
+        if (exit !== 0) out.exit = exit;
+        return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
+      }
+
+      const { err, stdout, stderr } = await run(args.command, cwd, timeoutMs, sessionId);
       return execResponse(err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
