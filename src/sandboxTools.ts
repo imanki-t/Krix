@@ -420,7 +420,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       }
 
       const { err, stdout, stderr } = await run(cmd, cwd, 45000, sessionId);
-      return execResponse(err, stdout, stderr);
+      return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
     finally {
       if (tmp) await fs.unlink(tmp).catch(() => {});
