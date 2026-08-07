@@ -130,10 +130,10 @@ async function resolveDir(sessionId: string, dir?: string): Promise<string> {
 // sandbox_exec previously spawned a brand-new process via exec() on every
 // call, so `cd`, `export`, activating a venv, etc. never survived between
 // calls — the dir/env args added some of that back, but not real shell
-// state. This keeps one long-lived bash process alive per authenticated
-// identity (same key as everything else, so it survives session-id churn
-// too) and pipes commands into its stdin, reading output back out until a
-// unique sentinel line appears. stdout+stderr are merged (`2>&1`) for the
+// state. This keeps one long-lived bash process alive per (identity,
+// session) pair — see shellKey() below — and pipes commands into its
+// stdin, reading output back out until a unique sentinel line appears.
+// stdout+stderr are merged (`2>&1`) for the
 // duration of each individual command only — bash redirections on a simple
 // command don't persist past that command — which sidesteps a race between
 // two separately-buffered pipes with no reliable way to know both streams
