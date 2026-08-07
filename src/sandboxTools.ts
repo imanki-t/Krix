@@ -462,7 +462,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_reset', {
-    description: 'Wipe the sandbox: scratch files, cloned repo, and background processes.',
+    description: 'Wipe the sandbox: scratch files, cloned repo, persistent shell, and background processes.',
     inputSchema: {},
     annotations: getToolAnnotations('sandbox_reset')
   }, async () => {
