@@ -402,8 +402,6 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     } catch (err) { return formatError(err); }
   });
 
-  const EXITED_TTL_MS = 10 * 60 * 1000;
-
   reg('sandbox_ps', {
     description: 'List, kill (pid or "all"), or fetch output of background sandbox processes started via sandbox_exec(background:true).',
     inputSchema: { action: z.enum(['list', 'kill', 'output']).default('list'), pid: z.union([z.coerce.number(), z.literal('all')]).optional() },
