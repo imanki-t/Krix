@@ -175,17 +175,21 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_install', {
-    description: 'Install npm or pip packages into the sandbox/repo.',
+    description: 'Install npm or pip packages into the sandbox scratch dir (never the cloned repo, so it can\'t pollute git-tracked files).',
     inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()).min(1) },
     annotations: getToolAnnotations('sandbox_install')
   }, async (args: any) => {
     try {
-      const cwd = await workDir(sessionId);
+      // Always install into the auth-scoped root, not workDir() — workDir()
+      // returns the cloned repo's directory once one exists, and installing
+      // there modified the repo's real package.json/package-lock.json or
+      // dumped raw pip package files straight into the git working tree.
+      const cwd = await sandboxRoot(sessionId);
       const list = args.packages.join(' ');
       const cmd = args.manager === 'npm' ? `npm install ${list}` : `pip install --quiet --target=. ${list}`;
       const { err, stdout, stderr } = await run(cmd, cwd, 90000);
       if (err) return execResponse(err, stdout, stderr);
-      return formatOptimizedResponse({ installed: args.packages });
+      return formatOptimizedResponse({ installed: args.packages, path: cwd });
     } catch (err) { return formatError(err); }
   });
 
