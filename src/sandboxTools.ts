@@ -249,7 +249,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
   reg('sandbox_ps', {
     description: 'List, kill (pid or "all"), or fetch output of background sandbox processes started via sandbox_exec(background:true).',
-    inputSchema: { action: z.enum(['list', 'kill', 'output']).default('list'), pid: z.union([z.number(), z.literal('all')]).optional() },
+    inputSchema: { action: z.enum(['list', 'kill', 'output']).default('list'), pid: z.union([z.coerce.number(), z.literal('all')]).optional() },
     annotations: getToolAnnotations('sandbox_ps')
   }, async (args: any) => {
     const table = procTable(sessionId);
