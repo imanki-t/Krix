@@ -407,11 +407,13 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_file', {
-    description: 'Read, write, append to, or delete a file in the sandbox — safer than shell-escaping content through sandbox_exec.',
+    description: 'Read, write, append to, edit (surgical old_str/new_str replace), or delete a file in the sandbox — safer than shell-escaping content through sandbox_exec.',
     inputSchema: {
-      action: z.enum(['read', 'write', 'append', 'delete']),
+      action: z.enum(['read', 'write', 'append', 'edit', 'delete']),
       path: z.string(),
       content: z.string().optional(),
+      old_str: z.string().optional().describe('Required for action:edit. Must match the file content in exactly one place.'),
+      new_str: z.string().optional().describe('Required for action:edit. Replaces old_str; empty string deletes the matched text.'),
       dir: z.string().optional()
     },
     annotations: getToolAnnotations('sandbox_file')
@@ -433,6 +435,21 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       if (args.action === 'delete') {
         await fs.unlink(abs);
         return formatOptimizedResponse({ deleted: args.path });
+      }
+
+      if (args.action === 'edit') {
+        if (args.old_str === undefined || args.new_str === undefined) return formatError('`old_str` and `new_str` are both required for action:edit.');
+        const stat = await fs.stat(abs).catch(() => null);
+        if (!stat || !stat.isFile()) return formatError(`No such file: ${args.path}`);
+        const content = await fs.readFile(abs, 'utf-8');
+        const count = content.split(args.old_str).length - 1;
+        if (count === 0) return formatError('old_str not found in file.');
+        if (count > 1) return formatError(`old_str matches ${count} places — make it unique by including more surrounding context.`);
+        const idx = content.indexOf(args.old_str);
+        const updated = content.slice(0, idx) + args.new_str + content.slice(idx + args.old_str.length);
+        await fs.writeFile(abs, updated, 'utf-8');
+        const newStat = await fs.stat(abs);
+        return formatOptimizedResponse({ edited: args.path, sizeBytes: newStat.size });
       }
 
       if (args.content === undefined) return formatError('`content` is required for write/append.');
