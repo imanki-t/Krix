@@ -443,7 +443,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const list = args.packages.join(' ');
       const cmd = args.manager === 'npm' ? `npm install ${list}` : `pip install --quiet --target=. ${list}`;
       const { err, stdout, stderr } = await run(cmd, cwd, 90000, sessionId);
-      if (err) return execResponse(err, stdout, stderr);
+      if (err) return execResponse(sessionId, err, stdout, stderr);
       return formatOptimizedResponse({ installed: args.packages, path: cwd });
     } catch (err) { return formatError(err); }
   });
