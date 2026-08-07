@@ -57,10 +57,18 @@ function authBucket(sessionId: string) {
 export function getSessionContext(sessionId: string): SessionContext {
   if (!sessionContexts.has(sessionId)) {
     const enableAll = process.env.ENABLE_ALL_TOOLS === 'true';
+    const known = authBucket(sessionId);
+    // A category set loaded earlier this identity's life (via load_toolset)
+    // takes priority over the bare default on session-id churn — otherwise
+    // a mid-conversation mcp-session-id rotation would silently re-lock
+    // toolsets the caller already unlocked, with no error to signal it.
+    // ENABLE_ALL_TOOLS still wins outright since it's an explicit deploy-time
+    // override, not a per-session preference.
     const initial: ToolCategory[] = enableAll
       ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
-      : ['core', 'sandbox'];
-    const known = authBucket(sessionId);
+      : (known.enabledCategories && known.enabledCategories.length > 0)
+        ? known.enabledCategories
+        : ['core', 'sandbox'];
     sessionContexts.set(sessionId, {
       branch: known.branch || 'main',
       owner: known.owner,
@@ -88,7 +96,18 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
   if ('sandboxDir' in patch) known.sandboxDir = patch.sandboxDir;
   if ('cwd' in patch) known.cwd = patch.cwd;
   if ('env' in patch) known.env = patch.env;
+  if ('enabledCategories' in patch && patch.enabledCategories) known.enabledCategories = Array.from(patch.enabledCategories);
   return current;
+}
+
+// Persists the current enabledCategories set to the auth bucket so a
+// session-id rotation (common with some MCP clients that don't resend
+// mcp-session-id on every call) doesn't silently re-lock toolsets that were
+// already loaded via load_toolset. Call this any time enabledCategories is
+// mutated in place, since updateSessionContext's Object.assign only detects
+// a *replaced* reference, not an in-place Set mutation.
+export function persistEnabledCategories(sessionId: string, enabledCategories: Set<ToolCategory>): void {
+  authBucket(sessionId).enabledCategories = Array.from(enabledCategories);
 }
 
 export function deleteSessionContext(sessionId: string): void {
