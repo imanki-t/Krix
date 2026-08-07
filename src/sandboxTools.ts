@@ -203,16 +203,17 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_install', {
-    description: 'Install npm or pip packages into the sandbox scratch dir (never the cloned repo, so it can\'t pollute git-tracked files).',
-    inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()).min(1) },
+    description: 'Install npm or pip packages. Defaults to the isolated sandbox root (never the cloned repo, so it can\'t pollute git-tracked files) — pass `dir` to target a specific directory instead.',
+    inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()).min(1), dir: z.string().optional() },
     annotations: getToolAnnotations('sandbox_install')
   }, async (args: any) => {
     try {
-      // Always install into the auth-scoped root, not workDir() — workDir()
-      // returns the cloned repo's directory once one exists, and installing
-      // there modified the repo's real package.json/package-lock.json or
-      // dumped raw pip package files straight into the git working tree.
-      const cwd = await sandboxRoot(sessionId);
+      // Default (no dir given) is the auth-scoped root, not workDir() —
+      // workDir() returns the cloned repo's directory once one exists, and
+      // installing there modified the repo's real package.json/
+      // package-lock.json or dumped raw pip package files into the git
+      // working tree. Pass `dir` explicitly if you really want that.
+      const cwd = args.dir ? await resolveDir(sessionId, args.dir) : await sandboxRoot(sessionId);
       const list = args.packages.join(' ');
       const cmd = args.manager === 'npm' ? `npm install ${list}` : `pip install --quiet --target=. ${list}`;
       const { err, stdout, stderr } = await run(cmd, cwd, 90000);
