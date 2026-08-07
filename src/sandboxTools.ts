@@ -642,8 +642,13 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         try { await fs.access(ctx.sandboxDir); cloned = true; }
         catch { updateSessionContext(sessionId, { sandboxDir: undefined }); }
       }
+      const rawFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
+      const maxMemMB = 400;
+      const freeMemMB = Math.min(maxMemMB, rawFreeMemMB);
+
       return formatOptimizedResponse({
-        freeMemMB: Math.round(os.freemem() / (1024 * 1024)),
+        freeMemMB,
+        maxMemMB,
         runtimes,
         repo: ctx.owner && ctx.repo ? `${ctx.owner}/${ctx.repo}` : undefined,
         branch: ctx.branch,
