@@ -57,23 +57,25 @@ function execResponse(err: any, stdout: string, stderr: string) {
   return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
 }
 
-function sandboxEnv(): NodeJS.ProcessEnv {
+function sandboxEnv(sessionId?: string): NodeJS.ProcessEnv {
   // process.env.HOME can point at a directory that doesn't exist in this
   // container (e.g. /home/sbx_userXXXX), which makes npm/pip fail with
   // ENOENT trying to create their cache/config dirs there. Pin HOME (and
   // the npm cache) to the sandbox's own writable tmp dir instead.
   const safeHome = path.join(os.tmpdir(), 'krix_home');
   try { require('node:fs').mkdirSync(safeHome, { recursive: true }); } catch {}
+  const sessionEnv = sessionId ? (getSessionContext(sessionId).env || {}) : {};
   return {
     ...process.env,
     HOME: safeHome,
     npm_config_cache: path.join(safeHome, '.npm'),
+    ...sessionEnv,
   };
 }
 
-function run(cmd: string, cwd: string, timeout: number = 30000): Promise<{ err: any; stdout: string; stderr: string }> {
+function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?: string): Promise<{ err: any; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    exec(cmd, { cwd, timeout, env: sandboxEnv(), ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+    exec(cmd, { cwd, timeout, env: sandboxEnv(sessionId), ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
   });
 }
 
@@ -85,6 +87,11 @@ async function sandboxRoot(sessionId: string): Promise<string> {
 
 async function workDir(sessionId: string): Promise<string> {
   const ctx = getSessionContext(sessionId);
+  // A persisted default cwd (set via set_active_context) wins over the
+  // cloned-repo/scratch-root default, but only if it still exists.
+  if (ctx.cwd) {
+    try { await fs.access(ctx.cwd); return ctx.cwd; } catch {}
+  }
   if (ctx.sandboxDir) {
     try { await fs.access(ctx.sandboxDir); return ctx.sandboxDir; } catch {}
   }
