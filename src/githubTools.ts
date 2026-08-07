@@ -103,13 +103,30 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   const reg = makeRegistrar(server, registry);
 
   reg('set_active_context', {
-    description: 'Set default GitHub repository context once per session.',
-    inputSchema: { owner: z.string(), repo: z.string(), branch: z.string().optional().default('main') },
+    description: 'Set default GitHub repo/branch context and/or default sandbox cwd + env vars, once per authenticated identity.',
+    inputSchema: {
+      owner: z.string().optional(),
+      repo: z.string().optional(),
+      branch: z.string().optional(),
+      cwd: z.string().optional().describe('Default working directory for sandbox_exec/sandbox_run/sandbox_install/sandbox_file when no explicit dir is given.'),
+      env: z.record(z.string()).optional().describe('Default environment variables merged into every sandbox command.')
+    },
     annotations: getToolAnnotations('set_active_context')
   }, async (args: any) => {
-    const { owner, repo, branch } = args;
-    updateSessionContext(sessionId, { owner, repo, branch });
-    return formatOptimizedResponse(`Active repository context set to '${owner}/${repo}' on branch '${branch}'.`);
+    const { owner, repo, branch, cwd, env } = args;
+    const patch: Record<string, any> = {};
+    if (owner !== undefined) patch.owner = owner;
+    if (repo !== undefined) patch.repo = repo;
+    if (branch !== undefined) patch.branch = branch;
+    if (cwd !== undefined) patch.cwd = cwd;
+    if (env !== undefined) patch.env = env;
+    if (Object.keys(patch).length === 0) return formatError('Provide at least one of owner/repo/branch/cwd/env.');
+    updateSessionContext(sessionId, patch);
+    const parts: string[] = [];
+    if (owner && repo) parts.push(`repo '${owner}/${repo}'${branch ? ` on branch '${branch}'` : ''}`);
+    if (cwd) parts.push(`cwd '${cwd}'`);
+    if (env) parts.push(`${Object.keys(env).length} env var(s)`);
+    return formatOptimizedResponse(`Active context updated: ${parts.join(', ')}.`);
   });
 
   reg('get_me', {
