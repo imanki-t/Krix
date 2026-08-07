@@ -674,7 +674,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const url = `https://github.com/${owner}/${repo}.git`;
       const cmd = `git ${authFlag(githubToken)}clone --depth ${args.depth || 1} --branch ${branch} --single-branch "${url}" "${dest}"`;
       const { err, stdout, stderr } = await run(cmd, root, 60000);
-      if (err) return execResponse(err, stdout, stderr);
+      if (err) return execResponse(sessionId, err, stdout, stderr);
 
       await run(`git config user.email "agent@sandbox.local" && git config user.name "Sandbox Agent"`, dest);
       updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
@@ -692,7 +692,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
       const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
-      if (err) return execResponse(err, stdout, stderr);
+      if (err) return execResponse(sessionId, err, stdout, stderr);
       updateSessionContext(sessionId, { branch: args.branch });
       return formatOptimizedResponse({ branch: args.branch });
     } catch (err) { return formatError(err); }
@@ -708,7 +708,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const cmd = `git ${authFlag(githubToken)}pull --ff-only`;
       const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 30000);
-      return execResponse(err, stdout, stderr);
+      return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
 
@@ -721,7 +721,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const { err, stdout, stderr } = await run('git status --porcelain=v1 -b', ctx.sandboxDir, 10000);
-      return execResponse(err, stdout, stderr);
+      return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
 
@@ -735,7 +735,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const cmd = `git diff ${args.staged ? '--cached ' : ''}-- ${args.path ? `"${args.path}"` : ''}`;
       const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 10000);
-      return execResponse(err, stdout, stderr);
+      return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
 
@@ -750,15 +750,15 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const branch = ctx.branch || 'main';
 
       const add = await run('git add -A', ctx.sandboxDir, 10000);
-      if (add.err) return execResponse(add.err, add.stdout, add.stderr);
+      if (add.err) return execResponse(sessionId, add.err, add.stdout, add.stderr);
 
       const commit = await run(`git commit -m ${JSON.stringify(args.message)}`, ctx.sandboxDir, 10000);
-      if (commit.err) return execResponse(commit.err, commit.stdout, commit.stderr);
+      if (commit.err) return execResponse(sessionId, commit.err, commit.stdout, commit.stderr);
 
       if (!args.push) return formatOptimizedResponse({ committed: true });
 
       const push = await run(`git ${authFlag(githubToken)}push -u origin ${branch}`, ctx.sandboxDir, 30000);
-      if (push.err) return execResponse(push.err, push.stdout, push.stderr);
+      if (push.err) return execResponse(sessionId, push.err, push.stdout, push.stderr);
       return formatOptimizedResponse({ committed: true, pushed: branch });
     } catch (err) { return formatError(err); }
   });
