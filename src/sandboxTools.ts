@@ -500,7 +500,10 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         runtimes,
         repo: ctx.owner && ctx.repo ? `${ctx.owner}/${ctx.repo}` : undefined,
         branch: ctx.branch,
-        cloned
+        cloned,
+        cwd: ctx.cwd,
+        envVars: ctx.env ? Object.keys(ctx.env).length : undefined,
+        persistentShellAlive: !!persistentShells.get(getAuthKeyForSession(sessionId))
       });
     } catch (err) { return formatError(err); }
   });
