@@ -93,6 +93,14 @@ export function registerToolsetTools(
       newlyLoaded.push(toolset);
     }
 
+    // ctx.enabledCategories was mutated in place above, so it must be
+    // explicitly persisted here — a subsequent call under a rotated
+    // mcp-session-id would otherwise fall back to the bare session default
+    // and silently re-lock the toolset that was just enabled.
+    if (newlyLoaded.length > 0) {
+      persistEnabledCategories(sessionId, ctx.enabledCategories);
+    }
+
     // Flip on every registered tool handle whose category was just enabled.
     // handle.enable() triggers the SDK's own notifications/tools/list_changed
     // push, so the caller sees the new tools without reconnecting.
