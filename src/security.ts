@@ -195,7 +195,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
 };
 
 const CLOSED_WORLD_TOOLS = new Set([
-  'set_active_context', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
+  'set_active_context', 'load_toolset', 'sandbox_status', 'sandbox_ps', 'sandbox_reset',
   'git_status', 'git_diff'
 ]);
 
@@ -216,6 +216,7 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   // Always-Enabled Agentic Core Tools
   set_active_context: 'core',
   get_me: 'core',
+  load_toolset: 'core',
   get_file_contents: 'core',
   str_replace_editor: 'core',
   create_or_update_file: 'core',
