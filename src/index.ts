@@ -15,7 +15,8 @@ import {
   authorize,
   authorizePost,
   token,
-  verifyAccessToken
+  verifyAccessToken,
+  getAccessTokenIdentity
 } from './oauth.js';
 
 import { registerGitHubTools } from './githubTools.js';
@@ -102,15 +103,44 @@ app.disable('x-powered-by');
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('X-XSS-Protection', '0');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
   next();
 });
 
 app.use(express.json({ limit: RESOURCE_LIMITS.maxRequestBodyBytes }));
 app.use(express.urlencoded({ extended: false, limit: '32kb' }));
-app.use('/assets', express.static('assets'));
-app.get('/logo.jpg', (_req, res) => res.sendFile(path.resolve('assets/logo.jpg')));
-app.get('/favicon.ico', (_req, res) => res.sendFile(path.resolve('assets/logo.jpg')));
+
+// MCP clients (notably Gemini) may load these assets from another origin.
+// CORP is the important browser policy for cross-origin embedding; CORS is
+// also enabled for clients that inspect the image response programmatically.
+app.use('/assets', (_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+  next();
+}, express.static('assets', { fallthrough: false }));
+
+app.get('/logo.jpg', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+  res.type('image/jpeg').sendFile(path.resolve('assets/logo.jpg'));
+});
+
+app.get('/favicon.ico', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+  // The repository ships one logo asset; serve it as JPEG with the correct
+  // content type rather than pretending a JPEG is an ICO file.
+  res.type('image/jpeg').sendFile(path.resolve('assets/logo.jpg'));
+});
 app.get('/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
 app.get('/.well-known/oauth-authorization-server', sendAuthorizationServerMetadata);
 app.post('/oauth/register', registerClient);
@@ -140,8 +170,14 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     crypto.timingSafeEqual(provided, expected);
 
   const validOAuth = bearer ? verifyAccessToken(bearer) : false;
+  const oauthIdentity = bearer && validOAuth ? getAccessTokenIdentity(bearer) : undefined;
+  const githubToken = (req.headers['x-github-token'] as string) || DEFAULT_GITHUB_PAT || '';
+  const renderToken = (req.headers['x-render-token'] as string) || DEFAULT_RENDER_API_KEY;
+  const sessionIdentity = oauthIdentity
+    ? `${oauthIdentity}:github:${crypto.createHash('sha256').update(githubToken).digest('hex').slice(0, 16)}`
+    : (validLegacyKey ? `api:${MCP_API_KEY}` : undefined);
 
-  if (!validOAuth && !validLegacyKey) {
+  if (!sessionIdentity && !validLegacyKey) {
     res.set(
       'WWW-Authenticate',
       `Bearer realm="mcp", resource_metadata="${protectedResourceMetadataUrl()}"`
@@ -154,15 +190,13 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const githubToken = (req.headers['x-github-token'] as string) || DEFAULT_GITHUB_PAT || '';
-  const renderToken = (req.headers['x-render-token'] as string) || DEFAULT_RENDER_API_KEY;
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
   if (sessionId && transports.has(sessionId)) {
     const entry = transports.get(sessionId)!;
     entry.lastActive = Date.now();
     try {
-      registerSessionAuth(sessionId, githubToken);
+      registerSessionAuth(sessionId, sessionIdentity || `api:${MCP_API_KEY}`);
       await entry.transport.handleRequest(req, res, req.body);
     } catch (error: any) {
       if (!res.headersSent) {
@@ -182,7 +216,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   }
 
   const newSessionId = crypto.randomUUID();
-  registerSessionAuth(newSessionId, githubToken);
+  registerSessionAuth(newSessionId, sessionIdentity || `api:${MCP_API_KEY}`);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => newSessionId,
@@ -239,6 +273,21 @@ const cleanupTimer = setInterval(() => {
   }
 }, 3 * 60 * 1000);
 cleanupTimer.unref();
+
+function validateStartupSecurityConfig(): void {
+  if (!MCP_API_KEY || MCP_API_KEY.length < 32) {
+    throw new Error('MCP_API_KEY must be configured and at least 32 characters long.');
+  }
+  const issuer = (process.env.OAUTH_ISSUER || '').replace(/\/$/, '');
+  if (issuer && !/^https:\/\//i.test(issuer)) {
+    throw new Error('OAUTH_ISSUER must be an HTTPS URL when configured.');
+  }
+  if (issuer && (process.env.OAUTH_SIGNING_SECRET || '').length < 32) {
+    throw new Error('OAUTH_SIGNING_SECRET must be at least 32 characters when OAuth is enabled.');
+  }
+}
+
+validateStartupSecurityConfig();
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => console.log(`🚀 Krix Active on Port ${PORT}`));

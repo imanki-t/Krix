@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import crypto from 'node:crypto';
 import type { Request, Response } from 'express';
 
@@ -17,11 +18,31 @@ type ClientMetadata = {
 };
 
 // Security: In-memory sliding window rate limiter & single-use auth code store
-const usedAuthCodes = new Set<string>();
+const usedAuthCodes = new Map<string, number>();
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_MAX_ENTRIES = 4096;
+const USED_AUTH_CODE_MAX_ENTRIES = 20000;
+
+function pruneRateLimitMap(now: number = Date.now()): void {
+  for (const [key, entry] of rateLimitMap) {
+    if (now > entry.resetTime) rateLimitMap.delete(key);
+  }
+  if (rateLimitMap.size <= RATE_LIMIT_MAX_ENTRIES) return;
+  const oldest = [...rateLimitMap.entries()]
+    .sort((a, b) => a[1].resetTime - b[1].resetTime)
+    .slice(0, rateLimitMap.size - RATE_LIMIT_MAX_ENTRIES);
+  for (const [key] of oldest) rateLimitMap.delete(key);
+}
+
+function pruneUsedAuthCodes(now: number = nowSeconds()): void {
+  for (const [nonce, exp] of usedAuthCodes) {
+    if (exp <= now) usedAuthCodes.delete(nonce);
+  }
+}
 
 function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
   const now = Date.now();
+  pruneRateLimitMap(now);
   const entry = rateLimitMap.get(key);
   if (!entry || now > entry.resetTime) {
     rateLimitMap.set(key, { count: 1, resetTime: now + windowMs });
@@ -35,11 +56,9 @@ function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
 }
 
 function getClientIp(req: Request): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') {
-    return forwarded.split(',')[0].trim();
-  }
-  return req.ip || req.socket.remoteAddress || 'unknown';
+  // Do not trust a client-supplied X-Forwarded-For value for security
+  // decisions. Express is intentionally left with trust proxy disabled.
+  return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
 function requireConfig(): void {
@@ -151,7 +170,30 @@ function resolveDynamicClientLogo(clientName?: string, redirectUris: string[] = 
     return explicitLogo;
   }
 
-  // 1. Try extracting origin domain from redirect URIs (for web/cloud client apps)
+  // Resolve well-known clients before redirect-domain fallbacks. Gemini Spark
+  // commonly registers as "Spark" or "Custom apps for Spark"; resolving the
+  // redirect URI first would incorrectly return a generic favicon.
+  if (clientName) {
+    const nameLower = clientName.toLowerCase().trim();
+
+    if (nameLower.includes('gemini') || nameLower.includes('spark') || nameLower.includes('google')) {
+      return 'https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a611345.svg';
+    }
+    if (nameLower.includes('claude')) return 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/logo.png';
+    if (nameLower.includes('cursor')) return 'https://www.cursor.com/favicon.ico';
+    if (nameLower.includes('copilot') || nameLower.includes('github')) return 'https://github.githubassets.com/favicons/favicon.png';
+    if (nameLower.includes('chatgpt') || nameLower.includes('openai')) return 'https://openai.com/favicon.ico';
+    if (nameLower.includes('antigravity')) return 'https://antigravity.dev/favicon.ico';
+
+    const domainMatch = nameLower.match(/([a-z0-9-]+\.[a-z]{2,})/);
+    if (domainMatch) {
+      return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domainMatch[1])}&sz=128`;
+    }
+  }
+
+  // Try extracting origin domain from redirect URIs for otherwise unknown
+  // web/cloud clients. This remains a browser-side image request; Krix never
+  // fetches an attacker-controlled logo URL server-side.
   for (const uri of redirectUris) {
     try {
       const url = new URL(uri);
@@ -161,26 +203,8 @@ function resolveDynamicClientLogo(clientName?: string, redirectUris: string[] = 
     } catch {}
   }
 
-  // 2. Dynamic matching based on client name or domain
   if (clientName) {
-    const nameLower = clientName.toLowerCase().trim();
-
-    // Ecosystem brand matching
-    if (nameLower.includes('gemini')) return 'https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a611345.svg';
-    if (nameLower.includes('claude')) return 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/logo.png';
-    if (nameLower.includes('cursor')) return 'https://www.cursor.com/favicon.ico';
-    if (nameLower.includes('copilot') || nameLower.includes('github')) return 'https://github.githubassets.com/favicons/favicon.png';
-    if (nameLower.includes('chatgpt') || nameLower.includes('openai')) return 'https://openai.com/favicon.ico';
-    if (nameLower.includes('antigravity')) return 'https://antigravity.dev/favicon.ico';
-
-    // If client name is or contains a domain (e.g., "my-app.com")
-    const domainMatch = nameLower.match(/([a-z0-9-]+\.[a-z]{2,})/);
-    if (domainMatch) {
-      return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domainMatch[1])}&sz=128`;
-    }
-
-    // Dynamic fallback favicon fetch via brand name domain
-    const cleanName = nameLower.replace(/[^a-z0-9]/g, '');
+    const cleanName = clientName.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
     if (cleanName) {
       return `https://www.google.com/s2/favicons?domain=${cleanName}.com&sz=128`;
     }
@@ -309,7 +333,22 @@ export function authorize(req: Request, res: Response): void {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    const cspNonce = crypto.randomBytes(16).toString('base64');
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'none'",
+        "object-src 'none'",
+        `script-src 'nonce-${cspNonce}'`,
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' https: data: blob:",
+        "connect-src 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "upgrade-insecure-requests"
+      ].join('; ')
+    );
 
     const {
       response_type,
@@ -324,9 +363,11 @@ export function authorize(req: Request, res: Response): void {
 
     const client = parseClient(client_id);
     const redirect = typeof redirect_uri === 'string' ? redirect_uri : '';
+    const safeState = typeof state === 'string' ? state : '';
 
     if (
       response_type !== 'code' ||
+      safeState.length > 2048 ||
       !client ||
       !client.redirect_uris.includes(redirect) ||
       code_challenge_method !== 'S256' ||
@@ -618,12 +659,23 @@ export function authorize(req: Request, res: Response): void {
     flex-shrink: 0;
   }
 </style>
+<script nonce="${cspNonce}">
+  window.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('img[data-client-logo]').forEach((img) => {
+      img.addEventListener('error', () => {
+        img.style.display = 'none';
+        const fallback = img.nextElementSibling;
+        if (fallback) fallback.style.display = 'flex';
+      }, { once: true });
+    });
+  });
+</script>
 </head>
 <body>
 <div class="card">
   <div class="brand-header">
     <div class="client-avatar" title="${escapeHtml(client.client_name || 'Client')}">
-      ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(client.client_name || 'Client')}" class="client-logo-img" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';">` : ''}
+      ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(client.client_name || 'Client')}" class="client-logo-img" data-client-logo>` : ''}
       <div class="client-initial" ${logoUrl ? 'style="display:none;"' : ''}>
         ${escapeHtml((client.client_name || 'C').charAt(0).toUpperCase())}
       </div>
@@ -634,7 +686,7 @@ export function authorize(req: Request, res: Response): void {
         <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
       </svg>
     </div>
-    <img src="/logo.jpg" alt="Krix Logo" class="node-logo" onerror="this.style.display='none'">
+    <img src="/logo.jpg" alt="Krix Logo" class="node-logo">
   </div>
 
   <div class="title-group">
@@ -653,7 +705,7 @@ export function authorize(req: Request, res: Response): void {
     ${hidden('client_id', client.client_id)}
     ${hidden('redirect_uri', redirect)}
     ${hidden('scope', 'mcp')}
-    ${hidden('state', typeof state === 'string' ? state : '')}
+    ${hidden('state', safeState)}
     ${hidden('code_challenge', code_challenge)}
     ${hidden('resource', RESOURCE)}
     ${hidden('_csrf', csrfToken)}
@@ -713,7 +765,22 @@ export function authorizePost(req: Request, res: Response): void {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    const cspNonce = crypto.randomBytes(16).toString('base64');
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'none'",
+        "object-src 'none'",
+        `script-src 'nonce-${cspNonce}'`,
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' https: data: blob:",
+        "connect-src 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "upgrade-insecure-requests"
+      ].join('; ')
+    );
 
     const {
       client_id,
@@ -725,6 +792,12 @@ export function authorizePost(req: Request, res: Response): void {
       approval_key,
       _csrf
     } = req.body || {};
+    const safeState = typeof state === 'string' ? state : '';
+
+    if (safeState.length > 2048) {
+      res.status(400).send('Invalid OAuth state.');
+      return;
+    }
 
     // Validate anti-CSRF token
     const csrfPayload = typeof _csrf === 'string' ? decodeSigned<Record<string, any>>(_csrf) : null;
@@ -783,7 +856,7 @@ export function authorizePost(req: Request, res: Response): void {
 
     const target = new URL(redirect_uri);
     target.searchParams.set('code', code);
-    if (state) target.searchParams.set('state', state);
+    if (safeState) target.searchParams.set('state', safeState);
     res.redirect(target.toString());
   } catch (error: any) {
     res.status(500).send('OAuth configuration error.');
@@ -842,22 +915,29 @@ function issueFromCode(req: Request, res: Response): void {
     return;
   }
 
-  // Single-use enforcement: authorization code replay prevention
+  // Single-use enforcement: authorization code replay prevention. Keep only
+  // unexpired nonces so the store stays bounded without ever clearing recent
+  // entries wholesale (which would re-enable replay).
+  pruneUsedAuthCodes();
   if (typeof payload.nonce === 'string' && usedAuthCodes.has(payload.nonce)) {
     res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code already redeemed.' });
     return;
   }
-  if (typeof payload.nonce === 'string') {
-    usedAuthCodes.add(payload.nonce);
-    if (usedAuthCodes.size > 10000) {
-      usedAuthCodes.clear();
-    }
-  }
-
   const expectedChallenge = crypto.createHash('sha256').update(code_verifier).digest('base64url');
   if (!timingSafeEqualString(expectedChallenge, payload.code_challenge)) {
     res.status(400).json({ error: 'invalid_grant' });
     return;
+  }
+
+  if (typeof payload.nonce === 'string') {
+    if (usedAuthCodes.size >= USED_AUTH_CODE_MAX_ENTRIES) {
+      pruneUsedAuthCodes();
+    }
+    if (usedAuthCodes.size >= USED_AUTH_CODE_MAX_ENTRIES) {
+      res.status(503).json({ error: 'temporarily_unavailable' });
+      return;
+    }
+    usedAuthCodes.set(payload.nonce, payload.exp);
   }
 
   issueTokens(res, client_id, payload.scope, payload.resource);
@@ -924,16 +1004,36 @@ function issueTokens(res: Response, clientId: string, scope: string, resource: s
   });
 }
 
-export function verifyAccessToken(tokenValue: string): boolean {
-  if (typeof tokenValue !== 'string' || tokenValue.length > 4096) return false;
+function decodeValidAccessToken(tokenValue: string): Record<string, any> | null {
+  if (typeof tokenValue !== 'string' || tokenValue.length > 4096) return null;
   const payload = decodeSigned<Record<string, any>>(tokenValue);
-  return !!payload &&
-    payload.typ === 'access_token' &&
-    payload.iss === ISSUER &&
-    payload.aud === RESOURCE &&
-    typeof payload.sub === 'string' &&
-    payload.scope === 'mcp' &&
-    validExpiry(payload.exp);
+  if (
+    !payload ||
+    payload.typ !== 'access_token' ||
+    payload.iss !== ISSUER ||
+    payload.aud !== RESOURCE ||
+    typeof payload.sub !== 'string' ||
+    payload.scope !== 'mcp' ||
+    !validExpiry(payload.exp)
+  ) {
+    return null;
+  }
+  return payload;
+}
+
+export function verifyAccessToken(tokenValue: string): boolean {
+  return !!decodeValidAccessToken(tokenValue);
+}
+
+/**
+ * Returns a stable per-token identity for sandbox/session isolation. The
+ * access-token jti is intentionally included so different OAuth tokens for
+ * the same public client cannot share a sandbox.
+ */
+export function getAccessTokenIdentity(tokenValue: string): string | undefined {
+  const payload = decodeValidAccessToken(tokenValue);
+  if (!payload || typeof payload.jti !== 'string' || payload.jti.length < 16) return undefined;
+  return `oauth:${payload.sub}:${payload.jti}`;
 }
 
 function escapeHtml(value: string): string {

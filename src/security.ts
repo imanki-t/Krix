@@ -76,8 +76,8 @@ function hashAuth(token: string): string {
   return crypto.createHash('sha256').update(token || 'anonymous').digest('hex').slice(0, 16);
 }
 
-export function registerSessionAuth(sessionId: string, githubToken: string): void {
-  const key = hashAuth(githubToken);
+export function registerSessionAuth(sessionId: string, authIdentity: string): void {
+  const key = hashAuth(authIdentity);
   const existing = sessionAuthKey.get(sessionId);
   if (existing && existing !== key) {
     throw new Error('Session authentication identity cannot be changed after session creation.');
@@ -506,7 +506,7 @@ export function sanitizeSessionEnv(env: Record<string, string>): Record<string, 
     'MCP_API_KEY', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_PAT', 'RENDER_API_KEY', 'RENDER_PAT',
     'NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONHOME',
     'RUBYLIB', 'PERL5LIB', 'BASH_ENV', 'ENV', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
-    'GIT_SSH_COMMAND', 'GIT_ASKPASS'
+    'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AZURE_CLIENT_SECRET', 'GOOGLE_APPLICATION_CREDENTIALS'
   ]);
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
@@ -519,14 +519,14 @@ export function sanitizeSessionEnv(env: Record<string, string>): Record<string, 
 }
 
 export function getNetworkRestrictionLevel(): 'low' | 'medium' | 'high' {
-  const level = (process.env.NETWORK_RESTRICTION_LEVEL || 'low').toLowerCase();
+  const level = (process.env.NETWORK_RESTRICTION_LEVEL || 'high').toLowerCase();
   if (level === 'high') return 'high';
   if (level === 'medium') return 'medium';
   return 'low';
 }
 
 export function getCommandRestrictionLevel(): 'low' | 'medium' | 'high' {
-  const level = (process.env.COMMAND_RESTRICTION_LEVEL || 'low').toLowerCase();
+  const level = (process.env.COMMAND_RESTRICTION_LEVEL || 'high').toLowerCase();
   if (level === 'high') return 'high';
   if (level === 'medium') return 'medium';
   return 'low';
