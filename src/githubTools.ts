@@ -24,22 +24,18 @@ function resolveRepo(inputOwner: string | undefined, inputRepo: string | undefin
 }
 
 async function resolveFullSha(octokit: Octokit, owner: string, repo: string, ref: string): Promise<string> {
-  // Already a full 40-char commit SHA — use as-is.
   if (/^[0-9a-f]{40}$/i.test(ref)) return ref;
 
-  // Try as a branch name.
   try {
     const branchRef = await octokit.git.getRef({ owner, repo, ref: `heads/${ref}` });
     return branchRef.data.object.sha;
-  } catch { /* not a branch — fall through */ }
+  } catch {}
 
-  // Try as a tag name.
   try {
     const tagRef = await octokit.git.getRef({ owner, repo, ref: `tags/${ref}` });
     return tagRef.data.object.sha;
-  } catch { /* not a tag — fall through */ }
+  } catch {}
 
-  // Fall back to treating it as a (possibly short) commit SHA.
   const commit = await octokit.repos.getCommit({ owner, repo, ref });
   return commit.data.sha;
 }
@@ -768,9 +764,6 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
 
       if (username) {
         if (q || rx) {
-          // A filter was requested: pull a broad page of the user's repos and
-          // filter client-side, since GitHub's listForUser has no free-text query.
-          // Otherwise q/regex only reordered results without narrowing them.
           const userRepos = await octokit.repos.listForUser({
             username,
             per_page: 100,
@@ -793,7 +786,6 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
           const start = (pageNum - 1) * perPage;
           items = items.slice(start, start + perPage);
         } else {
-          // No filter: an explicit "list everything" request, paginate normally.
           const userRepos = await octokit.repos.listForUser({
             username,
             per_page: perPage,
