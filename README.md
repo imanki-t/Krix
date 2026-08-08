@@ -19,10 +19,12 @@ load_toolset({ category: "all" })               // Enable all categories concurr
 ```
 
 ### 2. Isolated Multi-Tenant Execution Sandbox
-- **Identity-Scoped File System**: Sandboxes are isolated under `/tmp/krix_sbx_${authKey}/` where `authKey` is a SHA-256 hash of the caller's GitHub token. User data never leaks across sessions or accounts.
+- **Identity-Scoped File System**: Sandboxes are isolated under `/tmp/krix_sbx_${authKey}/` where `authKey` is a SHA-256 hash of the caller's GitHub token. Sessions for the same authenticated identity intentionally share that sandbox.
 - **Persistent Shell State**: Keeps long-lived `bash` sessions per `(authKey, sessionId)` pair. `cd`, `export`, and venv activations persist between tool calls.
 - **Race-Guarded Concurrency**: In-flight shell creation is promise-guarded to prevent concurrent requests from spawning orphan processes.
-- **Safe Environment**: Automatically pins `HOME` to `/tmp/krix_home/` with pre-created cache directories, preventing `npm` and `pip` `ENOENT` failures in containerized environments.
+- **OS-Level Sandbox Boundary**: Sandbox commands run through Linux `bubblewrap` (`bwrap`) with separate PID/mount/IPC/UTS/user namespaces, dropped capabilities, a read-only system filesystem, and only the identity-scoped workspace mounted writable. Krix fails closed if `bwrap` is unavailable unless explicitly configured otherwise.
+- **Configurable Sandbox Network Access**: `sandbox_exec`, `sandbox_run`, `sandbox_install`, and Git operations each have their own network-access environment variable. All four default to `true`; set an individual variable to `false` to disable network access for that capability. Bubblewrap enforces the resulting network namespace setting.
+- **Safe Environment**: Server credentials are not inherited by sandbox commands; dangerous runtime/configuration variables such as `NODE_OPTIONS`, `LD_PRELOAD`, and Git SSH/askpass overrides are blocked.
 - **Context-Aware Reset (`sandbox_reset`)**: Wipes scratch files, persistent shells, and background processes while safely preserving active Git context (`owner`, `repo`, `branch`).
 
 ### 3. Surgical Code Editing & Structural Search
@@ -34,7 +36,7 @@ load_toolset({ category: "all" })               // Enable all categories concurr
 
 ### 4. Enterprise Security & Memory Hygiene
 - **Zero-Trust Credential Masking**: Automatically redacts GitHub tokens (`ghp_*`, `github_pat_*`), Render keys (`rnd_*`), Bearer [REDACTED], and SSH/RSA private keys from all outputs.
-- **Path Escape Protection**: Enforces path resolution bounds (`sanitizePath`) prohibiting access outside `/tmp` or working directory roots.
+- **Path Escape Protection**: Enforces strict sandbox-root containment, including realpath/symlink checks, so sandbox paths cannot escape the identity-scoped workspace.
 - **Multi-Level Safety Filters**: Configurable via `COMMAND_RESTRICTION_LEVEL` and `NETWORK_RESTRICTION_LEVEL` (`low`, `medium`, `high`, defaulting to `low`):
   - **Command Levels**: `low` protects against total destruction (`rm -rf /`, `mkfs`, fork bombs); `medium` blocks administrative modifications (`shutdown`, `reboot`, `chmod 777 /`, `/etc/passwd`); `high` blocks privilege escalation (`sudo`, `su`), port listeners (`nc -l`), and kernel tools.
   - **Network Levels**: `low` blocks internal/private IP targeting (`169.254.169.254`, `127.0.0.1`, private CIDR blocks) for SSRF protection; `medium` blocks raw IP URLs and non-HTTP protocols; `high` restricts outbound traffic to a trusted domain allowlist.
@@ -43,6 +45,8 @@ load_toolset({ category: "all" })               // Enable all categories concurr
   - **10-min Idle Teardown**: Inactive session transports and sandboxes are automatically destroyed (`destroySandbox`).
   - **15-min Output Cache TTL**: Truncated shell outputs (`sandbox_output`) are cached per session and automatically purged on expiration or reset.
   - **10-min Process Table TTL**: Background job entries (`sandbox_ps`) are swept on a 5-minute timer. Buffer output is hard-capped at 200KB per process.
+  - **Resource Ceilings**: Sessions, background processes, persistent shells, concurrent executions, cached output, environment size, file size, sandbox disk usage, and request payloads all have bounded limits designed for 512 MB-class hosts.
+  - **Memory Pressure Guard**: Output caches are purged under memory pressure and sandbox child processes/shells are terminated at the emergency threshold to protect the Render service.
 
 ---
 
@@ -193,6 +197,23 @@ ENABLE_RENDER=false
 
 # Sandbox & Local Git Tools Flag (Enabled by default, set to 'false' to disable)
 ENABLE_SANDBOX=true
+
+# Secure Linux sandboxing (Docker image installs bubblewrap)
+SANDBOX_ISOLATION_REQUIRED=true
+# Network access defaults for each sandbox capability (all enabled by default)
+SANDBOX_EXEC_NETWORK_DEFAULT=true
+SANDBOX_RUN_NETWORK_DEFAULT=true
+SANDBOX_INSTALL_NETWORK_DEFAULT=true
+GIT_NETWORK_DEFAULT=true
+BWRAP_PATH=bwrap
+
+Network defaults:
+- `SANDBOX_EXEC_NETWORK_DEFAULT=true` — default network access for `sandbox_exec` (including persistent/background execution).
+- `SANDBOX_RUN_NETWORK_DEFAULT=true` — default network access for `sandbox_run`.
+- `SANDBOX_INSTALL_NETWORK_DEFAULT=true` — default network access for `sandbox_install`.
+- `GIT_NETWORK_DEFAULT=true` — network access for Git operations such as clone/fetch/pull/push (and related Git commands).
+
+Set any of these to `false` to place that capability in an isolated network namespace by default. Per-call `network` settings on execution tools can still override the execution defaults where supported.
 
 # Security Restriction Levels: low | medium | high (default: low)
 COMMAND_RESTRICTION_LEVEL=low
