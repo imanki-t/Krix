@@ -184,6 +184,14 @@ RENDER_API_KEY=rnd_your_render_api_key_here
 # Enable All Tools by Default (Optional: set to 'true' to disable lazy loading)
 ENABLE_ALL_TOOLS=false
 
+# Category-specific Tool Flags (Disabled by default, set to 'true' to enable)
+ENABLE_GITHUB_ISSUES_PRS=false
+ENABLE_GITHUB_ADMIN=false
+ENABLE_RENDER=false
+
+# Sandbox & Local Git Tools Flag (Enabled by default, set to 'false' to disable)
+ENABLE_SANDBOX=true
+
 # HTTP Server Port
 PORT=3000
 ```
