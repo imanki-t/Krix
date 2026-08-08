@@ -5,12 +5,8 @@ import { formatOptimizedResponse, formatError, getToolAnnotations, makeRegistrar
 interface RenderSessionEntry { sessionId: string; lastActive: number; }
 const renderSessions = new Map<string, RenderSessionEntry>();
 
-// Without this, a renderToken's session entry would only ever be removed on
-// an explicit API failure — never on staleness — so the map grows unbounded
-// with every distinct token ever seen. Mirrors the TTL pattern used for
-// session/auth context in security.ts and for output caching in sandboxTools.ts.
-const RENDER_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const RENDER_SESSION_PRUNE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const RENDER_SESSION_TTL_MS = 30 * 60 * 1000;
+const RENDER_SESSION_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 const renderSessionPruneTimer = setInterval(() => {
   const now = Date.now();
   for (const [token, entry] of renderSessions) {
@@ -25,7 +21,7 @@ async function getRenderSession(renderToken: string): Promise<string> {
     cached.lastActive = Date.now();
     return cached.sessionId;
   }
-  if (cached) renderSessions.delete(renderToken); // stale — fall through and re-initialize
+  if (cached) renderSessions.delete(renderToken);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
@@ -187,4 +183,4 @@ export function registerRenderTools(server: McpServer, renderTokenGetter: () => 
 
   reg('query_render_postgres', { description: 'Run SQL query.', inputSchema: { postgresId: z.string(), query: z.string() }, annotations: getToolAnnotations('query_render_postgres') },
     async (args: any) => callRenderTool('query_render_postgres', args, renderTokenGetter()));
-      }
+}
