@@ -111,7 +111,7 @@ function execResponse(sessionId: string, err: any, stdout: string, stderr: strin
   return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
 }
 
-function sandboxEnv(sessionId?: string): NodeJS.ProcessEnv {
+function sandboxEnv(sessionId?: string): Record<string, string> {
   const root = sessionId ? path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`) : path.join(os.tmpdir(), 'krix_sbx');
   const safeHome = path.join(root, '.home');
   const sessionEnv = sessionId ? (getSessionContext(sessionId).env || {}) : {};
