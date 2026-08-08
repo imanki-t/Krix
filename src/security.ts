@@ -9,8 +9,8 @@ import crypto from 'node:crypto';
 // in-memory collections bounded. They are application-level guards, not a
 // replacement for container/OS memory limits.
 export const RESOURCE_LIMITS = {
-  maxSessions: 24,
-  maxAuthContexts: 128,
+  maxSessions: 16,
+  maxAuthContexts: 64,
   maxEnvVars: 128,
   maxEnvBytes: 256 * 1024,
   maxInputString: 2 * 1024 * 1024,
@@ -20,9 +20,9 @@ export const RESOURCE_LIMITS = {
   maxOutputCacheBytesGlobal: 32 * 1024 * 1024,
   maxBackgroundProcessesPerAuth: 8,
   maxBackgroundProcessesGlobal: 16,
-  maxPersistentShellsGlobal: 12,
-  maxConcurrentExecutionsGlobal: 4,
-  maxExecutionQueue: 8,
+  maxPersistentShellsGlobal: 8,
+  maxConcurrentExecutionsGlobal: 3,
+  maxExecutionQueue: 6,
   maxPushFiles: 100,
   maxPushFileBytes: 4 * 1024 * 1024,
   maxPushTotalBytes: 16 * 1024 * 1024,
