@@ -117,6 +117,7 @@ function clientIdFor(metadata: Omit<ClientMetadata, 'client_id'>): string {
   const payload = {
     v: 1,
     name: metadata.client_name || '',
+    logo: metadata.logo_uri || '',
     redirects: [...metadata.redirect_uris].sort()
   };
   return `https://${new URL(ISSUER).host}/oauth/client/${encodeSigned(payload)}`;
@@ -137,6 +138,7 @@ function parseClient(clientId: unknown): ClientMetadata | null {
     return {
       client_id: clientId,
       client_name: typeof payload.name === 'string' ? payload.name : undefined,
+      logo_uri: typeof payload.logo === 'string' && /^https:\/\//i.test(payload.logo) ? payload.logo : undefined,
       redirect_uris: payload.redirects
     };
   } catch {
