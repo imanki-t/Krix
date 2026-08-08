@@ -12,6 +12,7 @@ const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 type ClientMetadata = {
   client_id: string;
   client_name?: string;
+  logo_uri?: string;
   redirect_uris: string[];
 };
 
