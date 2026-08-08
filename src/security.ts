@@ -17,6 +17,9 @@ export interface SessionContext {
   cwd?: string;
   env?: Record<string, string>;
   enabledCategories: Set<ToolCategory>;
+  /** True if this context was resumed from a prior session under the same
+   *  auth token (rather than starting fresh), and how old that data was. */
+  resumedContext?: { fromPriorSession: true; idleMs: number };
 }
 
 const sessionContexts = new Map<string, SessionContext>();
