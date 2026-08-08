@@ -52,6 +52,20 @@ function resolveConfiguredTtl(): number {
 }
 const AUTH_CONTEXT_TTL_MS = resolveConfiguredTtl();
 
+// authBucket() only overwrites a stale entry when that same key is touched
+// again — a key that's never revisited would otherwise sit in the map
+// forever. Actively sweep and remove anything past its TTL so the map is
+// bounded by recently-active tokens, not by every distinct token ever seen
+// over the process's lifetime.
+const AUTH_CONTEXT_PRUNE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const authContextPruneTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of lastKnownContextByAuth) {
+    if (now - bucket.lastUsed > AUTH_CONTEXT_TTL_MS) lastKnownContextByAuth.delete(key);
+  }
+}, AUTH_CONTEXT_PRUNE_INTERVAL_MS);
+authContextPruneTimer.unref();
+
 function hashAuth(token: string): string {
   return crypto.createHash('sha256').update(token || 'anonymous').digest('hex').slice(0, 16);
 }
