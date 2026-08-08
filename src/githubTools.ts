@@ -228,9 +228,31 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       const normalizedOld = resolvedOld.replace(/\r\n/g, '\n');
       const normalizedNew = resolvedNew.replace(/\r\n/g, '\n');
 
-      if (!normalizedContent.includes(normalizedOld)) {
+      const occurrences: number[] = [];
+      let searchFrom = 0;
+      while (true) {
+        const index = normalizedContent.indexOf(normalizedOld, searchFrom);
+        if (index === -1) break;
+        occurrences.push(index);
+        searchFrom = index + Math.max(normalizedOld.length, 1);
+      }
+
+      if (occurrences.length === 0) {
         const feedback = getBestMatchFeedback(normalizedContent, normalizedOld);
         throw new Error(feedback);
+      }
+
+      if (occurrences.length > 1) {
+        const lines = occurrences.map((index) => normalizedContent.slice(0, index).split('\n').length);
+        const occurrenceDetails = occurrences
+          .map((index, i) => `Occurrence ${i + 1}: starts at line ${lines[i]}`)
+          .join('\n');
+
+        throw new Error(
+          `Error: old_str is ambiguous; found ${occurrences.length} occurrences. ` +
+          `No changes were made.\n\n${occurrenceDetails}\n\n` +
+          `Provide a more specific old_str so exactly one occurrence matches.`
+        );
       }
 
       const updated = normalizedContent.replace(normalizedOld, normalizedNew);
