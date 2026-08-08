@@ -359,6 +359,14 @@ export function authorize(req: Request, res: Response): void {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Authorize ${escapeHtml(client.client_name || 'MCP Client')} &ndash; Krix</title>
+<link rel="icon" type="image/jpeg" href="/logo.jpg">
+<link rel="shortcut icon" href="/logo.jpg">
+<link rel="apple-touch-icon" href="/logo.jpg">
+<meta name="application-name" content="Krix">
+<meta name="theme-color" content="#4f46e5">
+<meta property="og:title" content="Krix Authorization Gateway">
+<meta property="og:description" content="Authorize access to your Krix MCP tools and sandbox environment.">
+<meta property="og:image" content="/logo.jpg">
 <style>
   :root {
     --bg: #f8fafc;
