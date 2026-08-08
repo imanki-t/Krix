@@ -194,6 +194,13 @@ ENABLE_RENDER=false
 # Sandbox & Local Git Tools Flag (Enabled by default, set to 'false' to disable)
 ENABLE_SANDBOX=true
 
+# Security Restriction Levels: low | medium | high (default: low)
+COMMAND_RESTRICTION_LEVEL=low
+NETWORK_RESTRICTION_LEVEL=low
+
+# Auth Context Persistence TTL in ms (default: 3600000 / 1h)
+AUTH_CONTEXT_TTL_MS=3600000
+
 # HTTP Server Port
 PORT=3000
 ```
