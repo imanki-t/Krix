@@ -116,7 +116,7 @@ function sameOriginLogo(req: Request): string {
       if (url.protocol === 'https:' || url.origin === baseUrl(req)) return url.toString();
     } catch {}
   }
-  return `${baseUrl(req)}/logo.svg`;
+  return `${baseUrl(req)}/logo.png`;
 }
 
 function reject(res: Response, status: number, message: string): void {

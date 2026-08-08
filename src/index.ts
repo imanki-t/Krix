@@ -127,8 +127,10 @@ app.use((req, res, next) => { if (!validateOrigin(req, res)) return; next(); });
 app.use(express.json({ limit: process.env.MCP_BODY_LIMIT || '5mb', strict: true, type: ['application/json', 'application/*+json'] }));
 app.use(express.urlencoded({ extended: false, limit: '16kb', parameterLimit: 20 }));
 app.use('/assets', express.static(path.resolve('assets'), { dotfiles: 'deny', index: false, maxAge: '7d', immutable: false }));
+app.get('/logo.png', (_req, res) => { res.type('image/png'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.sendFile(path.resolve('assets/logo.png')); });
 app.get('/logo.svg', (_req, res) => { res.type('image/svg+xml'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.sendFile(path.resolve('assets/logo.svg')); });
-app.get('/favicon.svg', (_req, res) => res.redirect(302, '/logo.svg'));
+app.get('/favicon.svg', (_req, res) => res.redirect(302, '/logo.png'));
+app.get('/favicon.ico', (_req, res) => res.redirect(302, '/logo.png'));
 
 app.get('/.well-known/oauth-authorization-server', (req, res) => { res.setHeader('Cache-Control', 'public, max-age=300'); res.json(oauthMetadata(req)); });
 app.get('/.well-known/oauth-protected-resource', (req, res) => { res.setHeader('Cache-Control', 'public, max-age=300'); res.json(protectedResourceMetadata(req)); });
@@ -192,7 +194,7 @@ app.get('/readyz', (_req, res) => {
   const ready = !!MCP_API_KEY && (!isProduction || process.env.PUBLIC_BASE_URL?.startsWith('https://'));
   res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not_ready' });
 });
-app.get('/', (_req, res) => { res.type('html').send('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Krix</title></head><body style="margin:0;background:#f4f4f2;color:#111;font-family:system-ui;display:grid;place-items:center;min-height:100vh"><main style="background:white;border:1px solid #ddd;border-radius:24px;padding:32px;box-shadow:0 20px 60px #0001"><img src="/logo.svg" width="56" height="56" alt="Krix"><h1>Krix Gateway</h1><p style="color:#666">Secure MCP gateway.</p></main></body></html>'); });
+app.get('/', (_req, res) => { res.type('html').send('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Krix</title><link rel="icon" href="/logo.png" type="image/png"></head><body style="margin:0;background:#f4f4f2;color:#111;font-family:system-ui;display:grid;place-items:center;min-height:100vh"><main style="background:white;border:1px solid #ddd;border-radius:24px;padding:32px;box-shadow:0 20px 60px #0001"><img src="/logo.png" width="56" height="56" alt="Krix"><h1>Krix Gateway</h1><p style="color:#666">Secure MCP gateway.</p></main></body></html>'); });
 
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
