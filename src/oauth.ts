@@ -291,32 +291,321 @@ export function authorize(req: Request, res: Response): void {
       `<input type="hidden" name="${name}" value="${escapeHtml(value)}">`;
 
     res.type('html').send(`<!doctype html>
-<html lang="en"><head>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Krix Authorization</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize ${escapeHtml(client.client_name || 'MCP Client')} &ndash; Krix</title>
 <style>
-body{font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:24px;line-height:1.5}
-.card{border:1px solid #ddd;border-radius:14px;padding:24px}
-button{padding:11px 18px;border:0;border-radius:9px;background:#111;color:#fff;font-size:16px;cursor:pointer}
-input{width:100%;padding:11px;margin:8px 0 18px;box-sizing:border-box;border:1px solid #bbb;border-radius:8px}
-small{color:#666}
-</style></head><body><div class="card">
-<h1>Authorize Krix</h1>
-<p><b>${escapeHtml(client.client_name || 'An MCP client')}</b> is requesting access to your Krix MCP tools.</p>
-<p><small>Only authorize clients you recognize.</small></p>
-<form method="post" action="/oauth/authorize">
-${hidden('client_id', client.client_id)}
-${hidden('redirect_uri', redirect)}
-${hidden('scope', 'mcp')}
-${hidden('state', typeof state === 'string' ? state : '')}
-${hidden('code_challenge', code_challenge)}
-${hidden('resource', RESOURCE)}
-${hidden('_csrf', csrfToken)}
-<label for="approval_key">Krix API key</label>
-<input id="approval_key" type="password" name="approval_key" autocomplete="current-password" required>
-<button type="submit">Authorize</button>
-</form></div></body></html>`);
+  :root {
+    --bg: #f8fafc;
+    --card-bg: #ffffff;
+    --card-border: #e2e8f0;
+    --text-main: #0f172a;
+    --text-muted: #64748b;
+    --accent: #4f46e5;
+    --accent-hover: #4338ca;
+    --accent-glow: rgba(79, 70, 229, 0.15);
+    --input-bg: #f1f5f9;
+    --input-border: #cbd5e1;
+    --input-focus: #4f46e5;
+    --badge-bg: #e0e7ff;
+    --badge-text: #3730a3;
+    --shield-bg: #ecfdf5;
+    --shield-text: #065f46;
+    --shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #111827;
+      --card-border: #1f2937;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --accent-glow: rgba(99, 102, 241, 0.25);
+      --input-bg: #1e293b;
+      --input-border: #334155;
+      --input-focus: #6366f1;
+      --badge-bg: #312e81;
+      --badge-text: #e0e7ff;
+      --shield-bg: #064e3b;
+      --shield-text: #a7f3d0;
+      --shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background-color: var(--bg);
+    color: var(--text-main);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 24px;
+    line-height: 1.5;
+  }
+
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes pulseGlow {
+    0%, 100% { opacity: 0.5; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.12); }
+  }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 20px;
+    padding: 36px 32px;
+    max-width: 440px;
+    width: 100%;
+    box-shadow: var(--shadow);
+    animation: fadeInUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  .brand-header {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    margin-bottom: 28px;
+  }
+
+  .node-logo {
+    width: 52px;
+    height: 52px;
+    border-radius: 14px;
+    object-fit: cover;
+    border: 2px solid var(--card-border);
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  }
+
+  .client-avatar {
+    width: 52px;
+    height: 52px;
+    border-radius: 14px;
+    background: var(--badge-bg);
+    color: var(--badge-text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 20px;
+    border: 2px solid var(--card-border);
+  }
+
+  .connection-line {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent);
+  }
+
+  .connection-line svg {
+    animation: pulseGlow 2s infinite ease-in-out;
+  }
+
+  .title-group {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+
+  .title-group h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 8px;
+  }
+
+  .title-group p {
+    font-size: 14px;
+    color: var(--text-muted);
+  }
+
+  .scope-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: var(--shield-bg);
+    color: var(--shield-text);
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 12px;
+  }
+
+  .form-group {
+    margin-top: 24px;
+  }
+
+  .form-group label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .input-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .input-icon {
+    position: absolute;
+    left: 14px;
+    color: var(--text-muted);
+    pointer-events: none;
+  }
+
+  input[type="password"] {
+    width: 100%;
+    padding: 12px 14px 12px 42px;
+    font-size: 15px;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 12px;
+    color: var(--text-main);
+    outline: none;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  input[type="password"]:focus {
+    border-color: var(--input-focus);
+    box-shadow: 0 0 0 4px var(--accent-glow);
+  }
+
+  .btn-authorize {
+    width: 100%;
+    padding: 13px;
+    margin-top: 20px;
+    border: none;
+    border-radius: 12px;
+    background: var(--accent);
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    transition: background-color 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
+  }
+
+  .btn-authorize:hover {
+    background: var(--accent-hover);
+    box-shadow: 0 4px 12px var(--accent-glow);
+  }
+
+  .btn-authorize:active {
+    transform: scale(0.98);
+  }
+
+  .security-footer {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 22px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  .security-footer svg {
+    flex-shrink: 0;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand-header">
+    <div class="client-avatar" title="${escapeHtml(client.client_name || 'Client')}">
+      ${escapeHtml((client.client_name || 'C').charAt(0).toUpperCase())}
+    </div>
+    <div class="connection-line">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+      </svg>
+    </div>
+    <img src="/logo.jpg" alt="Krix Logo" class="node-logo" onerror="this.style.display='none'">
+  </div>
+
+  <div class="title-group">
+    <h1>Authorize Krix Access</h1>
+    <p><b>${escapeHtml(client.client_name || 'An MCP client')}</b> is requesting permission to execute Krix MCP tools on your behalf.</p>
+    <div class="scope-badge">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        <polyline points="9 12 11 14 15 10"/>
+      </svg>
+      MCP Server &amp; Tools Access
+    </div>
+  </div>
+
+  <form method="post" action="/oauth/authorize">
+    ${hidden('client_id', client.client_id)}
+    ${hidden('redirect_uri', redirect)}
+    ${hidden('scope', 'mcp')}
+    ${hidden('state', typeof state === 'string' ? state : '')}
+    ${hidden('code_challenge', code_challenge)}
+    ${hidden('resource', RESOURCE)}
+    ${hidden('_csrf', csrfToken)}
+
+    <div class="form-group">
+      <label for="approval_key">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="7.5" cy="15.5" r="5.5"/>
+          <path d="m21 2-9.6 9.6"/>
+          <path d="m15.5 7.5 3 3"/>
+        </svg>
+        Krix API Key
+      </label>
+      <div class="input-wrapper">
+        <svg class="input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+        <input id="approval_key" type="password" name="approval_key" placeholder="Enter secret API key" autocomplete="current-password" required autofocus>
+      </div>
+    </div>
+
+    <button type="submit" class="btn-authorize">
+      Authorize Access
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="5" y1="12" x2="19" y2="12"/>
+        <polyline points="12 5 19 12 12 19"/>
+      </svg>
+    </button>
+  </form>
+
+  <div class="security-footer">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="10"/>
+      <line x1="12" y1="16" x2="12" y2="12"/>
+      <line x1="12" y1="8" x2="12.01" y2="8"/>
+    </svg>
+    Only authorize applications and clients you recognize.
+  </div>
+</div>
+</body>
+</html>`);
   } catch (error: any) {
     res.status(500).send('OAuth configuration error.');
   }
