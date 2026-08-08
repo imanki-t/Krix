@@ -371,6 +371,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         throw new Error('Provide either `code` or `filePath`.');
       }
 
+      if (args.code) sanitizeCommand(args.code);
+      sanitizeCommand(cmd);
+
       const { err, stdout, stderr } = await run(cmd, cwd, 45000, sessionId);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
