@@ -568,7 +568,10 @@ export function authorize(req: Request, res: Response): void {
 <div class="card">
   <div class="brand-header">
     <div class="client-avatar" title="${escapeHtml(client.client_name || 'Client')}">
-      ${escapeHtml((client.client_name || 'C').charAt(0).toUpperCase())}
+      ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(client.client_name || 'Client')}" class="client-logo-img" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';">` : ''}
+      <div class="client-initial" ${logoUrl ? 'style="display:none;"' : ''}>
+        ${escapeHtml((client.client_name || 'C').charAt(0).toUpperCase())}
+      </div>
     </div>
     <div class="connection-line">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
