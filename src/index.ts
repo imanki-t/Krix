@@ -6,6 +6,17 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Octokit } from '@octokit/rest';
 import dotenv from 'dotenv';
+import {
+  oauthResource,
+  protectedResourceMetadataUrl,
+  sendProtectedResourceMetadata,
+  sendAuthorizationServerMetadata,
+  registerClient,
+  authorize,
+  authorizePost,
+  token,
+  verifyAccessToken
+} from './oauth.js';
 
 import { registerGitHubTools } from './githubTools.js';
 import { registerRenderTools } from './renderTools.js';
@@ -73,8 +84,16 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
 
 const app = express();
 app.use(express.json({ limit: RESOURCE_LIMITS.maxRequestBodyBytes }));
+app.use(express.urlencoded({ extended: false, limit: '32kb' }));
 app.use('/assets', express.static('assets'));
 app.get('/logo.jpg', (_req, res) => res.sendFile(path.resolve('assets/logo.jpg')));
+app.get('/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
+app.get('/.well-known/oauth-authorization-server', sendAuthorizationServerMetadata);
+app.post('/oauth/register', registerClient);
+app.get('/oauth/authorize', authorize);
+app.post('/oauth/authorize', authorizePost);
+app.post('/oauth/token', token);
+
 
 app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   if (!MCP_API_KEY) {
@@ -88,15 +107,24 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
 
   const authHeader = req.headers['authorization']?.toString() || '';
   const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-  const clientKey = (req.headers['x-api-key'] as string) || bearer;
-  const expected = Buffer.from(MCP_API_KEY);
-  const provided = Buffer.from(clientKey || '');
-  const validKey = provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
+  const legacyKey = (req.headers['x-api-key'] as string) || '';
 
-  if (!validKey) {
+  const expected = Buffer.from(MCP_API_KEY);
+  const provided = Buffer.from(legacyKey);
+  const validLegacyKey =
+    provided.length === expected.length &&
+    crypto.timingSafeEqual(provided, expected);
+
+  const validOAuth = bearer ? verifyAccessToken(bearer) : false;
+
+  if (!validOAuth && !validLegacyKey) {
+    res.set(
+      'WWW-Authenticate',
+      `Bearer realm="mcp", resource_metadata="${protectedResourceMetadataUrl()}"`
+    );
     res.status(401).json({
       jsonrpc: '2.0',
-      error: { code: -32000, message: 'Unauthorized API Key.' },
+      error: { code: -32000, message: 'Authentication required.' },
       id: req.body?.id || null
     });
     return;
