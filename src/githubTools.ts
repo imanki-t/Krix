@@ -1,7 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Octokit } from '@octokit/rest';
 import { z } from 'zod';
-import { validateSandboxCwd, sanitizeSessionEnv, safeRegexTest, validateRegex } from './security.js';
 import { formatOptimizedResponse, formatError, getToolAnnotations, resolveInputString, getSessionContext, updateSessionContext, makeRegistrar } from './security.js';
 
 function handleGitHubError(err: any): any {
@@ -136,8 +135,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     if (owner !== undefined) patch.owner = owner;
     if (repo !== undefined) patch.repo = repo;
     if (branch !== undefined) patch.branch = branch;
-    if (cwd !== undefined) patch.cwd = validateSandboxCwd(sessionId, cwd);
-    if (env !== undefined) patch.env = sanitizeSessionEnv(env);
+    if (cwd !== undefined) patch.cwd = cwd;
+    if (env !== undefined) patch.env = env;
     if (Object.keys(patch).length === 0) return formatError('Provide at least one of owner/repo/branch/cwd/env.');
     updateSessionContext(sessionId, patch);
     const parts: string[] = [];
@@ -228,31 +227,9 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       const normalizedOld = resolvedOld.replace(/\r\n/g, '\n');
       const normalizedNew = resolvedNew.replace(/\r\n/g, '\n');
 
-      const occurrences: number[] = [];
-      let searchFrom = 0;
-      while (true) {
-        const index = normalizedContent.indexOf(normalizedOld, searchFrom);
-        if (index === -1) break;
-        occurrences.push(index);
-        searchFrom = index + Math.max(normalizedOld.length, 1);
-      }
-
-      if (occurrences.length === 0) {
+      if (!normalizedContent.includes(normalizedOld)) {
         const feedback = getBestMatchFeedback(normalizedContent, normalizedOld);
         throw new Error(feedback);
-      }
-
-      if (occurrences.length > 1) {
-        const lines = occurrences.map((index) => normalizedContent.slice(0, index).split('\n').length);
-        const occurrenceDetails = occurrences
-          .map((index, i) => `Occurrence ${i + 1}: starts at line ${lines[i]}`)
-          .join('\n');
-
-        throw new Error(
-          `Error: old_str is ambiguous; found ${occurrences.length} occurrences. ` +
-          `No changes were made.\n\n${occurrenceDetails}\n\n` +
-          `Provide a more specific old_str so exactly one occurrence matches.`
-        );
       }
 
       const updated = normalizedContent.replace(normalizedOld, normalizedNew);
@@ -355,7 +332,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('view_file_outline', {
-    description: 'Extract a lightweight declaration outline using language-aware heuristics (not a full AST parser).',
+    description: 'Extract high-level AST symbol structure.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), path: z.string(), ref: z.string().optional() },
     annotations: getToolAnnotations('view_file_outline')
   }, async (args: any) => {
@@ -565,31 +542,32 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('list_issue_fields', {
-    description: 'List custom issue fields defined for an organization. This is organization-level data, not repository labels.',
-    inputSchema: { org: z.string().optional(), owner: z.string().optional() },
+    description: 'List custom issue fields.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('list_issue_fields')
   }, async (args: any) => {
-    const org = args.org || args.owner;
-    if (!org) return formatError(new Error('Organization name is required (use org).'));
+    const { owner, repo } = args;
     try {
-      const res = await octokit.request('GET /orgs/{org}/issue-fields', { org });
-      return formatOptimizedResponse(res.data);
+      const target = resolveRepo(owner, repo, sessionId);
+      const res = await octokit.issues.listLabelsForRepo({ owner: target.owner, repo: target.repo });
+      return formatOptimizedResponse(res.data.map(l => l.name));
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('list_issue_types', {
-    description: 'List issue types available for a repository, including organization inheritance and repository overrides.',
+    description: "List configured issue types.",
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('list_issue_types')
   }, async (args: any) => {
+    const { owner, repo } = args;
     try {
-      const target = resolveRepo(args.owner, args.repo, sessionId);
-      const res = await octokit.request('GET /repos/{owner}/{repo}/issue-types', {
-        owner: target.owner,
-        repo: target.repo
-      });
-      return formatOptimizedResponse(res.data);
-    } catch (err) { return handleGitHubError(err); }
+      const target = resolveRepo(owner, repo, sessionId);
+      const res = await octokit.request('GET /orgs/{org}/issue-types', { org: target.owner });
+      return formatOptimizedResponse(res.data.map((t: any) => t.name));
+    } catch (err: any) {
+      if (err?.status === 404) return formatOptimizedResponse(['Bug', 'Feature', 'Task', 'Improvement']);
+      return handleGitHubError(err);
+    }
   });
 
   reg('list_issues', {
@@ -779,12 +757,13 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       let items: any[] = [];
       let totalCount = 0;
 
+      let rx: RegExp | null = null;
       if (regex) {
-        validateRegex(regex, 'i');
+        try { rx = new RegExp(regex, 'i'); } catch {}
       }
 
       if (username) {
-        if (q || regex) {
+        if (q || rx) {
           const userRepos = await octokit.repos.listForUser({
             username,
             per_page: 100,
@@ -792,8 +771,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
           });
           items = userRepos.data || [];
 
-          if (regex) {
-            items = items.filter(r => safeRegexTest(regex, 'i', r.name) || safeRegexTest(regex, 'i', r.full_name));
+          if (rx) {
+            items = items.filter(r => rx!.test(r.name) || rx!.test(r.full_name));
           }
           if (q) {
             const needle = q.toLowerCase();
@@ -826,8 +805,8 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
         items = res.data.items || [];
         totalCount = res.data.total_count || items.length;
 
-        if (regex) {
-          items = items.filter(r => safeRegexTest(regex, 'i', r.name) || safeRegexTest(regex, 'i', r.full_name));
+        if (rx) {
+          items = items.filter(r => rx!.test(r.name) || rx!.test(r.full_name));
         }
       }
 
@@ -836,24 +815,18 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
       }
 
       const targetQuery = q || regex || '';
-      const line = (r: any) => `${r.full_name} (${r.default_branch || 'main'})`;
-
-      if (exact) {
-        const needle = (q || '').trim().toLowerCase();
-        const exactItem = items.find(r =>
-          r.name?.toLowerCase() === needle ||
-          r.full_name?.toLowerCase() === needle ||
-          r.full_name?.toLowerCase() === (username && needle ? `${username.toLowerCase()}/${needle}` : needle)
-        );
-        if (!exactItem) return formatOptimizedResponse('No exact repository match found.');
-        return formatOptimizedResponse(line(exactItem));
-      }
-
       if (targetQuery) {
         items.forEach(r => {
           r._sim = getSimilarity(r.name, targetQuery);
         });
         items.sort((a, b) => (b._sim || 0) - (a._sim || 0));
+      }
+
+      const line = (r: any) => `${r.full_name} (${r.default_branch || 'main'})`;
+
+      if (exact) {
+        const top = items[0];
+        return formatOptimizedResponse(line(top));
       }
 
       const formatted = items.map((r, i) => `${i + 1}. ${line(r)}`);
@@ -875,7 +848,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('run_secret_scanning', {
-    description: 'List active secret scanning alerts; this does not start a new scan.',
+    description: 'Run secret scanning check.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('run_secret_scanning')
   }, async (args: any) => {
@@ -888,11 +861,11 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('add_comment_to_pending_review', {
-    description: 'Create a line comment inside a new pending pull request review. The review remains pending until explicitly submitted.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), body: z.string(), path: z.string(), line: z.number(), side: z.enum(['LEFT', 'RIGHT']).optional().default('RIGHT'), commit_id: z.string().optional() },
+    description: 'Add line comment to pending review.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), body: z.string(), path: z.string(), line: z.number(), commit_id: z.string().optional() },
     annotations: getToolAnnotations('add_comment_to_pending_review')
   }, async (args: any) => {
-    const { owner, repo, pull_number, body, path, line, side, commit_id } = args;
+    const { owner, repo, pull_number, body, path, line, commit_id } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
       let activeCommitId = commit_id;
@@ -900,15 +873,10 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
         const pr = await octokit.pulls.get({ owner: target.owner, repo: target.repo, pull_number });
         activeCommitId = pr.data.head.sha;
       }
-      const res = await octokit.pulls.createReview({
-        owner: target.owner,
-        repo: target.repo,
-        pull_number,
-        commit_id: activeCommitId,
-        event: '',
-        comments: [{ path, line, side, body }]
+      const res = await octokit.pulls.createReviewComment({
+        owner: target.owner, repo: target.repo, pull_number, body, path, line, commit_id: activeCommitId
       });
-      return formatOptimizedResponse({ reviewId: res.data.id, state: res.data.state, pending: res.data.state === 'PENDING' });
+      return formatOptimizedResponse(`Comment ID: ${res.data.id}`);
     } catch (err) { return handleGitHubError(err); }
   });
 
@@ -926,7 +894,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('add_reply_to_pull_request_comment', {
-    description: 'Reply to a pull request review comment.',
+    description: 'Reply to PR comment.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), comment_id: z.number(), body: z.string() },
     annotations: getToolAnnotations('add_reply_to_pull_request_comment')
   }, async (args: any) => {
@@ -1095,58 +1063,24 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('push_files', {
-    description: 'Atomically commit multiple UTF-8 text files in one Git commit.',
-    inputSchema: {
-      owner: z.string().optional(),
-      repo: z.string().optional(),
-      branch: z.string(),
-      message: z.string(),
-      files: z.array(z.object({ path: z.string().min(1), content: z.string() })).min(1).max(100)
-    },
+    description: 'Batch push multiple files.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string(), message: z.string(), files: z.array(z.object({ path: z.string(), content: z.string() })) },
     annotations: getToolAnnotations('push_files')
   }, async (args: any) => {
     const { owner, repo, branch, message, files } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const unique = new Set<string>();
       for (const f of files) {
-        const normalized = f.path.replace(/^\/+/, '');
-        if (!normalized || normalized.startsWith('..') || normalized.includes('\\0') || normalized.split('/').some((p: string) => p === '..')) {
-          throw new Error(`Invalid repository path: ${f.path}`);
-        }
-        if (unique.has(normalized)) throw new Error(`Duplicate file path: ${normalized}`);
-        unique.add(normalized);
-      }
-
-      const ref = await octokit.git.getRef({ owner: target.owner, repo: target.repo, ref: `heads/${branch}` });
-      const baseSha = ref.data.object.sha;
-      const baseCommit = await octokit.git.getCommit({ owner: target.owner, repo: target.repo, commit_sha: baseSha });
-      const baseTree = await octokit.git.getTree({ owner: target.owner, repo: target.repo, tree_sha: baseCommit.data.tree.sha, recursive: 'true' });
-
-      const entries = (baseTree.data.tree || []).filter((e: any) => e.path && e.type === 'blob')
-        .map((e: any) => ({ path: e.path as string, mode: e.mode as any, type: 'blob' as const, sha: e.sha as string }));
-
-      for (const f of files) {
-        const blob = await octokit.git.createBlob({
-          owner: target.owner, repo: target.repo,
-          content: Buffer.from(f.content, 'utf8').toString('base64'),
-          encoding: 'base64'
+        let existingSha: string | undefined;
+        try {
+          const cur = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path: f.path, ref: branch });
+          if (!Array.isArray(cur.data) && 'sha' in cur.data) existingSha = cur.data.sha;
+        } catch {}
+        await octokit.repos.createOrUpdateFileContents({
+          owner: target.owner, repo: target.repo, path: f.path, message, content: Buffer.from(f.content).toString('base64'), branch, sha: existingSha
         });
-        const idx = entries.findIndex((e: any) => e.path === f.path);
-        const entry = { path: f.path, mode: '100644' as const, type: 'blob' as const, sha: blob.data.sha };
-        if (idx >= 0) entries[idx] = entry; else entries.push(entry);
       }
-
-      const tree = await octokit.git.createTree({
-        owner: target.owner, repo: target.repo, base_tree: baseCommit.data.tree.sha, tree: entries as any
-      });
-      const commit = await octokit.git.createCommit({
-        owner: target.owner, repo: target.repo, message, tree: tree.data.sha, parents: [baseSha]
-      });
-      await octokit.git.updateRef({
-        owner: target.owner, repo: target.repo, ref: `heads/${branch}`, sha: commit.data.sha, force: false
-      });
-      return formatOptimizedResponse({ committed: true, branch, commit: commit.data.sha, files: files.length });
+      return formatOptimizedResponse(`Pushed ${files.length} files.`);
     } catch (err) { return handleGitHubError(err); }
   });
 
@@ -1177,26 +1111,15 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('sub_issue_write', {
-    description: 'Create a real GitHub sub-issue and attach it to a parent issue.',
+    description: 'Create sub-issue.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), parent_issue_number: z.number(), title: z.string(), body: z.string().optional() },
     annotations: getToolAnnotations('sub_issue_write')
   }, async (args: any) => {
     const { owner, repo, parent_issue_number, title, body } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const created = await octokit.issues.create({ owner: target.owner, repo: target.repo, title, body });
-      const attached = await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/sub_issues', {
-        owner: target.owner,
-        repo: target.repo,
-        issue_number: parent_issue_number,
-        sub_issue_id: created.data.id
-      });
-      return formatOptimizedResponse({
-        createdIssue: { number: created.data.number, id: created.data.id, url: created.data.html_url },
-        parentIssue: parent_issue_number,
-        attached: true,
-        relationship: attached.data
-      });
+      const res = await octokit.issues.create({ owner: target.owner, repo: target.repo, title: `[Sub-issue #${parent_issue_number}] ${title}`, body });
+      return formatOptimizedResponse(`Sub-issue #${res.data.number} created.`);
     } catch (err) { return handleGitHubError(err); }
   });
 

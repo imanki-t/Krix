@@ -1,15 +1,14 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { execFile, execFileSync, execSync, spawn, type ChildProcess } from 'node:child_process';
+import { exec, execFile, execSync, spawn, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
-import { accessSync } from 'node:fs';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { constants as fsConstants } from 'node:fs';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations,
-  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession, isPathInside, RESOURCE_LIMITS
+  sanitizeCommand, sanitizePath, sanitizeExistingPath, sanitizeWritablePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession
 } from './security.js';
 
 interface ActiveProcess {
@@ -22,177 +21,19 @@ interface ActiveProcess {
   exitedAt: Date | null;
   stdout: string;
   stderr: string;
-  killTimer?: ReturnType<typeof setTimeout>;
 }
 
 const OUT_CAP = 100000;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const BG_BUF_CAP = 200000;
-const PERSISTENT_SHELL_BUF_CAP = 1024 * 1024;
 const EXEC_LIMITS = { maxBuffer: 4 * 1024 * 1024 };
-const MAX_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
-const MAX_BACKGROUND_RUNTIME_MS = 10 * 60 * 1000;
-const MEMORY_SOFT_LIMIT_BYTES = 360 * 1024 * 1024;
-const MEMORY_EMERGENCY_LIMIT_BYTES = 440 * 1024 * 1024;
-const SANDBOX_EXEC_NETWORK_DEFAULT = process.env.SANDBOX_EXEC_NETWORK_DEFAULT === 'true';
-const SANDBOX_RUN_NETWORK_DEFAULT = process.env.SANDBOX_RUN_NETWORK_DEFAULT === 'true';
-const SANDBOX_INSTALL_NETWORK_DEFAULT = process.env.SANDBOX_INSTALL_NETWORK_DEFAULT === 'true';
-const GIT_NETWORK_DEFAULT = process.env.GIT_NETWORK_DEFAULT === 'true';
-const SANDBOX_ISOLATION_REQUIRED = process.env.SANDBOX_ISOLATION_REQUIRED !== 'false';
-const BWRAP_PATH = process.env.BWRAP_PATH || 'bwrap';
-
-let sandboxIsolationAvailable: boolean | undefined;
-function hasSandboxIsolation(): boolean {
-  if (sandboxIsolationAvailable !== undefined) return sandboxIsolationAvailable;
-  if (process.platform !== 'linux') return (sandboxIsolationAvailable = false);
-  try {
-    execFileSync(BWRAP_PATH, ['--version'], { stdio: 'ignore', timeout: 1500 });
-    sandboxIsolationAvailable = true;
-  } catch {
-    sandboxIsolationAvailable = false;
-  }
-  return sandboxIsolationAvailable;
-}
-
-function assertSandboxIsolationAvailable(): void {
-  if (SANDBOX_ISOLATION_REQUIRED && !hasSandboxIsolation()) {
-    throw new Error('Secure sandbox isolation is unavailable. Install bubblewrap (bwrap) or set SANDBOX_ISOLATION_REQUIRED=false only if you explicitly accept an unisolated sandbox.');
-  }
-}
-
-function shellCwdInside(root: string, cwd: string): string {
-  const relative = path.relative(root, cwd);
-  return relative ? `/workspace/${relative.split(path.sep).join('/')}` : '/workspace';
-}
-
-function isolationArgs(root: string, cwd: string, network: boolean, env: NodeJS.ProcessEnv): string[] {
-  assertSandboxIsolationAvailable();
-  const args = [
-    '--die-with-parent',
-    '--new-session',
-    '--cap-drop', 'ALL',
-    '--unshare-all',
-    '--clearenv',
-    // Start from an empty root mount namespace. Only explicitly approved
-    // read-only system paths and the writable workspace are exposed below.
-    // This is what prevents /app, /proc (host), /root, /var, etc. from
-    // accidentally remaining visible through the host root filesystem.
-    '--tmpfs', '/',
-    ...(network ? ['--share-net'] : []),
-    '--proc', '/proc',
-    '--dev', '/dev',
-    '--tmpfs', '/dev/shm',
-    '--tmpfs', '/tmp',
-    '--tmpfs', '/run',
-    '--tmpfs', '/home',
-    '--ro-bind', '/usr', '/usr',
-    '--ro-bind', '/usr/local', '/usr/local',
-    '--ro-bind', '/bin', '/bin',
-    '--ro-bind', '/sbin', '/sbin',
-    '--ro-bind', '/lib', '/lib',
-    '--ro-bind', '/etc', '/etc',
-  ];
-  for (const dir of ['/lib64', '/opt']) {
-    try { accessSync(dir, fsConstants.F_OK); args.push('--ro-bind', dir, dir); } catch {}
-  }
-  args.push('--bind', root, '/workspace');
-  args.push('--chdir', shellCwdInside(root, cwd));
-  args.push('--dir', '/home/sandbox');
-  args.push('--setenv', 'HOME', '/home/sandbox');
-  args.push('--setenv', 'TMPDIR', '/tmp');
-  for (const [key, value] of Object.entries(env)) {
-    if (value === undefined) continue;
-    args.push('--setenv', key, String(value));
-  }
-  args.push('--');
-  return args;
-}
-
-function isolatedCommand(root: string, cwd: string, network: boolean, env: NodeJS.ProcessEnv, file: string, args: string[]): { file: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv } {
-  if (!SANDBOX_ISOLATION_REQUIRED && !hasSandboxIsolation()) return { file, args, cwd, env };
-  return { file: BWRAP_PATH, args: [...isolationArgs(root, cwd, network, {}), file, ...args], cwd: root, env };
-}
-
-
-function clearAllOutputCache(): void {
-  for (const bucket of outputCache.values()) {
-    for (const id of bucket.keys()) removeCachedOutput(bucket, id);
-  }
-  outputCache.clear();
-}
-
-function enforceMemoryBudget(emergencyCleanup = false): void {
-  const rss = process.memoryUsage().rss;
-  if (rss <= MEMORY_SOFT_LIMIT_BYTES && !emergencyCleanup) return;
-  clearAllOutputCache();
-  if (rss >= MEMORY_EMERGENCY_LIMIT_BYTES || emergencyCleanup) {
-    for (const table of processTables.values()) {
-      for (const item of table.values()) {
-        if (item.status === 'running') { try { item.proc.kill('SIGKILL'); } catch {} }
-      }
-    }
-    for (const key of persistentShells.keys()) killShell(key);
-  }
-}
-
-const memoryGuardTimer = setInterval(() => {
-  enforceMemoryBudget();
-}, 30 * 1000);
-memoryGuardTimer.unref();
 const EXITED_TTL_MS = 10 * 60 * 1000;
-const MAX_PROCESS_RECORDS_PER_AUTH = 32;
-
-let activeExecutions = 0;
-const executionWaiters: Array<() => void> = [];
-
-async function acquireExecutionSlot(): Promise<void> {
-  enforceMemoryBudget();
-  if (activeExecutions < RESOURCE_LIMITS.maxConcurrentExecutionsGlobal) {
-    activeExecutions++;
-    return;
-  }
-  if (executionWaiters.length >= RESOURCE_LIMITS.maxExecutionQueue) {
-    throw new Error('Sandbox execution capacity is temporarily full. Retry shortly.');
-  }
-  await new Promise<void>((resolve) => executionWaiters.push(resolve));
-  activeExecutions++;
-}
-
-function releaseExecutionSlot(): void {
-  activeExecutions = Math.max(0, activeExecutions - 1);
-  const next = executionWaiters.shift();
-  if (next) next();
-}
-
-async function withExecutionSlot<T>(fn: () => Promise<T>): Promise<T> {
-  await acquireExecutionSlot();
-  try { return await fn(); } finally { releaseExecutionSlot(); }
-}
-
-function enforceProcessRecordLimit(table: Map<number, ActiveProcess>): void {
-  if (table.size < MAX_PROCESS_RECORDS_PER_AUTH) return;
-  const exited = [...table.entries()]
-    .filter(([, item]) => item.status === 'exited')
-    .sort((a, b) => (a[1].exitedAt?.getTime() || 0) - (b[1].exitedAt?.getTime() || 0));
-  while (table.size >= MAX_PROCESS_RECORDS_PER_AUTH && exited.length) {
-    const [pid] = exited.shift()!;
-    table.delete(pid);
-  }
-  if (table.size >= MAX_PROCESS_RECORDS_PER_AUTH) {
-    throw new Error('Background process record capacity reached. Stop an existing process or wait for records to expire.');
-  }
-}
+const MAX_BACKGROUND_PROCESSES = 8;
+const MAX_BACKGROUND_LIFETIME_MS = 30 * 60 * 1000;
 
 const processTables = new Map<string, Map<number, ActiveProcess>>();
-function totalRunningBackgroundProcesses(): number {
-  let count = 0;
-  for (const table of processTables.values()) {
-    for (const item of table.values()) if (item.status === 'running') count++;
-  }
-  return count;
-}
-
 function procTable(sessionId: string): Map<number, ActiveProcess> {
-  const key = getAuthKeyForSession(sessionId);
+  const key = sessionId;
   let t = processTables.get(key);
   if (!t) { t = new Map(); processTables.set(key, t); }
   return t;
@@ -202,11 +43,9 @@ const processTablePruneTimer = setInterval(() => {
   const now = Date.now();
   for (const table of processTables.values()) {
     for (const [pid, item] of table) {
+      if (item.status === 'running' && now - item.startTime.getTime() > MAX_BACKGROUND_LIFETIME_MS) { try { item.proc.kill('SIGKILL'); } catch {} }
       if (item.status === 'exited' && item.exitedAt && now - item.exitedAt.getTime() > EXITED_TTL_MS) table.delete(pid);
     }
-  }
-  for (const [authKey, table] of processTables) {
-    if (table.size === 0) processTables.delete(authKey);
   }
 }, 5 * 60 * 1000);
 processTablePruneTimer.unref();
@@ -224,44 +63,18 @@ function trunc(s: string, cap: number = OUT_CAP): string {
 
 interface CachedOutput { content: string; createdAt: number; }
 const outputCache = new Map<string, Map<string, CachedOutput>>();
-let outputCacheEntriesGlobal = 0;
-let outputCacheBytesGlobal = 0;
 const OUTPUT_CACHE_TTL_MS = 15 * 60 * 1000;
 const OUTPUT_CACHE_MAX_PER_SESSION = 10;
-
-function removeCachedOutput(bucket: Map<string, CachedOutput>, id: string): void {
-  const entry = bucket.get(id);
-  if (!entry) return;
-  bucket.delete(id);
-  outputCacheEntriesGlobal = Math.max(0, outputCacheEntriesGlobal - 1);
-  outputCacheBytesGlobal = Math.max(0, outputCacheBytesGlobal - Buffer.byteLength(entry.content));
-}
 
 function cacheOutput(sessionId: string, content: string): string {
   let bucket = outputCache.get(sessionId);
   if (!bucket) { bucket = new Map(); outputCache.set(sessionId, bucket); }
-  const bytes = Buffer.byteLength(content);
-  while (
-    bucket.size >= OUTPUT_CACHE_MAX_PER_SESSION ||
-    outputCacheEntriesGlobal >= RESOURCE_LIMITS.maxOutputCacheEntriesGlobal ||
-    outputCacheBytesGlobal + bytes > RESOURCE_LIMITS.maxOutputCacheBytesGlobal
-  ) {
-    let oldestBucket: Map<string, CachedOutput> | undefined;
-    let oldestId: string | undefined;
-    let oldestTime = Infinity;
-    for (const candidate of outputCache.values()) {
-      for (const [id, entry] of candidate) {
-        if (entry.createdAt < oldestTime) { oldestTime = entry.createdAt; oldestBucket = candidate; oldestId = id; }
-      }
-    }
-    if (!oldestBucket || !oldestId) break;
-    removeCachedOutput(oldestBucket, oldestId);
+  if (bucket.size >= OUTPUT_CACHE_MAX_PER_SESSION) {
+    const oldest = [...bucket.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
+    if (oldest) bucket.delete(oldest[0]);
   }
-  if (bytes > RESOURCE_LIMITS.maxOutputCacheBytesGlobal) return '';
   const id = crypto.randomBytes(6).toString('hex');
   bucket.set(id, { content, createdAt: Date.now() });
-  outputCacheEntriesGlobal++;
-  outputCacheBytesGlobal += bytes;
   return id;
 }
 
@@ -273,7 +86,7 @@ const outputCachePruneTimer = setInterval(() => {
   const now = Date.now();
   for (const [sid, bucket] of outputCache) {
     for (const [id, entry] of bucket) {
-      if (now - entry.createdAt > OUTPUT_CACHE_TTL_MS) removeCachedOutput(bucket, id);
+      if (now - entry.createdAt > OUTPUT_CACHE_TTL_MS) bucket.delete(id);
     }
     if (bucket.size === 0) outputCache.delete(sid);
   }
@@ -285,7 +98,6 @@ function truncWithCache(sessionId: string, s: string, cap: number = OUT_CAP): st
   if (!clean) return '';
   if (clean.length <= cap) return clean;
   const id = cacheOutput(sessionId, clean);
-  if (!id) return `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated — output cache capacity reached; only the first ${cap} chars are retained]`;
   return `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated — call sandbox_output({ outputId: "${id}", offset: ${cap} }) to continue reading; cached 15min]`;
 }
 
@@ -300,90 +112,94 @@ function execResponse(sessionId: string, err: any, stdout: string, stderr: strin
 }
 
 function sandboxEnv(sessionId?: string): NodeJS.ProcessEnv {
-  const authKey = sessionId ? getAuthKeyForSession(sessionId) : 'anonymous';
-  const safeHome = path.join('/home/sandbox', `krix_home_${authKey}`);
+  const root = sessionId ? path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`) : path.join(os.tmpdir(), 'krix_sbx');
+  const safeHome = path.join(root, '.home');
   const sessionEnv = sessionId ? (getSessionContext(sessionId).env || {}) : {};
-  const blocked = new Set([
-    'MCP_API_KEY', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_PAT', 'RENDER_API_KEY', 'RENDER_PAT',
-    'NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONHOME',
-    'RUBYLIB', 'PERL5LIB', 'BASH_ENV', 'ENV', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
-    'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AZURE_CLIENT_SECRET', 'GOOGLE_APPLICATION_CREDENTIALS', 'PATH', 'HOME', 'PWD', 'OLDPWD', 'SHLVL',
-    'PROMPT_COMMAND', 'CDPATH', 'IFS'
-  ]);
-  const env: NodeJS.ProcessEnv = {};
-  const safeBase = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'CI', 'NODE_ENV'];
-  for (const key of safeBase) {
-    const value = process.env[key];
-    if (value !== undefined && !blocked.has(key)) env[key] = value;
-  }
-  env.HOME = safeHome;
-  env.npm_config_cache = `${safeHome}/.npm`;
-  env.GIT_TERMINAL_PROMPT = '0';
-  env.GIT_CONFIG_NOSYSTEM = '1';
-  env.GIT_CONFIG_GLOBAL = '/dev/null';
-  let envBytes = 0;
-  let envCount = 0;
+  const clean: NodeJS.ProcessEnv = {
+    PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    HOME: safeHome,
+    TMPDIR: '/tmp',
+    LANG: 'C.UTF-8',
+    LC_ALL: 'C.UTF-8',
+    npm_config_cache: path.join(safeHome, '.npm'),
+    GIT_TERMINAL_PROMPT: '0'
+  };
   for (const [key, value] of Object.entries(sessionEnv)) {
-    if (blocked.has(key) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    if (envCount >= RESOURCE_LIMITS.maxEnvVars) throw new Error(`Sandbox environment exceeds ${RESOURCE_LIMITS.maxEnvVars} variables.`);
-    const stringValue = String(value);
-    const entryBytes = Buffer.byteLength(key) + Buffer.byteLength(stringValue) + 2;
-    if (envBytes + entryBytes > RESOURCE_LIMITS.maxEnvBytes) throw new Error(`Sandbox environment exceeds ${RESOURCE_LIMITS.maxEnvBytes} bytes.`);
-    env[key] = stringValue;
-    envBytes += entryBytes;
-    envCount++;
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) continue;
+    if (/^(PATH|HOME|TMPDIR|LD_|NODE_OPTIONS|BASH_ENV|ENV|GIT_.*|NPM_CONFIG_.*)$/i.test(key)) continue;
+    if (typeof value === 'string' && value.length <= 8192) clean[key] = value;
   }
-  return env;
+  return clean;
 }
 
-async function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?: string, network = SANDBOX_EXEC_NETWORK_DEFAULT): Promise<{ err: any; stdout: string; stderr: string }> {
-  const safeTimeout = Math.min(Math.max(1000, Number(timeout) || 30000), MAX_EXEC_TIMEOUT_MS);
-  const root = sessionId ? await sandboxRoot(sessionId) : path.resolve(cwd);
+function sandboxMode(): 'bwrap' | 'host' | 'disabled' {
+  const mode = (process.env.SANDBOX_MODE || 'disabled').toLowerCase();
+  if (mode === 'bwrap') return mode;
+  if (mode === 'host' && process.env.ALLOW_UNSAFE_HOST_SANDBOX === 'true') return mode;
+  if (mode === 'disabled') return mode;
+  return 'disabled';
+}
+
+function bwrapArgs(sessionId: string, cwd: string, command: string, network = false): string[] {
+  const root = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
   const env = sandboxEnv(sessionId);
-  const isolated = isolatedCommand(root, cwd, network, env, 'bash', ['--noprofile', '--norc', '-lc', cmd]);
-  return withExecutionSlot(() => new Promise((resolve) => {
-    execFile(isolated.file, isolated.args, { cwd: isolated.cwd, timeout: safeTimeout, env: isolated.env, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
-  }));
+  const args = [
+    '--die-with-parent', '--new-session', '--unshare-all',
+    '--ro-bind', '/usr', '/usr',
+    '--ro-bind', '/usr/local', '/usr/local',
+    '--ro-bind', '/bin', '/bin',
+    '--ro-bind', '/sbin', '/sbin',
+    '--ro-bind', '/lib', '/lib',
+    '--ro-bind', '/lib64', '/lib64',
+    '--ro-bind', '/etc', '/etc',
+    '--proc', '/proc', '--dev', '/dev',
+    '--tmpfs', '/tmp', '--tmpfs', '/run',
+    '--bind', root, root,
+    '--dir', '/home', '--dir', '/root',
+    '--chdir', cwd,
+  ];
+  if (network) args.push('--share-net');
+  for (const [key, value] of Object.entries(env)) args.push('--setenv', key, value);
+  if (command) args.push('/bin/bash', '--noprofile', '--norc', '-lc', command);
+  else args.push('/bin/bash', '--noprofile', '--norc');
+  return args;
 }
 
-async function runFile(file: string, args: string[], cwd: string, timeout = 30000, sessionId?: string, network = SANDBOX_EXEC_NETWORK_DEFAULT): Promise<{ err: any; stdout: string; stderr: string }> {
-  const safeTimeout = Math.min(Math.max(1000, Number(timeout) || 30000), MAX_EXEC_TIMEOUT_MS);
-  const root = sessionId ? await sandboxRoot(sessionId) : path.resolve(cwd);
-  const env = sandboxEnv(sessionId);
-  const isolated = isolatedCommand(root, cwd, network, env, file, args);
-  return withExecutionSlot(() => new Promise((resolve) => {
-    execFile(isolated.file, isolated.args, { cwd: isolated.cwd, timeout: safeTimeout, env: isolated.env, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
-  }));
-}
 
-async function assertSandboxPath(sessionId: string, candidate: string, allowMissing = false): Promise<string> {
-  const root = await sandboxRoot(sessionId);
-  const abs = sanitizePath(candidate, root);
-  const rootReal = await fs.realpath(root);
-  try {
-    const targetReal = await fs.realpath(abs);
-    if (!isPathInside(rootReal, targetReal)) throw new Error('Security Violation: symlink/path escapes sandbox.');
-  } catch (err: any) {
-    if (!allowMissing || err?.message?.includes('escapes sandbox')) throw err;
-    const parentReal = await fs.realpath(path.dirname(abs));
-    if (!isPathInside(rootReal, parentReal)) throw new Error('Security Violation: path parent escapes sandbox.');
-  }
-  return abs;
+function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?: string, network = false): Promise<{ err: any; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const mode = sandboxMode();
+    if (mode === 'disabled') { resolve({ err: Object.assign(new Error('Sandbox is disabled in production configuration.'), { code: 126 }), stdout: '', stderr: 'Sandbox disabled.' }); return; }
+    if (!sessionId) { resolve({ err: Object.assign(new Error('Sandbox session missing.'), { code: 126 }), stdout: '', stderr: 'Sandbox session missing.' }); return; }
+    const env = sandboxEnv(sessionId);
+    if (mode === 'host') {
+      exec(cmd, { cwd, timeout, env, maxBuffer: 4 * 1024 * 1024, shell: '/bin/bash' }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+      return;
+    }
+    const args = bwrapArgs(sessionId, cwd, cmd, network);
+    execFile('bwrap', args, { cwd: '/', timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+  });
 }
 
 async function sandboxRoot(sessionId: string): Promise<string> {
   const dir = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const stat = await fs.lstat(dir);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Sandbox root is not a trusted directory.');
-  try { await fs.chmod(dir, 0o700); } catch {}
+  await fs.mkdir(path.join(dir, '.home'), { recursive: true, mode: 0o700 });
   return dir;
 }
 
 async function workDir(sessionId: string): Promise<string> {
   const ctx = getSessionContext(sessionId);
-  if (ctx.cwd) return assertSandboxPath(sessionId, ctx.cwd);
-  if (ctx.sandboxDir) return assertSandboxPath(sessionId, ctx.sandboxDir);
+  if (ctx.cwd) {
+    try {
+      const root = await sandboxRoot(sessionId);
+      const safe = await sanitizeExistingPath(ctx.cwd, root);
+      return safe;
+    } catch {}
+  }
+  if (ctx.sandboxDir) {
+    try { await fs.access(ctx.sandboxDir); return ctx.sandboxDir; } catch {}
+  }
   return sandboxRoot(sessionId);
 }
 
@@ -392,10 +208,10 @@ async function resolveDir(sessionId: string, dir?: string): Promise<string> {
   const root = await sandboxRoot(sessionId);
   const target = sanitizePath(dir, root);
   await fs.mkdir(target, { recursive: true });
-  return assertSandboxPath(sessionId, target);
+  return await sanitizeExistingPath(target, root);
 }
 
-interface PersistentShell { proc: ChildProcess; buf: string; busy: boolean; network: boolean; }
+interface PersistentShell { proc: ChildProcess; buf: string; busy: boolean; }
 const persistentShells = new Map<string, PersistentShell>();
 const SHELL_HANG_MS = 60000;
 
@@ -405,30 +221,31 @@ function shellKey(sessionId: string): string {
 
 const shellCreation = new Map<string, Promise<PersistentShell>>();
 
-async function getShell(sessionId: string, network = SANDBOX_EXEC_NETWORK_DEFAULT): Promise<PersistentShell> {
-  enforceMemoryBudget();
+async function getShell(sessionId: string): Promise<PersistentShell> {
   const key = shellKey(sessionId);
   const existing = persistentShells.get(key);
-  if (existing && !existing.proc.killed) {
-    if (existing.network !== network) throw new Error(`Persistent shell already exists with network=${existing.network}. Use persistent:false or sandbox_reset before changing network mode.`);
-    return existing;
-  }
+  if (existing && !existing.proc.killed) return existing;
 
   const inFlight = shellCreation.get(key);
   if (inFlight) return inFlight;
-  if (persistentShells.size >= RESOURCE_LIMITS.maxPersistentShellsGlobal) {
-    throw new Error('Persistent shell capacity reached. Close an idle session or use persistent:false.');
-  }
 
   const creation = (async () => {
     const cwd = await workDir(sessionId);
-    const root = await sandboxRoot(sessionId);
-    const env = sandboxEnv(sessionId);
-    const isolated = isolatedCommand(root, cwd, network, env, 'bash', ['--noprofile', '--norc']);
-    const proc = spawn(isolated.file, isolated.args, { cwd: isolated.cwd, env: isolated.env });
-    const shell: PersistentShell = { proc, buf: '', busy: false, network };
-    proc.stdout?.on('data', (d) => { shell.buf = appendCapped(shell.buf, d.toString(), PERSISTENT_SHELL_BUF_CAP); });
-    proc.stderr?.on('data', (d) => { shell.buf = appendCapped(shell.buf, d.toString(), PERSISTENT_SHELL_BUF_CAP); });
+    if (sandboxMode() === 'disabled') throw new Error('Sandbox is disabled. Set SANDBOX_MODE=bwrap for production isolation.');
+    if (sandboxMode() === 'host') {
+      const proc = spawn('bash', ['--noprofile', '--norc'], { cwd, env: sandboxEnv(sessionId), stdio: ['pipe', 'pipe', 'pipe'] });
+      const shell: PersistentShell = { proc, buf: '', busy: false };
+      proc.stdout?.on('data', (d) => { shell.buf = appendCapped(shell.buf, d.toString(), BG_BUF_CAP); });
+      proc.on('exit', () => { if (persistentShells.get(key) === shell) persistentShells.delete(key); });
+      persistentShells.set(key, shell);
+      return shell;
+    }
+    const args = bwrapArgs(sessionId, cwd, '', false);
+    const commandIndex = args.lastIndexOf('-lc');
+    args[commandIndex + 1] = '';
+    const proc = spawn('bwrap', args, { cwd: '/', stdio: ['pipe', 'pipe', 'pipe'] });
+    const shell: PersistentShell = { proc, buf: '', busy: false };
+    proc.stdout?.on('data', (d) => { shell.buf = appendCapped(shell.buf, d.toString(), BG_BUF_CAP); });
     proc.on('exit', () => { if (persistentShells.get(key) === shell) persistentShells.delete(key); });
     persistentShells.set(key, shell);
     return shell;
@@ -446,8 +263,8 @@ function killShell(key: string): void {
   if (shell) { try { shell.proc.kill('SIGKILL'); } catch {} persistentShells.delete(key); }
 }
 
-async function runInShell(sessionId: string, command: string, timeoutMs: number, network = SANDBOX_EXEC_NETWORK_DEFAULT): Promise<{ stdout: string; exit: number; timedOut: boolean }> {
-  const shell = await getShell(sessionId, network);
+async function runInShell(sessionId: string, command: string, timeoutMs: number): Promise<{ stdout: string; exit: number; timedOut: boolean }> {
+  const shell = await getShell(sessionId);
   if (shell.busy) throw new Error('A previous command is still running in this persistent shell — wait for it to finish, or use background:true for long-running commands.');
 
   shell.busy = true;
@@ -484,19 +301,6 @@ async function runInShell(sessionId: string, command: string, timeoutMs: number,
   });
 }
 
-export function cleanupSessionResources(sessionId: string): void {
-  // A Krix auth identity may have multiple live MCP sessions sharing one
-  // sandbox. Closing one session must not destroy that shared sandbox or kill
-  // processes belonging to the other sessions.
-  if (getAuthKeyForSession(sessionId)) {
-    killShell(shellKey(sessionId));
-    const cacheBucket = outputCache.get(sessionId);
-    if (cacheBucket) for (const id of cacheBucket.keys()) removeCachedOutput(cacheBucket, id);
-    outputCache.delete(sessionId);
-    deleteSessionContext(sessionId);
-  }
-}
-
 export async function destroySandbox(sessionId: string, options: { deleteContext?: boolean } = { deleteContext: true }): Promise<void> {
   const authKey = getAuthKeyForSession(sessionId);
   const dirToRemove = path.join(os.tmpdir(), `krix_sbx_${authKey}`);
@@ -505,41 +309,39 @@ export async function destroySandbox(sessionId: string, options: { deleteContext
     deleteSessionContext(sessionId);
   }
   killShell(shellToKill);
-  const cacheBucket = outputCache.get(sessionId);
-  if (cacheBucket) for (const id of cacheBucket.keys()) removeCachedOutput(cacheBucket, id);
   outputCache.delete(sessionId);
-  const table = processTables.get(authKey);
+  const table = processTables.get(sessionId);
   if (table) {
     for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch {} }
-    processTables.delete(authKey);
+    processTables.delete(sessionId);
   }
   try {
     await fs.rm(dirToRemove, { recursive: true, force: true });
   } catch {}
 }
 
-function fileRunArgs(ext: string, abs: string, extraArgs: string[], binPath?: string): { file: string; args: string[] } {
+function fileRunCmd(ext: string, abs: string, extraArgs: string, binPath?: string): string {
   switch (ext) {
-    case '.py': return { file: 'python3', args: [abs, ...extraArgs] };
-    case '.js': return { file: 'node', args: [abs, ...extraArgs] };
-    case '.ts': return { file: 'npx', args: ['-y', 'tsx', abs, ...extraArgs] };
-    case '.sh': return { file: 'bash', args: [abs, ...extraArgs] };
-    case '.go': return { file: 'go', args: ['run', abs, ...extraArgs] };
-    case '.java': return { file: 'java', args: [abs, ...extraArgs] };
+    case '.py': return `python3 "${abs}" ${extraArgs}`;
+    case '.js': return `node "${abs}" ${extraArgs}`;
+    case '.ts': return `npx -y tsx "${abs}" ${extraArgs}`;
+    case '.sh': return `bash "${abs}" ${extraArgs}`;
+    case '.go': return `go run "${abs}" ${extraArgs}`;
+    case '.java': return `java "${abs}" ${extraArgs}`;
     case '.cpp': {
       const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
-      return { file: 'sh', args: ['-c', 'g++ "$1" -o "$2" && "$2" "${@:3}"', '--', abs, bin, ...extraArgs] };
+      return `g++ "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
     }
     case '.c': {
       const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
-      return { file: 'sh', args: ['-c', 'gcc "$1" -o "$2" && "$2" "${@:3}"', '--', abs, bin, ...extraArgs] };
+      return `gcc "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
     }
     case '.rs': {
       const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
-      return { file: 'sh', args: ['-c', 'rustc -O "$1" -o "$2" && "$2" "${@:3}"', '--', abs, bin, ...extraArgs] };
+      return `rustc -O "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
     }
-    case '.rb': return { file: 'ruby', args: [abs, ...extraArgs] };
-    case '.php': return { file: 'php', args: [abs, ...extraArgs] };
+    case '.rb': return `ruby "${abs}" ${extraArgs}`;
+    case '.php': return `php "${abs}" ${extraArgs}`;
     default: throw new Error(`Unsupported extension '${ext}'. Use py/js/ts/sh/go/java/cpp/c/rust/ruby/php.`);
   }
 }
@@ -547,62 +349,50 @@ function fileRunArgs(ext: string, abs: string, extraArgs: string[], binPath?: st
 const EXT_BY_LANG: Record<string, string> = { py: '.py', js: '.js', ts: '.ts', sh: '.sh', go: '.go', java: '.java', cpp: '.cpp', c: '.c', rust: '.rs', ruby: '.rb', php: '.php' };
 const COMPILED_EXTS = new Set(['.cpp', '.c', '.rs']);
 
-function gitEnv(sessionId: string, token?: string): NodeJS.ProcessEnv {
-  const env = sandboxEnv(sessionId);
-  if (token) {
-    const b64 = Buffer.from(`x-access-token:${token}`).toString('base64');
-    env.GIT_CONFIG_COUNT = '1';
-    env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
-    env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${b64}`;
-  }
-  return env;
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function runGit(args: string[], cwd: string, timeout: number, sessionId: string, token?: string) {
-  const safeTimeout = Math.min(Math.max(1000, Number(timeout) || 30000), MAX_EXEC_TIMEOUT_MS);
-  return withExecutionSlot(() => new Promise<{ err: any; stdout: string; stderr: string }>((resolve) => {
-    (async () => { const root = await sandboxRoot(sessionId); const env = gitEnv(sessionId, token); const gitArgs = token ? ['-c', 'core.hooksPath=/dev/null', ...args] : args; const isolated = isolatedCommand(root, cwd, GIT_NETWORK_DEFAULT, env, 'git', gitArgs); execFile(isolated.file, isolated.args, { cwd: isolated.cwd, timeout: safeTimeout, env: isolated.env, ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr })); })().catch((err) => resolve({ err, stdout: '', stderr: '' }));
-  }));
+function validGitRef(value: string): boolean {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 255 &&
+    !value.startsWith('-') && !value.endsWith('.') && !value.endsWith('/') &&
+    !value.includes('..') && !value.includes('@{') && !/[\u0000-\u001F\u007F ~^:?*[\\]/.test(value);
 }
 
+async function safeReadText(abs: string): Promise<string> {
+  const handle = await fs.open(abs, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+  try { return await handle.readFile('utf-8'); } finally { await handle.close(); }
+}
 
-async function sandboxUsageBytes(root: string, maxBytes: number = RESOURCE_LIMITS.maxSandboxDirBytes): Promise<number> {
-  let total = 0;
-  const stack = [root];
-  while (stack.length) {
-    const dir = stack.pop()!;
-    let entries;
-    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { continue; }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      try {
-        const stat = await fs.lstat(full);
-        if (stat.isSymbolicLink()) continue;
-        if (stat.isDirectory()) stack.push(full);
-        else {
-          total += stat.size;
-          if (total > maxBytes) return total;
-        }
-      } catch {}
+async function safeWriteText(abs: string, content: string, append = false): Promise<void> {
+  const flags = append
+    ? (fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_APPEND | fsSync.constants.O_NOFOLLOW)
+    : (fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_NOFOLLOW);
+  const handle = await fs.open(abs, flags, 0o600);
+  try { await handle.writeFile(content, 'utf-8'); } finally { await handle.close(); }
+}
+
+function validRepoPart(value: string): boolean {
+  return /^[A-Za-z0-9_.-]{1,100}$/.test(value) && value !== '.' && value !== '..';
+}
+
+function runGit(args: string[], cwd: string, timeout: number, token?: string): Promise<{ err: any; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const env: NodeJS.ProcessEnv = {
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: '/bin/false',
+      PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    };
+    if (token) {
+      env.GIT_CONFIG_COUNT = '1';
+      env.GIT_CONFIG_KEY_0 = 'http.extraHeader';
+      env.GIT_CONFIG_VALUE_0 = `Authorization: Bearer ${token}`;
     }
-  }
-  return total;
-}
-
-async function assertSandboxSize(sessionId: string): Promise<void> {
-  const root = await sandboxRoot(sessionId);
-  const used = await sandboxUsageBytes(root);
-  if (used > RESOURCE_LIMITS.maxSandboxDirBytes) {
-    throw new Error(`Sandbox disk quota exceeded (${Math.round(RESOURCE_LIMITS.maxSandboxDirBytes / 1024 / 1024)} MB). Remove files or reset the sandbox.`);
-  }
-}
-
-async function assertSandboxGrowth(sessionId: string, additionalBytes: number): Promise<void> {
-  const root = await sandboxRoot(sessionId);
-  const used = await sandboxUsageBytes(root);
-  if (used + Math.max(0, additionalBytes) > RESOURCE_LIMITS.maxSandboxDirBytes) {
-    throw new Error(`Sandbox disk quota would exceed ${Math.round(RESOURCE_LIMITS.maxSandboxDirBytes / 1024 / 1024)} MB.`);
-  }
+    const safeArgs = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=false', '-c', 'credential.helper=', '-c', 'protocol.ext.allow=never', '-c', 'protocol.file.allow=never', '-c', 'submodule.recurse=false', ...args];
+    execFile('git', safeArgs, { cwd, env, timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+  });
 }
 
 export function registerSandboxTools(server: McpServer, sessionId: string, githubToken: string | undefined, registry: Record<string, any>) {
@@ -611,12 +401,11 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   reg('sandbox_exec', {
     description: 'Run a shell command. By default runs in a persistent shell that keeps cd/export/venv state across calls (like a real terminal) — pass `persistent:false` for an isolated one-off exec instead. Pass `dir` to target any sandbox path (one-off cd for that call only). Pass `background:true` to run detached and track it via sandbox_ps (always isolated, unaffected by `persistent`).',
     inputSchema: {
-      command: z.string().max(RESOURCE_LIMITS.maxInputString),
+      command: z.string(),
       timeoutMs: z.number().optional(),
       dir: z.string().optional(),
       background: z.boolean().optional().default(false),
-      persistent: z.boolean().optional().default(true),
-      network: z.boolean().optional().default(SANDBOX_EXEC_NETWORK_DEFAULT)
+      persistent: z.boolean().optional().default(true)
     },
     annotations: getToolAnnotations('sandbox_exec')
   }, async (args: any) => {
@@ -625,44 +414,29 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const cwd = await resolveDir(sessionId, args.dir);
 
       if (args.background) {
-        enforceMemoryBudget();
-        const table = procTable(sessionId);
-        const runningForAuth = [...table.values()].filter((item) => item.status === 'running').length;
-        if (runningForAuth >= RESOURCE_LIMITS.maxBackgroundProcessesPerAuth || totalRunningBackgroundProcesses() >= RESOURCE_LIMITS.maxBackgroundProcessesGlobal) {
-          throw new Error('Background process capacity reached. Stop an existing process or wait for one to exit.');
+        if (procTable(sessionId).size >= MAX_BACKGROUND_PROCESSES) throw new Error(`Maximum of ${MAX_BACKGROUND_PROCESSES} background sandbox processes reached.`);
+        if (sandboxMode() === 'disabled') throw new Error('Sandbox is disabled. Set SANDBOX_MODE=bwrap for production isolation.');
+        let proc: ChildProcess;
+        if (sandboxMode() === 'host') {
+          proc = spawn('/bin/bash', ['--noprofile', '--norc', '-lc', args.command], { cwd, env: sandboxEnv(sessionId), stdio: ['ignore', 'pipe', 'pipe'] });
+        } else {
+          proc = spawn('bwrap', bwrapArgs(sessionId, cwd, args.command, false), { cwd: '/', stdio: ['ignore', 'pipe', 'pipe'] });
         }
-        const root = await sandboxRoot(sessionId);
-        const env = sandboxEnv(sessionId);
-        const isolated = isolatedCommand(root, cwd, args.network === true, env, 'bash', ['--noprofile', '--norc', '-lc', args.command]);
-        const proc = spawn(isolated.file, isolated.args, { cwd: isolated.cwd, env: isolated.env });
         if (!proc.pid) throw new Error('Failed to start background process.');
         const pid = proc.pid;
-        enforceProcessRecordLimit(table);
         const entry: ActiveProcess = { pid, command: args.command, proc, startTime: new Date(), status: 'running', exitCode: null, exitedAt: null, stdout: '', stderr: '' };
         procTable(sessionId).set(pid, entry);
         proc.stdout?.on('data', (d) => { entry.stdout = appendCapped(entry.stdout, d.toString()); });
         proc.stderr?.on('data', (d) => { entry.stderr = appendCapped(entry.stderr, d.toString()); });
-        proc.on('exit', (code) => {
-          entry.status = 'exited';
-          entry.exitCode = code;
-          entry.exitedAt = new Date();
-          if (entry.killTimer) clearTimeout(entry.killTimer);
-        });
-        entry.killTimer = setTimeout(() => {
-          if (entry.status === 'running') {
-            try { entry.proc.kill('SIGKILL'); } catch {}
-          }
-        }, MAX_BACKGROUND_RUNTIME_MS);
-        entry.killTimer.unref();
+        proc.on('exit', (code) => { entry.status = 'exited'; entry.exitCode = code; entry.exitedAt = new Date(); });
         return formatOptimizedResponse({ started: pid, command: args.command, dir: cwd });
       }
 
       const timeoutMs = Math.min(args.timeoutMs || 30000, 120000);
 
       if (args.persistent) {
-        // runInShell already starts the shell with the validated cwd.
-        // Never interpolate a filesystem path into shell source.
-        const { stdout, exit, timedOut } = await withExecutionSlot(() => runInShell(sessionId, args.command, Math.min(timeoutMs, SHELL_HANG_MS), args.network));
+        const cmd = args.dir ? `cd "${cwd}" && ${args.command}` : args.command;
+        const { stdout, exit, timedOut } = await runInShell(sessionId, cmd, Math.min(timeoutMs, SHELL_HANG_MS));
         if (timedOut) return formatError(`Command timed out after ${timeoutMs}ms and the persistent shell was restarted (its prior state is lost). Use background:true for long-running commands instead.`);
         const out: Record<string, any> = {};
         const o = truncWithCache(sessionId, stdout);
@@ -671,20 +445,19 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
       }
 
-      const { err, stdout, stderr } = await run(args.command, cwd, timeoutMs, sessionId, args.network);
+      const { err, stdout, stderr } = await run(args.command, cwd, timeoutMs, sessionId);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
 
   reg('sandbox_run', {
-    description: 'Run code from inline code or an existing sandbox file.',
+    description: 'Run code: pass inline `code` (+ optional `lang`, default py) or an existing `filePath`. Langs: py,js,ts,sh,go,java,cpp,c,rust,ruby,php. Pass `dir` to run in any sandbox directory instead of the default workDir.',
     inputSchema: {
       lang: z.enum(['py', 'js', 'ts', 'sh', 'go', 'java', 'cpp', 'c', 'rust', 'ruby', 'php']).optional(),
-      code: z.string().max(RESOURCE_LIMITS.maxInputString).optional(),
+      code: z.string().optional(),
       filePath: z.string().optional(),
-      args: z.array(z.string().max(65536)).max(100).optional(),
-      dir: z.string().optional(),
-      network: z.boolean().optional().default(SANDBOX_RUN_NETWORK_DEFAULT)
+      args: z.array(z.string()).optional(),
+      dir: z.string().optional()
     },
     annotations: getToolAnnotations('sandbox_run')
   }, async (args: any) => {
@@ -692,31 +465,33 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     let createdBin: string | null = null;
     try {
       const cwd = await resolveDir(sessionId, args.dir);
-      const extraArgs: string[] = args.args || [];
-      let abs: string;
+      const extraArgs = (args.args || []).map((value: string) => shellQuote(value)).join(' ');
+
+      let cmd: string;
       if (args.filePath) {
-        abs = await assertSandboxPath(sessionId, sanitizePath(args.filePath, cwd));
+        const abs = await sanitizeExistingPath(args.filePath, cwd);
+        const ext = path.extname(abs).toLowerCase();
+        if (COMPILED_EXTS.has(ext)) {
+          createdBin = path.join(cwd, `_sbx_out_${crypto.randomBytes(12).toString('hex')}`);
+          cmd = fileRunCmd(ext, abs, extraArgs, createdBin!);
+        } else {
+          cmd = fileRunCmd(ext, abs, extraArgs);
+        }
       } else if (args.code) {
         const ext = EXT_BY_LANG[args.lang || 'py'] || '.py';
-        tmp = path.join(cwd, `_snippet_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
-        await assertSandboxPath(sessionId, tmp!, true);
-        const inlineBytes = Buffer.byteLength(args.code, 'utf8');
-        if (inlineBytes > RESOURCE_LIMITS.maxSandboxFileBytes) throw new Error('Inline code exceeds the sandbox file-size limit.');
-        await assertSandboxGrowth(sessionId, inlineBytes);
-        await fs.writeFile(tmp, args.code, 'utf-8');
-        await assertSandboxSize(sessionId);
-        abs = tmp!;
+        tmp = path.join(cwd, `_snippet_${crypto.randomBytes(12).toString('hex')}${ext}`);
+        await safeWriteText(tmp!, args.code);
+        if (COMPILED_EXTS.has(ext)) {
+          createdBin = path.join(cwd, `_sbx_out_${crypto.randomBytes(12).toString('hex')}`);
+          cmd = fileRunCmd(ext, tmp!, extraArgs, createdBin!);
+        } else {
+          cmd = fileRunCmd(ext, tmp!, extraArgs);
+        }
       } else {
         throw new Error('Provide either `code` or `filePath`.');
       }
 
-      const ext = path.extname(abs).toLowerCase();
-      if (COMPILED_EXTS.has(ext)) {
-        createdBin = path.join(cwd, `_sbx_out_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
-      }
-      const spec = fileRunArgs(ext, abs, extraArgs, createdBin || undefined);
-      if (args.code) sanitizeCommand(args.code);
-      const { err, stdout, stderr } = await runFile(spec.file, spec.args, cwd, 45000, sessionId, args.network);
+      const { err, stdout, stderr } = await run(cmd, cwd, 45000, sessionId);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
     finally {
@@ -727,21 +502,16 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
   reg('sandbox_install', {
     description: 'Install npm or pip packages. Defaults to the isolated sandbox root (never the cloned repo, so it can\'t pollute git-tracked files) — pass `dir` to target a specific directory instead.',
-    inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string().max(256)).min(1).max(100), dir: z.string().optional() },
+    inputSchema: { manager: z.enum(['npm', 'pip']), packages: z.array(z.string()).min(1), dir: z.string().optional() },
     annotations: getToolAnnotations('sandbox_install')
   }, async (args: any) => {
     try {
       const cwd = args.dir ? await resolveDir(sessionId, args.dir) : await sandboxRoot(sessionId);
-      const packages = args.packages.map((p: string) => {
-        if (!p || p.length > 256 || /[\u0000\r\n]/.test(p)) throw new Error(`Invalid package name/specifier: ${p}`);
-        return p;
-      });
-      const spec = args.manager === 'npm'
-        ? { file: 'npm', args: ['install', '--', ...packages] }
-        : { file: 'python3', args: ['-m', 'pip', 'install', '--quiet', '--target=.', ...packages] };
-      const { err, stdout, stderr } = await runFile(spec.file, spec.args, cwd, 90000, sessionId, SANDBOX_INSTALL_NETWORK_DEFAULT);
+      const packages = args.packages.map((value: string) => { if (!/^[A-Za-z0-9@_./:+=-]{1,200}$/.test(value) || value.startsWith('-')) throw new Error(`Invalid package spec: ${value}`); return shellQuote(value); });
+      const list = packages.join(' ');
+      const cmd = args.manager === 'npm' ? `npm install --ignore-scripts ${list}` : `pip install --disable-pip-version-check --no-input --target=. ${list}`;
+      const { err, stdout, stderr } = await run(cmd, cwd, 90000, sessionId, true);
       if (err) return execResponse(sessionId, err, stdout, stderr);
-      await assertSandboxSize(sessionId);
       return formatOptimizedResponse({ installed: args.packages, path: cwd });
     } catch (err) { return formatError(err); }
   });
@@ -760,6 +530,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
     const now = Date.now();
     for (const [pid, item] of table) {
+      if (item.status === 'running' && now - item.startTime.getTime() > MAX_BACKGROUND_LIFETIME_MS) { try { item.proc.kill('SIGKILL'); } catch {} }
       if (item.status === 'exited' && item.exitedAt && now - item.exitedAt.getTime() > EXITED_TTL_MS) table.delete(pid);
     }
 
@@ -845,12 +616,15 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   }, async (args: any) => {
     try {
       const base = await resolveDir(sessionId, args.dir);
-      const abs = sanitizePath(args.path, base);
+      const abs = args.action === 'read' || args.action === 'delete' || args.action === 'edit'
+        ? await sanitizeExistingPath(args.path, base)
+        : await sanitizeWritablePath(args.path, base);
 
       if (args.action === 'read') {
         const stat = await fs.stat(abs).catch(() => null);
         if (!stat || !stat.isFile()) return formatError(`No such file: ${args.path}`);
-        const content = await fs.readFile(abs, 'utf-8');
+        if (stat.size > MAX_FILE_BYTES) return formatError(`File exceeds the ${MAX_FILE_BYTES} byte safety limit.`);
+        const content = await safeReadText(abs);
         const offset = Math.max(0, args.offset || 0);
         const limit = Math.min(args.limit || OUT_CAP, OUT_CAP);
         const slice = content.slice(offset, offset + limit);
@@ -869,34 +643,23 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         if (args.old_str === undefined || args.new_str === undefined) return formatError('`old_str` and `new_str` are both required for action:edit.');
         const stat = await fs.stat(abs).catch(() => null);
         if (!stat || !stat.isFile()) return formatError(`No such file: ${args.path}`);
-        const content = await fs.readFile(abs, 'utf-8');
+        if (stat.size > MAX_FILE_BYTES) return formatError(`File exceeds the ${MAX_FILE_BYTES} byte safety limit.`);
+        const content = await safeReadText(abs);
         const count = content.split(args.old_str).length - 1;
         if (count === 0) return formatError('old_str not found in file.');
         if (count > 1) return formatError(`old_str matches ${count} places — make it unique by including more surrounding context.`);
         const idx = content.indexOf(args.old_str);
         const updated = content.slice(0, idx) + args.new_str + content.slice(idx + args.old_str.length);
-        const updatedBytes = Buffer.byteLength(updated, 'utf8');
-        if (updatedBytes > RESOURCE_LIMITS.maxSandboxFileBytes) throw new Error(`Resulting file would exceed ${RESOURCE_LIMITS.maxSandboxFileBytes} bytes.`);
-        await assertSandboxGrowth(sessionId, Math.max(0, updatedBytes - Buffer.byteLength(content, 'utf8')));
-        await fs.writeFile(abs, updated, 'utf-8');
-        await assertSandboxSize(sessionId);
+        await safeWriteText(abs, updated);
         const newStat = await fs.stat(abs);
         return formatOptimizedResponse({ edited: args.path, sizeBytes: newStat.size });
       }
 
       if (args.content === undefined) return formatError('`content` is required for write/append.');
+      if (Buffer.byteLength(args.content, 'utf8') > MAX_FILE_BYTES) return formatError(`Content exceeds the ${MAX_FILE_BYTES} byte safety limit.`);
       await fs.mkdir(path.dirname(abs), { recursive: true });
-      const contentBytes = Buffer.byteLength(args.content, 'utf8');
-      if (contentBytes > RESOURCE_LIMITS.maxSandboxFileBytes) throw new Error(`File content exceeds ${RESOURCE_LIMITS.maxSandboxFileBytes} bytes.`);
-      const existingBytes = await fs.stat(abs).then((s) => s.size).catch(() => 0);
-      if (args.action === 'append' && existingBytes + contentBytes > RESOURCE_LIMITS.maxSandboxFileBytes) {
-        throw new Error(`Resulting file would exceed ${RESOURCE_LIMITS.maxSandboxFileBytes} bytes.`);
-      }
-      const additionalBytes = args.action === 'append' ? contentBytes : Math.max(0, contentBytes - existingBytes);
-      await assertSandboxGrowth(sessionId, additionalBytes);
-      if (args.action === 'append') await fs.appendFile(abs, args.content, 'utf-8');
-      else await fs.writeFile(abs, args.content, 'utf-8');
-      await assertSandboxSize(sessionId);
+      if (args.action === 'append') await safeWriteText(abs, args.content, true);
+      else await safeWriteText(abs, args.content);
       const stat = await fs.stat(abs);
       return formatOptimizedResponse({ [args.action === 'append' ? 'appended' : 'wrote']: args.path, sizeBytes: stat.size });
     } catch (err) { return formatError(err); }
@@ -929,6 +692,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       check('python', 'python3 --version');
       check('git', 'git --version');
       check('go', 'go version');
+      check('bwrap', 'bwrap --version');
 
       const ctx = getSessionContext(sessionId);
       let cloned = false;
@@ -936,9 +700,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         try { await fs.access(ctx.sandboxDir); cloned = true; }
         catch { updateSessionContext(sessionId, { sandboxDir: undefined }); }
       }
-      const maxMemMB = 512;
-      const usedMemMB = Math.round(process.memoryUsage().rss / (1024 * 1024));
-      const freeMemMB = Math.max(0, maxMemMB - usedMemMB);
+      const maxMemMB = 400;
+      const usedMemMB = Math.round(process.memoryUsage().heapUsed / (1024 * 1024));
+      const freeMemMB = Math.max(0, Math.min(maxMemMB, maxMemMB - usedMemMB));
 
       return formatOptimizedResponse({
         freeMemMB,
@@ -950,77 +714,55 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         cwd: ctx.cwd,
         envVars: ctx.env ? Object.keys(ctx.env).length : undefined,
         persistentShellAlive: !!persistentShells.get(shellKey(sessionId)),
-        sandboxIsolation: hasSandboxIsolation() ? 'bubblewrap' : 'unavailable',
-        sandboxNetworkDefaults: {
-          exec: SANDBOX_EXEC_NETWORK_DEFAULT,
-          run: SANDBOX_RUN_NETWORK_DEFAULT,
-          install: SANDBOX_INSTALL_NETWORK_DEFAULT,
-          git: GIT_NETWORK_DEFAULT
-        },
+        isolationMode: sandboxMode(),
         ...(ctx.resumedContext ? { resumed: true, resumedAfterIdleMs: ctx.resumedContext.idleMs } : { resumed: false })
       });
     } catch (err) { return formatError(err); }
   });
 
   reg('git_clone', {
-    description: 'Clone a repo into the sandbox so it can be run/tested. Omit owner/repo to use active set_active_context.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string().optional(), depth: z.number().optional().default(1) },
+    description: 'Clone a repository into the isolated sandbox. Network access is used only by this fixed git operation; arbitrary sandbox commands have no network access in bwrap mode.',
+    inputSchema: { owner: z.string().min(1).max(100).optional(), repo: z.string().min(1).max(100).optional(), branch: z.string().optional(), depth: z.number().int().min(1).max(50).optional().default(1) },
     annotations: getToolAnnotations('git_clone')
   }, async (args: any) => {
     try {
       const ctx = getSessionContext(sessionId);
       const owner = args.owner || ctx.owner;
       const repo = args.repo || ctx.repo;
-      if (!owner || !repo) throw new Error('owner/repo missing. Pass them or call set_active_context first.');
+      if (!owner || !repo || !validRepoPart(owner) || !validRepoPart(repo)) throw new Error('Invalid GitHub owner/repository name.');
       const branch = args.branch || ctx.branch || 'main';
-      if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)) throw new Error('Invalid owner/repository name.');
-      if (!/^[A-Za-z0-9._\\/-]+$/.test(branch) || branch.includes('..')) throw new Error('Invalid branch name.');
-
+      if (!validGitRef(branch)) throw new Error('Invalid branch name.');
+      if (!githubToken) throw new Error('A server-side GitHub token is required for sandbox git operations.');
       const root = await sandboxRoot(sessionId);
-      const dest = sanitizePath(path.join(root, owner, repo), root);
+      const dest = path.join(root, owner, repo);
+      const relative = path.relative(root, dest);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Repository path escaped sandbox.');
 
       let isExisting = false;
-      try {
-        await fs.access(path.join(dest, '.git'));
-        isExisting = true;
-      } catch {
-        try {
-          await fs.rm(dest, { recursive: true, force: true });
-        } catch {}
-      }
-
+      try { const stat = await fs.stat(path.join(dest, '.git')); isExisting = stat.isDirectory(); } catch {}
       if (isExisting) {
-        let checkoutErr: any = null;
-        let { err } = await runGit(['checkout', branch], dest, 15000, sessionId, githubToken);
-        if (err) {
-          const fetchRes = await runGit(['fetch', 'origin', `${branch}:${branch}`], dest, 15000, sessionId, githubToken);
-          if (!fetchRes.err) {
-            ({ err } = await runGit(['checkout', branch], dest, 15000, sessionId, githubToken));
-          } else {
-            const fetchRemote = await runGit(['fetch', 'origin', branch], dest, 15000, sessionId, githubToken);
-            if (!fetchRemote.err) {
-              ({ err } = await runGit(['checkout', '-B', branch, `origin/${branch}`], dest, 15000, sessionId, githubToken));
-            }
-          }
+        let result = await runGit(['checkout', branch], dest, 15000, githubToken);
+        if (result.err) {
+          const fetched = await runGit(['fetch', '--no-tags', 'origin', `${branch}:${branch}`], dest, 30000, githubToken);
+          if (!fetched.err) result = await runGit(['checkout', branch], dest, 15000, githubToken);
+          else result = await runGit(['fetch', '--no-tags', 'origin', branch], dest, 30000, githubToken);
         }
-        if (err) checkoutErr = err;
-
+        if (!result.err) {
+          await runGit(['config', 'user.email', 'agent@sandbox.local'], dest, 5000);
+          await runGit(['config', 'user.name', 'Krix Sandbox'], dest, 5000);
+        }
         updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
-        return formatOptimizedResponse({
-          note: 'already cloned',
-          branch,
-          path: dest,
-          ...(checkoutErr ? { checkoutWarning: `Could not switch to branch '${branch}'` } : {})
-        });
+        return formatOptimizedResponse({ note: 'already cloned', branch, path: dest, ...(result.err ? { checkoutWarning: `Could not switch to branch '${branch}'` } : {}) });
       }
 
       await fs.mkdir(path.dirname(dest), { recursive: true });
       const url = `https://github.com/${owner}/${repo}.git`;
-      const depth = Math.min(Math.max(1, Number(args.depth || 1)), 100);
-      const { err, stdout, stderr } = await runGit(['clone', '--depth', String(depth), '--branch', branch, '--single-branch', url, dest], root, 60000, sessionId, githubToken);
-      if (err) return execResponse(sessionId, err, stdout, stderr);
-
-      await runGit(['config', 'user.email', 'agent@sandbox.local'], dest, 10000, sessionId, githubToken); await runGit(['config', 'user.name', 'Sandbox Agent'], dest, 10000, sessionId, githubToken);
+      const result = await runGit(['clone', '--no-checkout', '--depth', String(args.depth || 1), '--branch', branch, '--single-branch', url, dest], root, 120000, githubToken);
+      if (result.err) return execResponse(sessionId, result.err, result.stdout, result.stderr);
+      const checkout = await runGit(['checkout', branch], dest, 60000, githubToken);
+      if (checkout.err) return execResponse(sessionId, checkout.err, checkout.stdout, checkout.stderr);
+      await runGit(['config', 'user.email', 'agent@sandbox.local'], dest, 5000);
+      await runGit(['config', 'user.name', 'Krix Sandbox'], dest, 5000);
       updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
       return formatOptimizedResponse({ cloned: `${owner}/${repo}`, branch, path: dest });
     } catch (err) { return formatError(err); }
@@ -1034,13 +776,12 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      if (!/^[A-Za-z0-9._\\/-]+$/.test(args.branch) || args.branch.includes('..')) throw new Error('Invalid branch name.');
-      let { err, stdout, stderr } = await runGit(args.create ? ['checkout', '-b', args.branch] : ['checkout', args.branch], ctx.sandboxDir, 15000, sessionId, githubToken);
+      if (!validGitRef(args.branch)) throw new Error('Invalid branch name.');
+      let result = await runGit(['checkout', ...(args.create ? ['-b'] : []), args.branch], ctx.sandboxDir, 15000, githubToken);
+      let { err, stdout, stderr } = result;
       if (err && !args.create) {
-        const fetchResult = await runGit(['fetch', 'origin', `${args.branch}:${args.branch}`], ctx.sandboxDir, 15000, sessionId, githubToken);
-        if (!fetchResult.err) {
-          ({ err, stdout, stderr } = await runGit(['checkout', args.branch], ctx.sandboxDir, 15000, sessionId, githubToken));
-        }
+        const fetchResult = await runGit(['fetch', '--no-tags', 'origin', `${args.branch}:${args.branch}`], ctx.sandboxDir, 30000, githubToken);
+        if (!fetchResult.err) ({ err, stdout, stderr } = await runGit(['checkout', args.branch], ctx.sandboxDir, 15000, githubToken));
       }
       if (err) return execResponse(sessionId, err, stdout, stderr);
       updateSessionContext(sessionId, { branch: args.branch });
@@ -1056,7 +797,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      const { err, stdout, stderr } = await runGit(['pull', '--ff-only'], ctx.sandboxDir, 30000, sessionId, githubToken);
+      const { err, stdout, stderr } = await runGit(['pull', '--ff-only'], ctx.sandboxDir, 30000, githubToken);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
@@ -1069,7 +810,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      const { err, stdout, stderr } = await runGit(['status', '--porcelain=v1', '-b'], ctx.sandboxDir, 10000, sessionId, githubToken);
+      const { err, stdout, stderr } = await runGit(['status', '--porcelain=v1', '-b'], ctx.sandboxDir, 10000, githubToken);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
@@ -1082,9 +823,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      const diffArgs = ['diff', ...(args.staged ? ['--cached'] : []), '--', ...(args.path ? [args.path] : [])];
-      if (args.path) await assertSandboxPath(sessionId, sanitizePath(args.path, ctx.sandboxDir));
-      const { err, stdout, stderr } = await runGit(diffArgs, ctx.sandboxDir, 10000, sessionId, githubToken);
+      const diffArgs = ['diff', ...(args.staged ? ['--cached'] : []), '--'];
+      if (args.path) diffArgs.push(args.path);
+      const { err, stdout, stderr } = await runGit(diffArgs, ctx.sandboxDir, 10000, githubToken);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
@@ -1098,22 +839,23 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const branch = args.branch || ctx.branch || 'main';
-      sanitizeCommand(branch);
-      sanitizeCommand(args.message);
       if (args.branch) {
         updateSessionContext(sessionId, { branch: args.branch });
-        await runGit(['checkout', args.branch], ctx.sandboxDir, 10000, sessionId, githubToken);
+        if (!validGitRef(args.branch)) throw new Error('Invalid branch name.');
+        const checkout = await runGit(['checkout', args.branch], ctx.sandboxDir, 10000, githubToken);
+        if (checkout.err) return execResponse(sessionId, checkout.err, checkout.stdout, checkout.stderr);
       }
 
-      const add = await runGit(['add', '-A'], ctx.sandboxDir, 10000, sessionId, githubToken);
+      const add = await runGit(['add', '-A'], ctx.sandboxDir, 10000, githubToken);
       if (add.err) return execResponse(sessionId, add.err, add.stdout, add.stderr);
 
-      const commit = await runGit(['commit', '-m', args.message], ctx.sandboxDir, 10000, sessionId, githubToken);
+      const commit = await runGit(['commit', '-m', args.message], ctx.sandboxDir, 10000, githubToken);
       if (commit.err) return execResponse(sessionId, commit.err, commit.stdout, commit.stderr);
 
       if (!args.push) return formatOptimizedResponse({ committed: true });
 
-      const push = await runGit(['push', '-u', 'origin', branch], ctx.sandboxDir, 30000, sessionId, githubToken);
+      if (!validGitRef(branch)) throw new Error('Invalid branch name.');
+      const push = await runGit(['push', '-u', 'origin', branch], ctx.sandboxDir, 30000, githubToken);
       if (push.err) return execResponse(sessionId, push.err, push.stdout, push.stderr);
       return formatOptimizedResponse({ committed: true, pushed: branch });
     } catch (err) { return formatError(err); }

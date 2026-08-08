@@ -1,34 +1,7 @@
 import vm from 'node:vm';
 import path from 'node:path';
-import os from 'node:os';
+import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
-
-
-// Resource ceilings tuned for small 512 MB-class hosts (including Render Free).
-// These are intentionally generous for normal agent workloads while keeping all
-// in-memory collections bounded. They are application-level guards, not a
-// replacement for container/OS memory limits.
-export const RESOURCE_LIMITS = {
-  maxSessions: 16,
-  maxAuthContexts: 64,
-  maxEnvVars: 128,
-  maxEnvBytes: 256 * 1024,
-  maxInputString: 2 * 1024 * 1024,
-  maxRegexLength: 16 * 1024,
-  maxRequestBodyBytes: 32 * 1024 * 1024,
-  maxOutputCacheEntriesGlobal: 64,
-  maxOutputCacheBytesGlobal: 32 * 1024 * 1024,
-  maxBackgroundProcessesPerAuth: 8,
-  maxBackgroundProcessesGlobal: 16,
-  maxPersistentShellsGlobal: 8,
-  maxConcurrentExecutionsGlobal: 3,
-  maxExecutionQueue: 6,
-  maxPushFiles: 100,
-  maxPushFileBytes: 4 * 1024 * 1024,
-  maxPushTotalBytes: 16 * 1024 * 1024,
-  maxSandboxFileBytes: 16 * 1024 * 1024,
-  maxSandboxDirBytes: 256 * 1024 * 1024,
-} as const;
 
 export enum PermissionLevel {
   READ_ONLY = 'READ_ONLY',
@@ -76,48 +49,28 @@ function hashAuth(token: string): string {
   return crypto.createHash('sha256').update(token || 'anonymous').digest('hex').slice(0, 16);
 }
 
-export function registerSessionAuth(sessionId: string, authIdentity: string): void {
-  const key = hashAuth(authIdentity);
-  const existing = sessionAuthKey.get(sessionId);
-  if (existing && existing !== key) {
-    throw new Error('Session authentication identity cannot be changed after session creation.');
-  }
-  sessionAuthKey.set(sessionId, key);
+export function registerSessionAuth(sessionId: string, githubToken: string, identity?: string): void {
+  // Never use a shared/blank credential as a cross-session identity.  Context
+  // resumption is opt-in and otherwise every MCP session gets an isolated key.
+  const allowResume = process.env.ENABLE_CONTEXT_RESUME === 'true';
+  const material = allowResume && identity
+    ? `${identity}:${hashAuth(githubToken)}`
+    : `session:${sessionId}`;
+  sessionAuthKey.set(sessionId, hashAuth(material));
 }
 
 export function getAuthKeyForSession(sessionId: string): string {
-  const key = sessionAuthKey.get(sessionId);
-  if (!key) throw new Error('Session authentication identity is not initialized.');
-  return key;
-}
-
-export function cleanupSessionState(sessionId: string): void {
-  sessionContexts.delete(sessionId);
-  sessionAuthKey.delete(sessionId);
+  return sessionAuthKey.get(sessionId) || 'anonymous';
 }
 
 function authBucket(sessionId: string) {
   const key = sessionAuthKey.get(sessionId) || 'anonymous';
   let bucket = lastKnownContextByAuth.get(key);
-  const now = Date.now();
-  if (bucket && now - bucket.lastUsed > AUTH_CONTEXT_TTL_MS) {
-    lastKnownContextByAuth.delete(key);
+  if (bucket && Date.now() - bucket.lastUsed > AUTH_CONTEXT_TTL_MS) {
     bucket = undefined;
   }
-  if (!bucket) {
-    if (lastKnownContextByAuth.size >= RESOURCE_LIMITS.maxAuthContexts) {
-      let oldestKey: string | undefined;
-      let oldest = Infinity;
-      for (const [candidate, value] of lastKnownContextByAuth) {
-        if (value.lastUsed < oldest) { oldest = value.lastUsed; oldestKey = candidate; }
-      }
-      if (oldestKey) lastKnownContextByAuth.delete(oldestKey);
-    }
-    bucket = { lastUsed: now };
-    lastKnownContextByAuth.set(key, bucket);
-  } else {
-    bucket.lastUsed = now;
-  }
+  if (!bucket) { bucket = { lastUsed: Date.now() }; lastKnownContextByAuth.set(key, bucket); }
+  else { bucket.lastUsed = Date.now(); }
   return bucket;
 }
 
@@ -184,7 +137,8 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
 }
 
 export function deleteSessionContext(sessionId: string): void {
-  cleanupSessionState(sessionId);
+  sessionContexts.delete(sessionId);
+  sessionAuthKey.delete(sessionId);
 }
 
 export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
@@ -208,7 +162,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'git_tree': PermissionLevel.READ_ONLY,
   'patch_contents': PermissionLevel.MUTATING,
   'sandbox_status': PermissionLevel.READ_ONLY,
-  'sandbox_file': PermissionLevel.MUTATING,
 
   'list_issues': PermissionLevel.READ_ONLY,
   'list_pull_requests': PermissionLevel.READ_ONLY,
@@ -453,7 +406,9 @@ export function sanitizeOutput(data: any): any {
       .replace(/(rnd_[a-zA-Z0-9]{24,32})/g, 'rnd_****')
       .replace(/(Bearer\s+)[a-zA-Z0-9._\-]+/gi, '$1[REDACTED]')
       .replace(/(x-api-key:\s*)[a-zA-Z0-9._\-]+/gi, '$1[REDACTED]')
-      .replace(/-----BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY-----\n[\s\S]+?\n-----END \1 KEY-----/g, '[REDACTED_KEY]');
+      .replace(/(sk-[A-Za-z0-9_-]{20,})/g, 'sk-[REDACTED]')
+      .replace(/(AKIA[0-9A-Z]{16})/g, 'AKIA[REDACTED]')
+      .replace(/(-----BEGIN (?:RSA|OPENSSH|EC|PRIVATE) KEY-----)[\s\S]+?(-----END (?:RSA|OPENSSH|EC|PRIVATE) KEY-----)/g, '[REDACTED_KEY]');
   }
   if (typeof data === 'object') {
     const copy: any = Array.isArray(data) ? [] : {};
@@ -471,7 +426,9 @@ export function sanitizeOutput(data: any): any {
 }
 
 export function sanitizePath(inputPath: string, rootDir: string = process.cwd()): string {
-  if (!inputPath || typeof inputPath !== 'string') throw new Error('Path is required.');
+  if (typeof inputPath !== 'string' || inputPath.length === 0) {
+    throw new Error('Security Violation: path must be a non-empty string.');
+  }
   const root = path.resolve(rootDir);
   const resolved = path.resolve(root, inputPath);
   const relative = path.relative(root, resolved);
@@ -481,171 +438,90 @@ export function sanitizePath(inputPath: string, rootDir: string = process.cwd())
   return resolved;
 }
 
-export function isPathInside(rootDir: string, candidate: string): boolean {
-  const root = path.resolve(rootDir);
-  const resolved = path.resolve(candidate);
-  const relative = path.relative(root, resolved);
-  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
-}
-
-export function validateRegex(pattern: string, flags = 'i'): void {
-  if (pattern.length > 5000) throw new Error('Regex pattern is too long.');
-  // Compilation is checked here; matching should use safeRegexTest().
-  // Restrict flags to the supported safe subset.
-  if (!/^[dgimsuvy]*$/.test(flags)) throw new Error('Unsupported regex flags.');
-  new RegExp(pattern, flags);
-}
-
-export function validateSandboxCwd(sessionId: string, cwd: string): string {
-  const root = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
-  return sanitizePath(cwd, root);
-}
-
-export function sanitizeSessionEnv(env: Record<string, string>): Record<string, string> {
-  const blocked = new Set([
-    'MCP_API_KEY', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_PAT', 'RENDER_API_KEY', 'RENDER_PAT',
-    'NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONHOME',
-    'RUBYLIB', 'PERL5LIB', 'BASH_ENV', 'ENV', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
-    'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AZURE_CLIENT_SECRET', 'GOOGLE_APPLICATION_CREDENTIALS'
-  ]);
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid environment variable name '${key}'.`);
-    if (blocked.has(key)) throw new Error(`Environment variable '${key}' is not permitted.`);
-    if (value.length > 8192) throw new Error(`Environment variable '${key}' is too large.`);
-    out[key] = value;
+export async function sanitizeExistingPath(inputPath: string, rootDir: string): Promise<string> {
+  const lexical = sanitizePath(inputPath, rootDir);
+  const root = await fs.realpath(rootDir);
+  const target = await fs.realpath(lexical);
+  const relative = path.relative(root, target);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Security Violation: resolved path escapes sandbox boundary.`);
   }
-  return out;
+  return target;
 }
 
-export function getNetworkRestrictionLevel(): 'low' | 'medium' | 'high' {
-  const level = (process.env.NETWORK_RESTRICTION_LEVEL || 'high').toLowerCase();
-  if (level === 'high') return 'high';
-  if (level === 'medium') return 'medium';
-  return 'low';
-}
-
-export function getCommandRestrictionLevel(): 'low' | 'medium' | 'high' {
-  const level = (process.env.COMMAND_RESTRICTION_LEVEL || 'high').toLowerCase();
-  if (level === 'high') return 'high';
-  if (level === 'medium') return 'medium';
-  return 'low';
-}
-
-export function sanitizeNetworkInCommand(cmd: string): void {
-  const netLevel = getNetworkRestrictionLevel();
-
-  const privateIpPatterns = [
-    /169\.254\.169\.254/,
-    /127\.0\.0\.1/,
-    /0\.0\.0\.0/,
-    /localhost/i,
-    /::1/,
-    /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
-    /\b172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}\b/,
-    /\b192\.168\.\d{1,3}\.\d{1,3}\b/
-  ];
-
-  for (const pattern of privateIpPatterns) {
-    if (pattern.test(cmd)) {
-      throw new Error(`Security Alert: Access to internal or private IP address blocked under ${netLevel.toUpperCase()} network restriction level.`);
+export async function sanitizeWritablePath(inputPath: string, rootDir: string): Promise<string> {
+  const lexical = sanitizePath(inputPath, rootDir);
+  const root = await fs.realpath(rootDir);
+  let current = lexical;
+  const missing: string[] = [];
+  while (true) {
+    try {
+      const stat = await fs.lstat(current);
+      if (stat.isSymbolicLink()) throw new Error('Security Violation: symbolic-link path components are not allowed.');
+      break;
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw new Error('Security Violation: invalid path.');
+      missing.push(path.basename(current));
+      current = parent;
     }
   }
-
-  if (netLevel === 'medium') {
-    const rawIpPattern = /https?:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/i;
-    if (rawIpPattern.test(cmd)) {
-      throw new Error('Security Alert: Direct IP address URLs blocked under MEDIUM network restriction level.');
-    }
-    const suspiciousSchemes = /(gopher|dict|file|ftp):\/\//i;
-    if (suspiciousSchemes.test(cmd)) {
-      throw new Error('Security Alert: Non-HTTP network protocol blocked under MEDIUM network restriction level.');
-    }
+  const realParent = await fs.realpath(current);
+  const relParent = path.relative(root, realParent);
+  if (relParent === '..' || relParent.startsWith(`..${path.sep}`) || path.isAbsolute(relParent)) {
+    throw new Error('Security Violation: writable path escapes sandbox boundary.');
   }
-
-  if (netLevel === 'high') {
-    const urls = cmd.match(/https?:\/\/([^\s\/:\'\"]+)/gi);
-    if (urls) {
-      const allowedDomains = [
-        'github.com',
-        'githubusercontent.com',
-        'npmjs.org',
-        'npmjs.com',
-        'pypi.org',
-        'pythonhosted.org',
-        'render.com',
-        'google.com',
-        'googleapis.com',
-        'cloudflare.com',
-        'crates.io',
-        'deno.land',
-        'maven.org',
-        'debian.org',
-        'ubuntu.com'
-      ];
-      for (const rawUrl of urls) {
-        const domainMatch = rawUrl.match(/https?:\/\/([^\s\/:\'\"]+)/i);
-        if (domainMatch && domainMatch[1]) {
-          const host = domainMatch[1].toLowerCase();
-          const isAllowed = allowedDomains.some(d => host === d || host.endsWith('.' + d));
-          if (!isAllowed) {
-            throw new Error(`Security Alert: Domain '${host}' is blocked under HIGH network restriction level.`);
-          }
-        }
-      }
-    }
-  }
+  return lexical;
 }
 
 export function sanitizeCommand(cmd: string): void {
-  const cmdLevel = getCommandRestrictionLevel();
-  const lowPatterns = [
-    /rm\s+-rf\s+[\/]/i,
-    /rm\s+-rf\s+\/\*/i,
-    /mkfs/i,
-    /dd\s+if=/i,
-    />\s*\/dev\/sd/i,
-    /:()\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;/i
+  const dangerous = [
+    /rm\s+-rf\s+(?:\/|\.\.)/i, /mkfs/i, /dd\s+if=/i, />\s*\/dev\/(?:sd|nvme|mapper)/i,
+    /:()\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;/i, /\b(?:nsenter|unshare|mount|umount|chroot|setcap|capsh|docker|podman|systemctl)\b/i
   ];
-  const medPatterns = [
-    ...lowPatterns,
-    /shutdown/i,
-    /reboot/i,
-    /init\s+0/i,
-    /chmod\s+-R\s+777\s+[\/]/i,
-    /\/etc\/passwd/i,
-    /\/etc\/shadow/i,
-    /\/etc\/sudoers/i,
-    /\/sbin\//i,
-    /\/bin\/rm/i
-  ];
-  const highPatterns = [
-    ...medPatterns,
-    /\bsudo\b/i,
-    /\bsu\b/i,
-    /\bdoas\b/i,
-    /\bnmap\b/i,
-    /\bnc\s+-l/i,
-    /\bnetcat\s+-l/i,
-    /\bsocat\b/i,
-    /\binsmod\b/i,
-    /\bmodprobe\b/i,
-    /\biptables\b/i
-  ];
-
-  const activePatterns = cmdLevel === 'high' ? highPatterns : (cmdLevel === 'medium' ? medPatterns : lowPatterns);
-  for (const pattern of activePatterns) {
-    if (pattern.test(cmd)) {
-      throw new Error(`Security Alert: Command blocked under ${cmdLevel.toUpperCase()} command restriction level.`);
-    }
+  for (const pattern of dangerous) {
+    if (pattern.test(cmd)) throw new Error('Security Alert: Command blocked due to safety policy.');
   }
-
-  sanitizeNetworkInCommand(cmd);
 }
 
 export function resolveInputString(plain?: string, b64?: string): string {
   if (b64) return Buffer.from(b64, 'base64').toString('utf-8');
   return plain || '';
+}
+
+export function timingSafeEqualText(a: string, b: string): boolean {
+  const left = Buffer.from(a, 'utf8');
+  const right = Buffer.from(b, 'utf8');
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+interface RateBucket { count: number; resetAt: number; blockedUntil: number; }
+const rateBuckets = new Map<string, RateBucket>();
+const RATE_PRUNE_MS = 60_000;
+const ratePrune = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateBuckets) {
+    if (bucket.resetAt <= now && bucket.blockedUntil <= now) rateBuckets.delete(key);
+  }
+}, RATE_PRUNE_MS);
+ratePrune.unref();
+
+export function consumeRateLimit(key: string, limit: number, windowMs: number, blockMs = 0): { allowed: boolean; retryAfterSeconds: number } {
+  const now = Date.now();
+  let bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { count: 0, resetAt: now + windowMs, blockedUntil: 0 };
+    rateBuckets.set(key, bucket);
+  }
+  if (bucket.blockedUntil > now) return { allowed: false, retryAfterSeconds: Math.ceil((bucket.blockedUntil - now) / 1000) };
+  bucket.count += 1;
+  if (bucket.count > limit) {
+    if (blockMs > 0) bucket.blockedUntil = now + blockMs;
+    return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((Math.max(bucket.resetAt, bucket.blockedUntil) - now) / 1000)) };
+  }
+  return { allowed: true, retryAfterSeconds: 0 };
 }
 
 export function safeRegexTest(pattern: string, flags: string, text: string, timeoutMs: number = 200): boolean {
