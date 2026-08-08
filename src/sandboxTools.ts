@@ -1,5 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { exec, execSync, spawn, type ChildProcess } from 'node:child_process';
+import { exec, execFile, execSync, spawn, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -7,7 +7,7 @@ import os from 'node:os';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations,
-  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession
+  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession, isPathInside
 } from './security.js';
 
 interface ActiveProcess {
@@ -107,16 +107,22 @@ function execResponse(sessionId: string, err: any, stdout: string, stderr: strin
 }
 
 function sandboxEnv(sessionId?: string): NodeJS.ProcessEnv {
-  const safeHome = path.join(os.tmpdir(), 'krix_home');
-  try { require('node:fs').mkdirSync(safeHome, { recursive: true }); } catch {}
+  const authKey = sessionId ? getAuthKeyForSession(sessionId) : 'anonymous';
+  const safeHome = path.join(os.tmpdir(), `krix_home_${authKey}`);
   const sessionEnv = sessionId ? (getSessionContext(sessionId).env || {}) : {};
-  return {
-    ...process.env,
-    HOME: safeHome,
-    npm_config_cache: path.join(safeHome, '.npm'),
-    NODE_OPTIONS: sessionEnv.NODE_OPTIONS || '--max-old-space-size=400',
-    ...sessionEnv,
-  };
+  const blocked = new Set([
+    'MCP_API_KEY', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_PAT', 'RENDER_API_KEY', 'RENDER_PAT',
+    'NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONHOME',
+    'RUBYLIB', 'PERL5LIB', 'BASH_ENV', 'ENV', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+    'GIT_SSH_COMMAND', 'GIT_ASKPASS'
+  ]);
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) if (!blocked.has(key)) env[key] = value;
+  for (const [key, value] of Object.entries(sessionEnv)) if (!blocked.has(key)) env[key] = String(value);
+  env.HOME = safeHome;
+  env.npm_config_cache = path.join(safeHome, '.npm');
+  env.GIT_TERMINAL_PROMPT = '0';
+  return env;
 }
 
 function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?: string): Promise<{ err: any; stdout: string; stderr: string }> {
@@ -125,20 +131,40 @@ function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?: stri
   });
 }
 
+function runFile(file: string, args: string[], cwd: string, timeout = 30000, sessionId?: string): Promise<{ err: any; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(file, args, { cwd, timeout, env: sandboxEnv(sessionId), ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+  });
+}
+
+async function assertSandboxPath(sessionId: string, candidate: string, allowMissing = false): Promise<string> {
+  const root = await sandboxRoot(sessionId);
+  const abs = sanitizePath(candidate, root);
+  const rootReal = await fs.realpath(root);
+  try {
+    const targetReal = await fs.realpath(abs);
+    if (!isPathInside(rootReal, targetReal)) throw new Error('Security Violation: symlink/path escapes sandbox.');
+  } catch (err: any) {
+    if (!allowMissing || err?.message?.includes('escapes sandbox')) throw err;
+    const parentReal = await fs.realpath(path.dirname(abs));
+    if (!isPathInside(rootReal, parentReal)) throw new Error('Security Violation: path parent escapes sandbox.');
+  }
+  return abs;
+}
+
 async function sandboxRoot(sessionId: string): Promise<string> {
   const dir = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
-  await fs.mkdir(dir, { recursive: true });
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const stat = await fs.lstat(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Sandbox root is not a trusted directory.');
+  try { await fs.chmod(dir, 0o700); } catch {}
   return dir;
 }
 
 async function workDir(sessionId: string): Promise<string> {
   const ctx = getSessionContext(sessionId);
-  if (ctx.cwd) {
-    try { await fs.access(ctx.cwd); return ctx.cwd; } catch {}
-  }
-  if (ctx.sandboxDir) {
-    try { await fs.access(ctx.sandboxDir); return ctx.sandboxDir; } catch {}
-  }
+  if (ctx.cwd) return assertSandboxPath(sessionId, ctx.cwd);
+  if (ctx.sandboxDir) return assertSandboxPath(sessionId, ctx.sandboxDir);
   return sandboxRoot(sessionId);
 }
 
@@ -147,7 +173,7 @@ async function resolveDir(sessionId: string, dir?: string): Promise<string> {
   const root = await sandboxRoot(sessionId);
   const target = sanitizePath(dir, root);
   await fs.mkdir(target, { recursive: true });
-  return target;
+  return assertSandboxPath(sessionId, target);
 }
 
 interface PersistentShell { proc: ChildProcess; buf: string; busy: boolean; }
@@ -247,28 +273,28 @@ export async function destroySandbox(sessionId: string, options: { deleteContext
   } catch {}
 }
 
-function fileRunCmd(ext: string, abs: string, extraArgs: string, binPath?: string): string {
+function fileRunArgs(ext: string, abs: string, extraArgs: string[], binPath?: string): { file: string; args: string[] } {
   switch (ext) {
-    case '.py': return `python3 "${abs}" ${extraArgs}`;
-    case '.js': return `node "${abs}" ${extraArgs}`;
-    case '.ts': return `npx -y tsx "${abs}" ${extraArgs}`;
-    case '.sh': return `bash "${abs}" ${extraArgs}`;
-    case '.go': return `go run "${abs}" ${extraArgs}`;
-    case '.java': return `java "${abs}" ${extraArgs}`;
+    case '.py': return { file: 'python3', args: [abs, ...extraArgs] };
+    case '.js': return { file: 'node', args: [abs, ...extraArgs] };
+    case '.ts': return { file: 'npx', args: ['-y', 'tsx', abs, ...extraArgs] };
+    case '.sh': return { file: 'bash', args: [abs, ...extraArgs] };
+    case '.go': return { file: 'go', args: ['run', abs, ...extraArgs] };
+    case '.java': return { file: 'java', args: [abs, ...extraArgs] };
     case '.cpp': {
       const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
-      return `g++ "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
+      return { file: 'sh', args: ['-c', 'g++ "$1" -o "$2" && "$2" "${@:3}"', '--', abs, bin, ...extraArgs] };
     }
     case '.c': {
       const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
-      return `gcc "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
+      return { file: 'sh', args: ['-c', 'gcc "$1" -o "$2" && "$2" "${@:3}"', '--', abs, bin, ...extraArgs] };
     }
     case '.rs': {
       const bin = binPath || path.join(path.dirname(abs), `_sbx_out_${Date.now()}`);
-      return `rustc -O "${abs}" -o "${bin}" && "${bin}" ${extraArgs}`;
+      return { file: 'sh', args: ['-c', 'rustc -O "$1" -o "$2" && "$2" "${@:3}"', '--', abs, bin, ...extraArgs] };
     }
-    case '.rb': return `ruby "${abs}" ${extraArgs}`;
-    case '.php': return `php "${abs}" ${extraArgs}`;
+    case '.rb': return { file: 'ruby', args: [abs, ...extraArgs] };
+    case '.php': return { file: 'php', args: [abs, ...extraArgs] };
     default: throw new Error(`Unsupported extension '${ext}'. Use py/js/ts/sh/go/java/cpp/c/rust/ruby/php.`);
   }
 }
@@ -276,10 +302,21 @@ function fileRunCmd(ext: string, abs: string, extraArgs: string, binPath?: strin
 const EXT_BY_LANG: Record<string, string> = { py: '.py', js: '.js', ts: '.ts', sh: '.sh', go: '.go', java: '.java', cpp: '.cpp', c: '.c', rust: '.rs', ruby: '.rb', php: '.php' };
 const COMPILED_EXTS = new Set(['.cpp', '.c', '.rs']);
 
-function authFlag(token?: string): string {
-  if (!token) return '';
-  const b64 = Buffer.from(`x-access-token:${token}`).toString('base64');
-  return `-c http.extraHeader="Authorization: Basic ${b64}" `;
+function gitEnv(sessionId: string, token?: string): NodeJS.ProcessEnv {
+  const env = sandboxEnv(sessionId);
+  if (token) {
+    const b64 = Buffer.from(`x-access-token:${token}`).toString('base64');
+    env.GIT_CONFIG_COUNT = '1';
+    env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
+    env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${b64}`;
+  }
+  return env;
+}
+
+function runGit(args: string[], cwd: string, timeout: number, sessionId: string, token?: string) {
+  return new Promise<{ err: any; stdout: string; stderr: string }>((resolve) => {
+    execFile('git', args, { cwd, timeout, env: gitEnv(sessionId, token), ...EXEC_LIMITS }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+  });
 }
 
 export function registerSandboxTools(server: McpServer, sessionId: string, githubToken: string | undefined, registry: Record<string, any>) {
@@ -331,12 +368,12 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('sandbox_run', {
-    description: 'Run code: pass inline `code` (+ optional `lang`, default py) or an existing `filePath`. Langs: py,js,ts,sh,go,java,cpp,c,rust,ruby,php. Pass `dir` to run in any sandbox directory instead of the default workDir.',
+    description: 'Run code from inline code or an existing sandbox file.',
     inputSchema: {
       lang: z.enum(['py', 'js', 'ts', 'sh', 'go', 'java', 'cpp', 'c', 'rust', 'ruby', 'php']).optional(),
       code: z.string().optional(),
       filePath: z.string().optional(),
-      args: z.array(z.string()).optional(),
+      args: z.array(z.string()).max(100).optional(),
       dir: z.string().optional()
     },
     annotations: getToolAnnotations('sandbox_run')
@@ -345,36 +382,27 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     let createdBin: string | null = null;
     try {
       const cwd = await resolveDir(sessionId, args.dir);
-      const extraArgs = (args.args || []).join(' ');
-
-      let cmd: string;
+      const extraArgs: string[] = args.args || [];
+      let abs: string;
       if (args.filePath) {
-        const abs = sanitizePath(args.filePath, cwd);
-        const ext = path.extname(abs).toLowerCase();
-        if (COMPILED_EXTS.has(ext)) {
-          createdBin = path.join(cwd, `_sbx_out_${Date.now()}`);
-          cmd = fileRunCmd(ext, abs, extraArgs, createdBin);
-        } else {
-          cmd = fileRunCmd(ext, abs, extraArgs);
-        }
+        abs = await assertSandboxPath(sessionId, sanitizePath(args.filePath, cwd));
       } else if (args.code) {
         const ext = EXT_BY_LANG[args.lang || 'py'] || '.py';
-        tmp = path.join(cwd, `_snippet_${Date.now()}${ext}`);
+        tmp = path.join(cwd, `_snippet_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
+        await assertSandboxPath(sessionId, tmp, true);
         await fs.writeFile(tmp, args.code, 'utf-8');
-        if (COMPILED_EXTS.has(ext)) {
-          createdBin = path.join(cwd, `_sbx_out_${Date.now()}`);
-          cmd = fileRunCmd(ext, tmp, extraArgs, createdBin);
-        } else {
-          cmd = fileRunCmd(ext, tmp, extraArgs);
-        }
+        abs = tmp!;
       } else {
         throw new Error('Provide either `code` or `filePath`.');
       }
 
+      const ext = path.extname(abs).toLowerCase();
+      if (COMPILED_EXTS.has(ext)) {
+        createdBin = path.join(cwd, `_sbx_out_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
+      }
+      const spec = fileRunArgs(ext, abs, extraArgs, createdBin || undefined);
       if (args.code) sanitizeCommand(args.code);
-      sanitizeCommand(cmd);
-
-      const { err, stdout, stderr } = await run(cmd, cwd, 45000, sessionId);
+      const { err, stdout, stderr } = await runFile(spec.file, spec.args, cwd, 45000, sessionId);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
     finally {
@@ -390,10 +418,14 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   }, async (args: any) => {
     try {
       const cwd = args.dir ? await resolveDir(sessionId, args.dir) : await sandboxRoot(sessionId);
-      const list = args.packages.join(' ');
-      const cmd = args.manager === 'npm' ? `npm install ${list}` : `pip install --quiet --target=. ${list}`;
-      sanitizeCommand(cmd);
-      const { err, stdout, stderr } = await run(cmd, cwd, 90000, sessionId);
+      const packages = args.packages.map((p: string) => {
+        if (!p || p.length > 256 || /[\u0000\r\n]/.test(p)) throw new Error(`Invalid package name/specifier: ${p}`);
+        return p;
+      });
+      const spec = args.manager === 'npm'
+        ? { file: 'npm', args: ['install', '--', ...packages] }
+        : { file: 'python3', args: ['-m', 'pip', 'install', '--quiet', '--target=.', ...packages] };
+      const { err, stdout, stderr } = await runFile(spec.file, spec.args, cwd, 90000, sessionId);
       if (err) return execResponse(sessionId, err, stdout, stderr);
       return formatOptimizedResponse({ installed: args.packages, path: cwd });
     } catch (err) { return formatError(err); }
@@ -606,10 +638,11 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const repo = args.repo || ctx.repo;
       if (!owner || !repo) throw new Error('owner/repo missing. Pass them or call set_active_context first.');
       const branch = args.branch || ctx.branch || 'main';
-      sanitizeCommand(branch);
+      if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)) throw new Error('Invalid owner/repository name.');
+      if (!/^[A-Za-z0-9._\\/-]+$/.test(branch) || branch.includes('..')) throw new Error('Invalid branch name.');
 
       const root = await sandboxRoot(sessionId);
-      const dest = path.join(root, owner, repo);
+      const dest = sanitizePath(path.join(root, owner, repo), root);
 
       let isExisting = false;
       try {
@@ -626,14 +659,13 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         const checkoutCmd = `git checkout ${branch}`;
         let { err } = await run(checkoutCmd, dest, 15000);
         if (err) {
-          const fetchCmd = `git ${authFlag(githubToken)}fetch origin ${branch}:${branch}`;
-          const fetchRes = await run(fetchCmd, dest, 15000);
+          const fetchRes = await runGit(['fetch', 'origin', `${branch}:${branch}`], dest, 15000, sessionId, githubToken);
           if (!fetchRes.err) {
-            ({ err } = await run(`git checkout ${branch}`, dest, 15000));
+            ({ err } = await runGit(['checkout', branch], dest, 15000, sessionId, githubToken));
           } else {
-            const fetchRemote = await run(`git ${authFlag(githubToken)}fetch origin ${branch}`, dest, 15000);
+            const fetchRemote = await runGit(['fetch', 'origin', branch], dest, 15000, sessionId, githubToken);
             if (!fetchRemote.err) {
-              ({ err } = await run(`git checkout -B ${branch} origin/${branch}`, dest, 15000));
+              ({ err } = await runGit(['checkout', '-B', branch, `origin/${branch}`], dest, 15000, sessionId, githubToken));
             }
           }
         }
@@ -650,12 +682,11 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
       await fs.mkdir(path.dirname(dest), { recursive: true });
       const url = `https://github.com/${owner}/${repo}.git`;
-      const cmd = `git ${authFlag(githubToken)}clone --depth ${args.depth || 1} --branch ${branch} --single-branch "${url}" "${dest}"`;
-      sanitizeCommand(cmd);
-      const { err, stdout, stderr } = await run(cmd, root, 60000);
+      const depth = Math.min(Math.max(1, Number(args.depth || 1)), 100);
+      const { err, stdout, stderr } = await runGit(['clone', '--depth', String(depth), '--branch', branch, '--single-branch', url, dest], root, 60000, sessionId, githubToken);
       if (err) return execResponse(sessionId, err, stdout, stderr);
 
-      await run(`git config user.email "agent@sandbox.local" && git config user.name "Sandbox Agent"`, dest);
+      await runGit(['config', 'user.email', 'agent@sandbox.local'], dest, 10000, sessionId, githubToken); await runGit(['config', 'user.name', 'Sandbox Agent'], dest, 10000, sessionId, githubToken);
       updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
       return formatOptimizedResponse({ cloned: `${owner}/${repo}`, branch, path: dest });
     } catch (err) { return formatError(err); }
@@ -669,14 +700,12 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      sanitizeCommand(args.branch);
-      const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
-      let { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
+      if (!/^[A-Za-z0-9._\\/-]+$/.test(args.branch) || args.branch.includes('..')) throw new Error('Invalid branch name.');
+      let { err, stdout, stderr } = await runGit(args.create ? ['checkout', '-b', args.branch] : ['checkout', args.branch], ctx.sandboxDir, 15000, sessionId, githubToken);
       if (err && !args.create) {
-        const fetchCmd = `git fetch origin ${args.branch}:${args.branch}`;
-        const fetchResult = await run(fetchCmd, ctx.sandboxDir, 15000);
+        const fetchResult = await runGit(['fetch', 'origin', `${args.branch}:${args.branch}`], ctx.sandboxDir, 15000, sessionId, githubToken);
         if (!fetchResult.err) {
-          ({ err, stdout, stderr } = await run(`git checkout ${args.branch}`, ctx.sandboxDir, 15000));
+          ({ err, stdout, stderr } = await runGit(['checkout', args.branch], ctx.sandboxDir, 15000, sessionId, githubToken));
         }
       }
       if (err) return execResponse(sessionId, err, stdout, stderr);
@@ -693,8 +722,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      const cmd = `git ${authFlag(githubToken)}pull --ff-only`;
-      const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 30000);
+      const { err, stdout, stderr } = await runGit(['pull', '--ff-only'], ctx.sandboxDir, 30000, sessionId, githubToken);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
@@ -707,7 +735,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
-      const { err, stdout, stderr } = await run('git status --porcelain=v1 -b', ctx.sandboxDir, 10000);
+      const { err, stdout, stderr } = await runGit(['status', '--porcelain=v1', '-b'], ctx.sandboxDir, 10000, sessionId, githubToken);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
@@ -751,7 +779,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
       if (!args.push) return formatOptimizedResponse({ committed: true });
 
-      const push = await run(`git ${authFlag(githubToken)}push -u origin ${branch}`, ctx.sandboxDir, 30000);
+      const push = await runGit(['push', '-u', 'origin', branch], ctx.sandboxDir, 30000, sessionId, githubToken);
       if (push.err) return execResponse(sessionId, push.err, push.stdout, push.stderr);
       return formatOptimizedResponse({ committed: true, pushed: branch });
     } catch (err) { return formatError(err); }

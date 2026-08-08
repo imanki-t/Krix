@@ -1,5 +1,6 @@
 import vm from 'node:vm';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 
 export enum PermissionLevel {
@@ -49,11 +50,23 @@ function hashAuth(token: string): string {
 }
 
 export function registerSessionAuth(sessionId: string, githubToken: string): void {
-  sessionAuthKey.set(sessionId, hashAuth(githubToken));
+  const key = hashAuth(githubToken);
+  const existing = sessionAuthKey.get(sessionId);
+  if (existing && existing !== key) {
+    throw new Error('Session authentication identity cannot be changed after session creation.');
+  }
+  sessionAuthKey.set(sessionId, key);
 }
 
 export function getAuthKeyForSession(sessionId: string): string {
-  return sessionAuthKey.get(sessionId) || 'anonymous';
+  const key = sessionAuthKey.get(sessionId);
+  if (!key) throw new Error('Session authentication identity is not initialized.');
+  return key;
+}
+
+export function cleanupSessionState(sessionId: string): void {
+  sessionContexts.delete(sessionId);
+  sessionAuthKey.delete(sessionId);
 }
 
 function authBucket(sessionId: string) {
@@ -130,8 +143,7 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
 }
 
 export function deleteSessionContext(sessionId: string): void {
-  sessionContexts.delete(sessionId);
-  sessionAuthKey.delete(sessionId);
+  cleanupSessionState(sessionId);
 }
 
 export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
@@ -417,11 +429,51 @@ export function sanitizeOutput(data: any): any {
 }
 
 export function sanitizePath(inputPath: string, rootDir: string = process.cwd()): string {
-  const resolved = path.resolve(rootDir, inputPath);
-  if (!resolved.startsWith(rootDir) && !resolved.startsWith('/tmp')) {
+  if (!inputPath || typeof inputPath !== 'string') throw new Error('Path is required.');
+  const root = path.resolve(rootDir);
+  const resolved = path.resolve(root, inputPath);
+  const relative = path.relative(root, resolved);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`Security Violation: Path '${inputPath}' escapes sandbox boundary.`);
   }
   return resolved;
+}
+
+export function isPathInside(rootDir: string, candidate: string): boolean {
+  const root = path.resolve(rootDir);
+  const resolved = path.resolve(candidate);
+  const relative = path.relative(root, resolved);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+export function validateRegex(pattern: string, flags = 'i'): void {
+  if (pattern.length > 5000) throw new Error('Regex pattern is too long.');
+  // Compilation is checked here; matching should use safeRegexTest().
+  // Restrict flags to the supported safe subset.
+  if (!/^[dgimsuvy]*$/.test(flags)) throw new Error('Unsupported regex flags.');
+  new RegExp(pattern, flags);
+}
+
+export function validateSandboxCwd(sessionId: string, cwd: string): string {
+  const root = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
+  return sanitizePath(cwd, root);
+}
+
+export function sanitizeSessionEnv(env: Record<string, string>): Record<string, string> {
+  const blocked = new Set([
+    'MCP_API_KEY', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_PAT', 'RENDER_API_KEY', 'RENDER_PAT',
+    'NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONHOME',
+    'RUBYLIB', 'PERL5LIB', 'BASH_ENV', 'ENV', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+    'GIT_SSH_COMMAND', 'GIT_ASKPASS'
+  ]);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid environment variable name '${key}'.`);
+    if (blocked.has(key)) throw new Error(`Environment variable '${key}' is not permitted.`);
+    if (value.length > 8192) throw new Error(`Environment variable '${key}' is too large.`);
+    out[key] = value;
+  }
+  return out;
 }
 
 export function getNetworkRestrictionLevel(): 'low' | 'medium' | 'high' {

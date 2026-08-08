@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import crypto from 'node:crypto';
 import { formatOptimizedResponse, formatError, getToolAnnotations, makeRegistrar } from './security.js';
 
 interface RenderSessionEntry { sessionId: string; lastActive: number; }
@@ -15,13 +16,16 @@ const renderSessionPruneTimer = setInterval(() => {
 }, RENDER_SESSION_PRUNE_INTERVAL_MS);
 renderSessionPruneTimer.unref();
 
+function renderCacheKey(renderToken: string): string { return crypto.createHash('sha256').update(renderToken).digest('hex'); }
+
 async function getRenderSession(renderToken: string): Promise<string> {
-  const cached = renderSessions.get(renderToken);
+  const cacheKey = renderCacheKey(renderToken);
+  const cached = renderSessions.get(cacheKey);
   if (cached && Date.now() - cached.lastActive <= RENDER_SESSION_TTL_MS) {
     cached.lastActive = Date.now();
     return cached.sessionId;
   }
-  if (cached) renderSessions.delete(renderToken);
+  if (cached) renderSessions.delete(cacheKey);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
@@ -36,9 +40,13 @@ async function getRenderSession(renderToken: string): Promise<string> {
       })
     });
     clearTimeout(timeoutId);
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Render MCP initialize failed (${response.status}): ${body.slice(0, 500)}`);
+    }
     const sessionId = response.headers.get('mcp-session-id');
     if (!sessionId) throw new Error('Render MCP missing session header.');
-    renderSessions.set(renderToken, { sessionId, lastActive: Date.now() });
+    renderSessions.set(cacheKey, { sessionId, lastActive: Date.now() });
     return sessionId;
   } catch (err) { clearTimeout(timeoutId); throw err; }
 }
@@ -47,16 +55,25 @@ async function callRenderTool(toolName: string, args: any, renderToken: string |
   if (!renderToken) return formatError(new Error('Render API key missing.'));
   try {
     const sessionId = await getRenderSession(renderToken);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
     const res = await fetch('https://mcp.render.com/mcp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${renderToken}`, 'Mcp-Session-Id': sessionId },
+      signal: controller.signal,
       body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { name: toolName, arguments: args }, id: `r-${Date.now()}` })
     });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      if (res.status === 401 || res.status === 403) renderSessions.delete(renderCacheKey(renderToken));
+      throw new Error(`Render MCP request failed (${res.status}): ${body.slice(0, 500)}`);
+    }
     const data: any = await res.json();
     if (data?.error) return formatError(new Error(data.error.message || JSON.stringify(data.error)));
     return formatOptimizedResponse(data?.result || data);
   } catch (err: any) {
-    renderSessions.delete(renderToken);
+    renderSessions.delete(cacheKey);
     return formatError(err);
   }
 }

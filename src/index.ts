@@ -86,11 +86,14 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const clientKey = (req.headers['x-api-key'] as string)
-    || req.headers['authorization']?.toString().replace('Bearer ', '')
-    || (req.query.api_key as string);
+  const authHeader = req.headers['authorization']?.toString() || '';
+  const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const clientKey = (req.headers['x-api-key'] as string) || bearer;
+  const expected = Buffer.from(MCP_API_KEY);
+  const provided = Buffer.from(clientKey || '');
+  const validKey = provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
 
-  if (clientKey !== MCP_API_KEY) {
+  if (!validKey) {
     res.status(401).json({
       jsonrpc: '2.0',
       error: { code: -32000, message: 'Unauthorized API Key.' },
@@ -106,8 +109,8 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   if (sessionId && transports.has(sessionId)) {
     const entry = transports.get(sessionId)!;
     entry.lastActive = Date.now();
-    registerSessionAuth(sessionId, githubToken);
     try {
+      registerSessionAuth(sessionId, githubToken);
       await entry.transport.handleRequest(req, res, req.body);
     } catch (error: any) {
       if (!res.headersSent) {
