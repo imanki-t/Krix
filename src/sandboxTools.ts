@@ -721,6 +721,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const cmd = `git diff ${args.staged ? '--cached ' : ''}-- ${args.path ? `"${args.path}"` : ''}`;
+      sanitizeCommand(cmd);
       const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 10000);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
