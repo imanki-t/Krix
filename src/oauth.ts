@@ -231,6 +231,9 @@ export function authorize(req: Request, res: Response): void {
       return;
     }
 
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+
     const hidden = (name: string, value: string) =>
       `<input type="hidden" name="${name}" value="${escapeHtml(value)}">`;
 
