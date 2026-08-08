@@ -262,7 +262,15 @@ Connect MCP clients (Antigravity, Claude Desktop, Cursor, or Custom SDKs) via St
 
 ## 🧠 Krix MCP Skill for AI Agents
 
-The repository includes a complete agentic workflow skill in [`skills/krix-mcp/SKILL.md`](skills/krix-mcp/SKILL.md) and detailed tool guides under [`skills/krix-mcp/references/`](skills/krix-mcp/references/). AI agents can import this skill to automatically direct and coordinate agentic coding, GitHub operations, surgical edits, and sandbox execution using Krix MCP tools.
+The repository includes a complete agentic workflow skill in [`skills/krix-mcp/SKILL.md`](skills/krix-mcp/SKILL.md) and detailed reference documentation under [`skills/krix-mcp/references/`](skills/krix-mcp/references/):
+
+- [`agentic-tools-guide.md`](skills/krix-mcp/references/agentic-tools-guide.md): 17 Agentic Remote GitHub tools
+- [`sandbox-tools-guide.md`](skills/krix-mcp/references/sandbox-tools-guide.md): 14 Sandbox execution and local Git CLI tools
+- [`workflows-and-best-practices.md`](skills/krix-mcp/references/workflows-and-best-practices.md): Multi-tool workflow patterns and safety directives
+- [`render-tools-guide.md`](skills/krix-mcp/references/render-tools-guide.md): 21 Render cloud infrastructure tools
+- [`github-extended-tools-guide.md`](skills/krix-mcp/references/github-extended-tools-guide.md): 32 Extended GitHub tools (Issues, PRs, Reviews, Teams, Admin)
+
+AI agents can import this skill to automatically direct and coordinate agentic coding, GitHub operations, surgical edits, sandbox execution, and Render cloud management using Krix MCP tools.
 
 ---
 
