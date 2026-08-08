@@ -288,6 +288,13 @@ export function authorize(req: Request, res: Response): void {
       return;
     }
 
+    // Determine primary client logo (logo_uri or auto-detected logo for Claude)
+    const logoUrl = client.logo_uri || (
+      /claude/i.test(client.client_name || '')
+        ? 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/logo.png'
+        : undefined
+    );
+
     // Generate stateless signed anti-CSRF token
     const csrfToken = encodeSigned({
       typ: 'csrf',
