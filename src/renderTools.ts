@@ -5,9 +5,27 @@ import { formatOptimizedResponse, formatError, getToolAnnotations, makeRegistrar
 interface RenderSessionEntry { sessionId: string; lastActive: number; }
 const renderSessions = new Map<string, RenderSessionEntry>();
 
+// Without this, a renderToken's session entry would only ever be removed on
+// an explicit API failure — never on staleness — so the map grows unbounded
+// with every distinct token ever seen. Mirrors the TTL pattern used for
+// session/auth context in security.ts and for output caching in sandboxTools.ts.
+const RENDER_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const RENDER_SESSION_PRUNE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const renderSessionPruneTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of renderSessions) {
+    if (now - entry.lastActive > RENDER_SESSION_TTL_MS) renderSessions.delete(token);
+  }
+}, RENDER_SESSION_PRUNE_INTERVAL_MS);
+renderSessionPruneTimer.unref();
+
 async function getRenderSession(renderToken: string): Promise<string> {
   const cached = renderSessions.get(renderToken);
-  if (cached) { cached.lastActive = Date.now(); return cached.sessionId; }
+  if (cached && Date.now() - cached.lastActive <= RENDER_SESSION_TTL_MS) {
+    cached.lastActive = Date.now();
+    return cached.sessionId;
+  }
+  if (cached) renderSessions.delete(renderToken); // stale — fall through and re-initialize
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
