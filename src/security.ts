@@ -96,9 +96,31 @@ function authBucket(sessionId: string) {
 export function getSessionContext(sessionId: string): SessionContext {
   if (!sessionContexts.has(sessionId)) {
     const enableAll = process.env.ENABLE_ALL_TOOLS === 'true';
-    const initial: ToolCategory[] = enableAll
-      ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
-      : ['core', 'sandbox'];
+
+    const enableIssuesPrs = enableAll ||
+      process.env.ENABLE_GITHUB_ISSUES_PRS === 'true' ||
+      process.env.ENABLE_GITHUB_ISSUES_PRS_TOOLS === 'true';
+
+    const enableAdmin = enableAll ||
+      process.env.ENABLE_GITHUB_ADMIN === 'true' ||
+      process.env.ENABLE_GITHUB_ADMIN_TOOLS === 'true';
+
+    const enableRender = enableAll ||
+      process.env.ENABLE_RENDER === 'true' ||
+      process.env.ENABLE_RENDER_TOOLS === 'true';
+
+    const enableSandbox = enableAll || (
+      process.env.ENABLE_SANDBOX !== 'false' &&
+      process.env.ENABLE_SANDBOX_TOOLS !== 'false' &&
+      process.env.DISABLE_SANDBOX !== 'true' &&
+      process.env.DISABLE_SANDBOX_TOOLS !== 'true'
+    );
+
+    const initial: ToolCategory[] = ['core'];
+    if (enableIssuesPrs) initial.push('github_issues_prs');
+    if (enableAdmin) initial.push('github_admin');
+    if (enableRender) initial.push('render');
+    if (enableSandbox) initial.push('sandbox');
     // Peek at whether there's live (non-stale) prior data before authBucket()
     // touches lastUsed, so we can tell the caller this context was resumed
     // rather than fresh, and how long it had been sitting idle.
