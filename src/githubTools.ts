@@ -891,15 +891,22 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('create_branch', {
-    description: 'Create branch.',
+    description: 'Create branch. refSha accepts a full 40-char commit SHA, a short SHA, or a branch/tag name — it is resolved to the full SHA automatically.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string(), refSha: z.string() },
     annotations: getToolAnnotations('create_branch')
   }, async (args: any) => {
     const { owner, repo, branch, refSha } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      await octokit.git.createRef({ owner: target.owner, repo: target.repo, ref: `refs/heads/${branch}`, sha: refSha });
-      return formatOptimizedResponse(`Branch '${branch}' created.`);
+      let fullSha = refSha;
+      if (!/^[0-9a-f]{40}$/i.test(refSha)) {
+        // Not already a full 40-char SHA — treat as a short SHA, branch name,
+        // or tag name and resolve it via the Commits API, which accepts all three.
+        const commit = await octokit.repos.getCommit({ owner: target.owner, repo: target.repo, ref: refSha });
+        fullSha = commit.data.sha;
+      }
+      await octokit.git.createRef({ owner: target.owner, repo: target.repo, ref: `refs/heads/${branch}`, sha: fullSha });
+      return formatOptimizedResponse(`Branch '${branch}' created from ${fullSha.substring(0, 7)}.`);
     } catch (err) { return handleGitHubError(err); }
   });
 
