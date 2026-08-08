@@ -1,1390 +1,323 @@
-# Krix
+# Production security / deployment
 
-**Krix** is a secure, extensible MCP gateway that gives AI agents controlled access to GitHub, Render, local Git repositories, and an isolated sandbox environment.
+Krix 2.0 is designed for production deployment behind HTTPS. Before connecting a real MCP client:
 
-It is designed for AI coding agents that need to inspect repositories, modify files, work with Git, interact with GitHub, manage Render resources, and execute code — while keeping authentication, filesystem access, processes, networking, and resource usage under explicit control.
+1. Set `NODE_ENV=production` and `PUBLIC_BASE_URL=https://<your-domain>`.
+2. Generate a strong random `MCP_API_KEY` (at least 32 characters; 64+ random characters is recommended).
+3. Keep GitHub and Render credentials in Render's secret environment variables.
+4. Keep `ALLOW_LEGACY_API_KEY=false` and `ALLOW_CLIENT_CREDENTIAL_HEADERS=false` unless a legacy integration explicitly requires them.
+5. Keep `SANDBOX_MODE=bwrap`. The Docker image installs bubblewrap and runs Krix as a non-root user.
+6. Do not enable `ALLOW_UNSAFE_HOST_SANDBOX` for production.
+7. Use the `/healthz` and `/readyz` endpoints for platform health checks.
+8. Review `SECURITY.md` before exposing the service publicly.
 
-> **Security-first principle:** Krix gives powerful capabilities to AI agents. Every capability therefore has explicit boundaries around authentication, filesystem access, process execution, networking, resource usage, and external API access.
+The OAuth connector uses authorization-code + PKCE S256, exact redirect URI matching, one-time authorization codes, opaque short-lived access tokens, rate limits, session binding, and no API keys in URLs.
 
----
+# Krix 
 
-## Table of Contents
+**Krix** is a production-grade Model Context Protocol (MCP) server that empowers AI agents with complete control over **GitHub Repositories**, **Render Cloud Infrastructure**, and an **Isolated Execution Sandbox** with persistent bash shells, language runtimes, and local Git CLI tools over a unified HTTP transport.
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Security Model](#security-model)
-- [Sandbox](#sandbox)
-- [Sandbox Isolation](#sandbox-isolation)
-- [Network Access](#network-access)
-- [Authentication](#authentication)
-- [GitHub Integration](#github-integration)
-- [Render Integration](#render-integration)
-- [Tool Loading](#tool-loading)
-- [Resource Limits](#resource-limits)
-- [Memory Protection](#memory-protection)
-- [Session Management](#session-management)
-- [Configuration](#configuration)
-- [Environment Variables](#environment-variables)
-- [Installation](#installation)
-- [Local Development](#local-development)
-- [Docker](#docker)
-- [Production Deployment](#production-deployment)
-- [API Authentication](#api-authentication)
-- [Security Levels](#security-levels)
-- [Git Operations](#git-operations)
-- [Sandbox Tools](#sandbox-tools)
-- [GitHub Tools](#github-tools)
-- [Render Tools](#render-tools)
-- [Resource Cleanup](#resource-cleanup)
-- [Operational Guidance](#operational-guidance)
-- [Troubleshooting](#troubleshooting)
-- [Security Considerations](#security-considerations)
-- [Limitations](#limitations)
-- [Development](#development)
-- [Contributing](#contributing)
-- [License](#license)
+Engineered for **LLM token conservation**, **multi-tenant identity isolation**, and **zero-trust security**, Krix combines 80+ tools behind a lazy-loading architecture with payload compression, credential scrubbing, and automated memory cleanup.
 
 ---
 
-# Features
+## 🚀 Key Features & Innovations
 
-Krix provides a unified MCP interface for several development and infrastructure capabilities.
+### 1. Token-Efficient Lazy Toolset Loading (`load_toolset`)
+To maximize token budget and prevent exceeding model context windows, Krix initializes with a lightweight default suite (**Core + Sandbox Tools**). Additional specialized categories can be dynamically enabled on demand:
 
-### GitHub
-
-Krix can interact with GitHub repositories and development workflows, including:
-
-- Repository discovery
-- Repository information
-- File inspection
-- File modification
-- Branch operations
-- Commit operations
-- Pull requests
-- Issues
-- Labels
-- Issue types
-- Issue fields
-- Reviews
-- Review comments
-- Sub-issues
-- Secret scanning
-- Repository search
-- Multi-file commits
-
-GitHub operations are performed through the GitHub API rather than relying on fragile shell commands whenever an API equivalent exists.
-
-### Local Git
-
-Krix provides controlled Git functionality inside the sandbox, including:
-
-- Clone
-- Fetch
-- Pull
-- Checkout
-- Diff
-- Status
-- Commit
-- Push
-- Repository inspection
-
-Git commands are executed with argument-safe process APIs rather than interpolating user-controlled values into shell commands.
-
-### Sandbox
-
-Krix provides an isolated execution environment for AI agents.
-
-The sandbox supports:
-
-- Shell commands
-- Persistent shell sessions
-- Background processes
-- File operations
-- Search
-- Git operations
-- Package installation
-- Multiple programming languages
-- Compilation
-- Code execution
-
-The sandbox is protected by:
-
-- Filesystem containment
-- Path validation
-- Symlink checks
-- Environment filtering
-- Resource limits
-- Process limits
-- Output limits
-- Execution timeouts
-- Bubblewrap isolation
-- Linux namespaces
-- Capability dropping
-- Optional network isolation
-
-### Render
-
-Krix can interact with Render through its API/MCP integration.
-
-Render functionality includes:
-
-- Service discovery
-- Service management
-- MCP session handling
-- Resource inspection
-- API-backed operations
-
-Render credentials are kept separate from sandbox execution and are never intentionally exposed to sandbox processes.
-
----
-
-# Architecture
-
-At a high level, Krix follows this architecture:
-
-```text
-                         AI Agent
-                            │
-                            │ MCP
-                            ▼
-                    ┌───────────────┐
-                    │     Krix      │
-                    │   MCP Server  │
-                    └───────┬───────┘
-                            │
-             ┌──────────────┼──────────────┐
-             │              │              │
-             ▼              ▼              ▼
-        ┌─────────┐   ┌──────────┐   ┌──────────┐
-        │ GitHub  │   │  Render  │   │  Local   │
-        │  Tools  │   │  Tools   │   │   Git    │
-        └─────────┘   └──────────┘   └────┬─────┘
-                                          │
-                                          ▼
-                                   ┌─────────────┐
-                                   │   Sandbox   │
-                                   └──────┬──────┘
-                                          │
-                                   ┌──────▼──────┐
-                                   │ Bubblewrap  │
-                                   │ Isolation   │
-                                   └─────────────┘
+```ts
+load_toolset({ category: "github_issues_prs" }) // Issues, PRs, Reviews, Comments
+load_toolset({ category: "github_admin" })      // Releases, Tags, Collaborators, Copilot
+load_toolset({ category: "render" })            // Render Cloud Services, Deploys, Logs, Postgres
+load_toolset({ category: "all" })               // Enable all categories concurrently
 ```
 
-The sandbox is intentionally treated differently from the GitHub and Render integrations.
+### 2. Isolated Multi-Tenant Execution Sandbox
+- **Identity-Scoped File System**: Sandboxes are isolated under `/tmp/krix_sbx_${authKey}/` where `authKey` is a SHA-256 hash of the caller's GitHub token. User data never leaks across sessions or accounts.
+- **Persistent Shell State**: Keeps long-lived `bash` sessions per `(authKey, sessionId)` pair. `cd`, `export`, and venv activations persist between tool calls.
+- **Race-Guarded Concurrency**: In-flight shell creation is promise-guarded to prevent concurrent requests from spawning orphan processes.
+- **Safe Environment**: Automatically pins `HOME` to `/tmp/krix_home/` with pre-created cache directories, preventing `npm` and `pip` `ENOENT` failures in containerized environments.
+- **Context-Aware Reset (`sandbox_reset`)**: Wipes scratch files, persistent shells, and background processes while safely preserving active Git context (`owner`, `repo`, `branch`).
 
-GitHub and Render credentials belong to the Krix server.
+### 3. Surgical Code Editing & Structural Search
+- **`str_replace_editor`**: Performs exact string block replacement. On match failure, it calculates **Levenshtein Distance Similarity** and returns a line-numbered context hint showing the closest matching code lines with similarity percentages. Supports Base64 (`old_str_b64`, `new_str_b64`).
+- **`patch_contents`**: Enables direct line-range edits (`startLine` to `endLine`) without requiring string matching.
+- **`get_file_contents`**: Line-windowed file reader (100 lines default, 500 max) with line number prefixes and a 100KB payload threshold.
+- **`grep`**: High-performance pattern search with regex, file extension filtering (`type: "ts"`), path globs, context lines, and case sensitivity.
+- **`view_file_outline`**: Extracts high-level AST symbol structures (classes, methods, functions, exports).
 
-Sandbox processes should receive only the environment and filesystem access required to perform their task.
-
----
-
-# Security Model
-
-Krix assumes that an AI agent may submit unexpected or malicious input.
-
-Therefore, user-controlled values are treated as untrusted.
-
-This includes:
-
-- File paths
-- Commands
-- Shell arguments
-- Git branches
-- Repository names
-- Search expressions
-- Regular expressions
-- Environment variables
-- Commit messages
-- Issue content
-- Package names
-- Render parameters
-- Network-related settings
-
-Security controls are applied at multiple layers rather than relying on a single validation function.
-
-```text
-Input validation
-      ↓
-Authentication
-      ↓
-Authorization / capability checks
-      ↓
-Filesystem validation
-      ↓
-Process isolation
-      ↓
-Environment filtering
-      ↓
-Resource limits
-      ↓
-Output limits
-      ↓
-Cleanup
-```
-
-This defense-in-depth approach is important because no single application-level validation mechanism is sufficient for arbitrary code execution.
+### 4. Enterprise Security & Memory Hygiene
+- **Zero-Trust Credential Masking**: Automatically redacts GitHub tokens (`ghp_*`, `github_pat_*`), Render keys (`rnd_*`), Bearer tokens, and SSH/RSA private keys from all outputs.
+- **Path Escape Protection**: Enforces path resolution bounds (`sanitizePath`) prohibiting access outside `/tmp` or working directory roots.
+- **Command Blocklist**: Pre-evaluates shell commands to block destructive patterns (`rm -rf /`, `mkfs`, `dd if=`, fork bombs).
+- **ReDoS Defense**: VM-sandboxed regular expression execution (`safeRegexTest`) with a 200ms hard timeout.
+- **Automatic Lifecycle Sweeps**:
+  - **10-min Idle Teardown**: Inactive session transports and sandboxes are automatically destroyed (`destroySandbox`).
+  - **15-min Output Cache TTL**: Truncated shell outputs (`sandbox_output`) are cached per session and automatically purged on expiration or reset.
+  - **10-min Process Table TTL**: Background job entries (`sandbox_ps`) are swept on a 5-minute timer. Buffer output is hard-capped at 200KB per process.
 
 ---
 
-# Sandbox
+## 🛠️ Tool Categories & Matrix
 
-Krix's sandbox is designed around a simple rule:
-
-> The AI agent may work inside its assigned workspace, but the Krix server itself is not part of that workspace.
-
-Each sandbox has a controlled workspace and a restricted execution environment.
-
-The sandbox root is authoritative.
-
-A caller cannot redefine the sandbox root simply by supplying a different `cwd`.
-
-## Filesystem Security
-
-Krix validates filesystem paths before using them.
-
-The sandbox prevents common escape techniques such as:
-
-```text
-../
-../../
-/etc/passwd
-/tmp/other-directory
-```
-
-It also accounts for:
-
-- Symlinks
-- Symlinked parent directories
-- Absolute paths
-- Relative paths
-- Path-prefix collisions
-- Existing filesystem targets
-
-A lexical string check such as `startsWith("/sandbox")` is not considered sufficient.
-
-Filesystem-aware validation is used where necessary.
+### Core Agentic Tools (`core` — Always Enabled)
+| Tool Name | Type | Description |
+| :--- | :--- | :--- |
+| `set_active_context` | `READ_ONLY` | Sets default `owner`, `repo`, and `branch`. Persists across session resets per auth key. |
+| `get_me` | `READ_ONLY` | Retrieves authenticated GitHub user profile information. |
+| `get_file_contents` | `READ_ONLY` | Reads windowed line ranges of a file (100 default, 500 max lines). |
+| `str_replace_editor` | `MUTATING` | Surgically replaces code blocks with Levenshtein similarity context feedback on match errors. |
+| `patch_contents` | `MUTATING` | Replaces specified line ranges directly by 1-indexed line numbers. |
+| `create_or_update_file` | `MUTATING` | Creates or updates files via plain text or Base64 (`content_b64`). |
+| `delete_file` | `MUTATING` | Deletes a file from a repository branch. |
+| `grep` | `READ_ONLY` | Pattern search supporting regex, file extension filters, globs, and context windowing. |
+| `view_file_outline` | `READ_ONLY` | Extracts high-level AST symbol outlines (classes, functions, exports). |
+| `git_tree` | `READ_ONLY` | Recursively indexes file tree structures with `tree_sha`, `offset`, `limit`, and path search `q`. |
+| `list_branches` | `READ_ONLY` | Lists branches in the active repository. |
+| `create_branch` | `MUTATING` | Creates a new branch from a specified ref/commit SHA. |
+| `delete_branch` | `MUTATING` | Deletes a branch from the repository. |
+| `push_files` | `MUTATING` | Batch commits and pushes multiple files in a single operation. |
+| `create_pull_request` | `MUTATING` | Opens a new pull request between head and base branches. |
+| `search_code` | `READ_ONLY` | Searches code across GitHub repositories. |
+| `search_repositories` | `READ_ONLY` | Searches GitHub repositories (`exact: true` returns single best match). |
+| `sandbox_status` | `READ_ONLY` | Inspects sandbox memory, runtimes (Node, Python, Go, Git), active repo/branch, and shell state. |
 
 ---
 
-# Sandbox Isolation
+### Execution Sandbox & Local Git (`sandbox` — Enabled by Default)
+| Tool Name | Type | Description |
+| :--- | :--- | :--- |
+| `sandbox_exec` | `MUTATING` | Executes shell commands in a persistent bash shell or isolated process with backgrounding support (`background: true`). |
+| `sandbox_run` | `MUTATING` | Runs inline code snippets across supported runtimes (`py`, `js`, `ts`, `sh`, `go`, `java`, `cpp`, `c`, `rs`, `rb`, `php`). |
+| `sandbox_install` | `MUTATING` | Installs dependencies via `npm` or `pip` targeting isolated sandbox directories. |
+| `sandbox_ps` | `READ_ONLY` | Lists, inspects output, or terminates background processes. |
+| `sandbox_output` | `READ_ONLY` | Reads paginated stdout/stderr for truncated shell execution results. |
+| `sandbox_reset` | `MUTATING` | Cleans scratch files, kills persistent shells and background jobs while preserving active Git context. |
+| `git_clone` | `MUTATING` | Clones a repository into the sandbox working directory. |
+| `git_checkout` | `MUTATING` | Switches or creates local branches in the cloned repository. |
+| `git_pull` | `MUTATING` | Performs fast-forward pull on the active sandbox branch. |
+| `git_status` | `READ_ONLY` | Inspects working tree status and untracked files in the sandbox. |
+| `git_diff` | `READ_ONLY` | Generates staged or unstaged git diff output. |
+| `git_commit_push` | `MUTATING` | Stages, commits, and pushes changes from the sandbox repository. |
 
-For Linux deployments, Krix uses **Bubblewrap (`bwrap`)** for sandbox execution.
+---
 
-Bubblewrap provides Linux namespace-based isolation.
+### GitHub Issues & Pull Requests (`github_issues_prs` — Lazy Loaded)
+Enable via `load_toolset({ category: "github_issues_prs" })`:
 
-The sandbox uses isolation for:
+| Tool Name | Type | Description |
+| :--- | :--- | :--- |
+| `list_issues` | `READ_ONLY` | Lists repository issues filtered by state, labels, assignee, or creator. |
+| `issue_read` | `READ_ONLY` | Reads detailed issue title, body, comments, and state. |
+| `issue_write` | `MUTATING` | Creates a new issue or updates an existing issue. |
+| `sub_issue_write` | `MUTATING` | Attaches a sub-issue to a parent issue. |
+| `add_issue_comment` | `MUTATING` | Adds a comment to an issue or pull request. |
+| `list_pull_requests` | `READ_ONLY` | Lists pull requests filtered by state, head, base, or branch. |
+| `pull_request_read` | `READ_ONLY` | Fetches pull request mergeability status and details. |
+| `update_pull_request` | `MUTATING` | Updates PR title, body, or state (`open`/`closed`). |
+| `update_pull_request_branch` | `MUTATING` | Merges base branch updates into the PR head branch. |
+| `merge_pull_request` | `MUTATING` | Merges a pull request into its base branch. |
+| `pull_request_review_write` | `MUTATING` | Submits a PR review (`APPROVE`, `REQUEST_CHANGES`, `COMMENT`). |
+| `add_comment_to_pending_review` | `MUTATING` | Adds a line-specific diff comment to a pending review. |
+| `add_reply_to_pull_request_comment` | `MUTATING` | Replies to an existing review comment thread. |
+| `search_issues` | `READ_ONLY` | Searches issues across GitHub repositories. |
+| `search_pull_requests` | `READ_ONLY` | Searches pull requests across GitHub repositories. |
 
-- Mounts
-- PIDs
-- IPC
-- UTS
-- User namespace
-- Linux capabilities
+---
 
-The sandbox filesystem is constructed explicitly.
+### GitHub Extended & Admin (`github_admin` — Lazy Loaded)
+Enable via `load_toolset({ category: "github_admin" })`:
 
-Only required system resources are exposed.
+| Tool Name | Type | Description |
+| :--- | :--- | :--- |
+| `get_commit` | `READ_ONLY` | Retrieves commit details by SHA. |
+| `search_commits` | `READ_ONLY` | Searches commit messages across GitHub. |
+| `get_label` | `READ_ONLY` | Fetches details for an issue label. |
+| `get_release` | `READ_ONLY` | Fetches release details by tag or published release. |
+| `get_tag` | `READ_ONLY` | Fetches git tag object details by SHA. |
+| `get_teams` | `READ_ONLY` | Lists teams in an organization. |
+| `get_team_members` | `READ_ONLY` | Lists members of an organization team. |
+| `list_commits` | `READ_ONLY` | Lists commits filtered by author, path, or date range. |
+| `list_releases` | `READ_ONLY` | Lists published releases for a repository. |
+| `list_tags` | `READ_ONLY` | Lists repository git tags. |
+| `list_issue_fields` | `READ_ONLY` | Lists repository issue labels and custom fields. |
+| `list_issue_types` | `READ_ONLY` | Lists organization issue types (`Bug`, `Feature`, `Task`). |
+| `list_repository_collaborators` | `READ_ONLY` | Lists collaborators and their permission levels. |
+| `search_users` | `READ_ONLY` | Searches GitHub users by query. |
+| `create_repository` | `MUTATING` | Creates a new GitHub repository. |
+| `fork_repository` | `MUTATING` | Forks a repository to the authenticated account. |
+| `run_secret_scanning` | `READ_ONLY` | Runs secret scanning alert checks on a repository. |
+| `request_copilot_review` | `MUTATING` | Requests an automated GitHub Copilot PR review. |
+| `assign_copilot_to_issue` | `MUTATING` | Assigns GitHub Copilot coding agent to solve an issue. |
 
-The Krix application directory is not intentionally mounted into the sandbox.
+---
 
-The sandbox workspace is the writable development area.
+### Render Cloud API (`render` — Lazy Loaded)
+Enable via `load_toolset({ category: "render" })`:
 
-## Sandbox Filesystem Layout
+| Tool Name | Type | Description |
+| :--- | :--- | :--- |
+| `list_workspaces` | `READ_ONLY` | Lists available Render workspace accounts. |
+| `select_workspace` | `MUTATING` | Sets active Render workspace target for the session. |
+| `get_selected_workspace` | `READ_ONLY` | Displays currently selected Render workspace ID. |
+| `list_services` | `READ_ONLY` | Lists deployed services (web, static sites, background workers, cron). |
+| `get_service` | `READ_ONLY` | Fetches details and status for a service. |
+| `create_web_service` | `MUTATING` | Provisions a new Render web service from a GitHub repository. |
+| `create_static_site` | `MUTATING` | Provisions a new Render static site. |
+| `create_cron_job` | `MUTATING` | Provisions a scheduled cron job service. |
+| `restart_service` | `MUTATING` | Triggers service restart or clear-cache restart. |
+| `delete_service` | `MUTATING` | Deletes a Render service instance. |
+| `list_deploys` | `READ_ONLY` | Lists recent deployment history for a service. |
+| `get_deploy` | `READ_ONLY` | Fetches deployment status, build logs, and commit info. |
+| `trigger_deploy` | `MUTATING` | Triggers a new manual deploy. |
+| `cancel_deploy` | `MUTATING` | Cancels an in-progress deployment. |
+| `list_logs` | `READ_ONLY` | Retrieves runtime application logs with server-side filtering (`level`, `text`, `startTime`/`endTime`). |
+| `list_log_label_values` | `READ_ONLY` | Lists streaming log label values. |
+| `get_metrics` | `READ_ONLY` | Fetches CPU, memory, and bandwidth utilization metrics. |
+| `list_env_vars` | `READ_ONLY` | Lists environment variables for a service. |
+| `update_env_vars` | `MUTATING` | Sets or updates key-value environment variables. |
+| `delete_env_var` | `MUTATING` | Removes an environment variable from a service. |
+| `query_render_postgres` | `READ_ONLY` | Inspects status and database details for Render Managed Postgres. |
 
-Conceptually, a sandbox looks like:
+---
 
-```text
-/
-├── bin/              read-only
-├── usr/              read-only
-├── lib/              read-only
-├── lib64/            read-only
-├── etc/              controlled
-├── tmp/              isolated
-├── run/              isolated
-├── home/             isolated
-└── workspace/        writable
-```
+## ⚙️ Configuration & Environment
 
-The exact layout depends on the host image and installed runtimes.
-
-## Fail-Closed Isolation
-
-When:
+Create a `.env` file in the root directory:
 
 ```env
-SANDBOX_ISOLATION_REQUIRED=true
-```
+# Server Authentication Key (Required for client header authorization)
+MCP_API_KEY=your_mcp_secret_key_here
 
-Krix requires Bubblewrap.
-
-If Bubblewrap is unavailable, sandbox execution should fail instead of silently falling back to an unisolated child process.
-
-This prevents an operational configuration mistake from accidentally disabling the intended security boundary.
-
----
-
-# Network Access
-
-Krix allows network access to be configured independently for the major network-capable operations.
-
-The secure defaults are now disabled:
-
-```env
-SANDBOX_EXEC_NETWORK_DEFAULT=false
-SANDBOX_RUN_NETWORK_DEFAULT=false
-SANDBOX_INSTALL_NETWORK_DEFAULT=false
-GIT_NETWORK_DEFAULT=false
-```
-
-Enable network access only for the capability that actually needs it.
-
-These control different capabilities.
-
-### `SANDBOX_EXEC_NETWORK_DEFAULT`
-
-Default network policy for sandbox execution.
-
-### `SANDBOX_RUN_NETWORK_DEFAULT`
-
-Default network policy for sandbox run operations.
-
-### `SANDBOX_INSTALL_NETWORK_DEFAULT`
-
-Default network policy for package installation.
-
-Package managers commonly require network access.
-
-### `GIT_NETWORK_DEFAULT`
-
-Default network policy for Git operations such as clone, fetch, pull, and push.
-
-## Network Security Warning
-
-Network-enabled sandbox execution is powerful.
-
-When network access is enabled, sandbox code may be able to communicate with services reachable from the Render environment.
-
-Application-level restrictions cannot provide the same guarantees as a dedicated outbound firewall or proxy.
-
-For high-security deployments, consider routing sandbox traffic through a controlled egress proxy or disabling sandbox networking unless it is required.
-
----
-
-# Authentication
-
-Krix supports gateway authentication using:
-
-```text
-x-api-key
-```
-
-or:
-
-```text
-Authorization: Bearer <key>
-```
-
-The gateway key is configured through:
-
-```env
-MCP_API_KEY=
-```
-
-API keys should not be supplied through URLs.
-
-Avoid query-string secrets because URLs may appear in logs, tracing systems, proxies, browser history, or monitoring systems.
-
-## MCP OAuth Authentication
-
-For Claude, Cursor, Gemini Spark, AntiGravity, or any OAuth-capable MCP client, Krix provides built-in, stateless OAuth 2.0 authorization server support with Dynamic Client Registration (DCR), PKCE (S256), anti-CSRF tokens, sliding-window rate limiting, and dynamic client logo resolution.
-
-Configure the following environment variables in `.env`:
-
-```env
-# MCP OAuth (required for Claude / OAuth-capable MCP clients)
-# Set this to the exact public Krix URL, with no trailing slash.
-OAUTH_ISSUER=your_web_service_url
-# Long random secret (32+ characters). Keep this unchanged across redeploys.
-OAUTH_SIGNING_SECRET=your_33_characters_secret
-```
-
-Production hardening in this build also includes cross-origin-safe logo assets for MCP clients, a restrictive OAuth CSP with nonce-based fallback handling, bounded rate-limit/auth-code state, startup validation for gateway/OAuth secrets, non-root Docker execution, and Bubblewrap isolation with networking disabled by default.
-
----
-
-# GitHub Authentication
-
-GitHub credentials can be supplied through environment configuration or request headers depending on the deployment configuration.
-
-Example:
-
-```env
+# Default GitHub Access Token (Fallback if x-github-token header omitted)
 GITHUB_PERSONAL_ACCESS_TOKEN=ghp_your_github_token_here
-```
 
-An alternative alias may also be used:
-
-```env
-GITHUB_PAT=ghp_your_github_token_here
-```
-
-Clients may provide a GitHub token through the supported request header when configured to do so.
-
-GitHub credentials should never be:
-
-- committed to Git
-- placed in source code
-- embedded in sandbox commands
-- written into logs
-- included in Git remote URLs unnecessarily
-
----
-
-# Render Authentication
-
-Render authentication is configured through:
-
-```env
+# Default Render API Key (Fallback if x-render-token header omitted)
 RENDER_API_KEY=rnd_your_render_api_key_here
-```
 
-The alternative alias:
-
-```env
-RENDER_PAT=rnd_your_render_api_key_here
-```
-
-may also be used where supported.
-
-Render credentials remain server-side.
-
-They should not be inherited by arbitrary sandbox processes.
-
----
-
-# Tool Loading
-
-Krix supports lazy tool loading.
-
-By default:
-
-```env
+# Enable All Tools by Default (Optional: set to 'true' to disable lazy loading)
 ENABLE_ALL_TOOLS=false
-```
 
-This allows the server to avoid registering every capability when it is unnecessary.
-
-Category flags include:
-
-```env
+# Category-specific Tool Flags (Disabled by default, set to 'true' to enable)
 ENABLE_GITHUB_ISSUES_PRS=false
 ENABLE_GITHUB_ADMIN=false
 ENABLE_RENDER=false
+
+# Sandbox & Local Git Tools Flag (Enabled by default, set to 'false' to disable)
 ENABLE_SANDBOX=true
+
+# HTTP Server Port
+PORT=3000
 ```
 
-Enable only the capabilities required by your deployment.
+### System Runtimes (Sandbox)
+The Execution Sandbox utilizes installed system binaries on the host system or Docker container:
 
-For development environments, enabling additional capabilities may be convenient.
+| Language | Binary | Ubuntu / Debian Package |
+| :--- | :--- | :--- |
+| Git ops | `git` | `git` |
+| Node.js / TS | `node`, `npx` | `nodejs` |
+| Python | `python3` | `python3`, `python3-pip` |
+| Go | `go` | `golang-go` |
+| Java | `java`, `javac` | `default-jdk-headless` |
+| C / C++ | `gcc`, `g++` | `g++` |
 
-For production, least privilege is recommended.
+The included **single-stage `Dockerfile`** installs all runtimes in one build layer, ensuring no missing OS dependencies when deploying to cloud platforms such as Render.
 
 ---
 
-# Resource Limits
+## 📦 Getting Started
 
-Krix is designed to run within constrained environments such as a 512 MB Render instance.
-
-Resource limits exist because an AI agent can unintentionally or intentionally create extremely expensive operations.
-
-Limits apply to:
-
-- Sessions
-- Processes
-- Shells
-- Executions
-- Queues
-- Output
-- Environment variables
-- Files
-- Git pushes
-- Render responses
-- Sandbox storage
-
-## Session Limits
-
-```env
-MAX_MCP_SESSIONS=24
-MAX_AUTH_CONTEXTS=128
-```
-
-These prevent unbounded growth of in-memory session state.
-
-Expired entries are cleaned automatically.
-
-## Process Limits
-
-```env
-MAX_BACKGROUND_PROCESSES=16
-MAX_BACKGROUND_PROCESSES_PER_AUTH=8
-MAX_PERSISTENT_SHELLS=12
-```
-
-This prevents a single agent or many agents from creating an unlimited number of child processes.
-
-## Execution Limits
-
-```env
-MAX_CONCURRENT_EXECUTIONS=4
-MAX_EXECUTION_QUEUE=8
-```
-
-Only a bounded number of expensive sandbox executions run simultaneously.
-
-Additional requests may wait in the bounded queue.
-
-This helps prevent CPU and memory spikes.
-
-## Execution Timeouts
-
-Normal execution:
-
-```env
-EXECUTION_TIMEOUT_MS=300000
-```
-
-Background execution:
-
-```env
-BACKGROUND_PROCESS_TIMEOUT_MS=600000
-```
-
-Processes that exceed their allowed lifetime are terminated.
-
----
-
-# Output Limits
-
-Command output can consume large amounts of memory.
-
-Krix therefore caps output.
-
-Persistent shells:
-
-```env
-PERSISTENT_SHELL_OUTPUT_LIMIT=1048576
-```
-
-Output caches are limited by both entry count, total memory, per-session count, and TTL.
-
-Example:
-
-```env
-MAX_OUTPUT_CACHE_ENTRIES=64
-MAX_OUTPUT_CACHE_BYTES=33554432
-MAX_OUTPUT_CACHE_PER_SESSION=10
-OUTPUT_CACHE_TTL_MS=900000
-```
-
-This prevents output from becoming an indefinitely growing in-memory data structure.
-
----
-
-# Environment Limits
-
-Sandbox environment variables are bounded.
-
-```env
-MAX_ENV_VARS=128
-MAX_ENV_BYTES=262144
-```
-
-Both the number of variables and their combined size are limited.
-
-Sensitive server variables are filtered.
-
-Dangerous runtime configuration variables such as `NODE_OPTIONS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `GIT_SSH_COMMAND`, and `GIT_ASKPASS` are restricted to prevent them from becoming indirect escape mechanisms.
-
----
-
-# Sandbox Storage Limits
-
-Individual file size:
-
-```env
-MAX_SANDBOX_FILE_SIZE=16777216
-```
-
-Maximum sandbox storage:
-
-```env
-MAX_SANDBOX_SIZE=268435456
-```
-
-The sandbox storage limit is intended to prevent uncontrolled disk growth.
-
-For a 512 MB Render instance, keeping workload sizes bounded is important because large generated datasets can also create CPU, I/O, and memory pressure.
-
----
-
-# Git Push Limits
-
-Krix limits large multi-file Git operations.
-
-```env
-MAX_PUSH_FILE_SIZE=4194304
-MAX_PUSH_TOTAL_SIZE=16777216
-```
-
-This prevents a single tool call from attempting to construct an excessively large Git operation.
-
----
-
-# Render Limits
-
-Render responses are bounded:
-
-```env
-MAX_RENDER_RESPONSE_SIZE=8388608
-```
-
-Cached Render sessions are also limited:
-
-```env
-MAX_RENDER_SESSIONS=8
-```
-
-Stale entries are removed after their TTL.
-
----
-
-# Memory Protection
-
-Krix monitors process RSS rather than relying only on Node's JavaScript heap usage.
-
-Memory pressure begins around:
-
-```env
-MEMORY_PRESSURE_MB=360
-```
-
-Emergency cleanup begins around:
-
-```env
-MEMORY_EMERGENCY_MB=440
-```
-
-These thresholds are deliberately below the 512 MB service limit to provide headroom for:
-
-- Native allocations
-- Child processes
-- Node runtime overhead
-- Buffers
-- Libraries
-- OS overhead
-
-These values are safety thresholds, not a replacement for an operating-system memory limit.
-
----
-
-# Session Management
-
-Krix maintains session state so that MCP clients can maintain continuity.
-
-Session state is not intended to grow indefinitely.
-
-Inactive sessions are removed after:
-
-```env
-SESSION_IDLE_TIMEOUT_MS=600000
-```
-
-Authentication context persistence:
-
-```env
-AUTH_CONTEXT_TTL_MS=3600000
-```
-
-Render session cache:
-
-```env
-RENDER_SESSION_TTL_MS=1800000
-```
-
----
-
-# Shared Sandbox Identity
-
-Krix intentionally uses the authenticated identity when determining the shared sandbox.
-
-This means multiple sessions belonging to the same authenticated identity may use the same sandbox.
-
-It should not be interpreted as a per-MCP-session sandbox.
-
-```text
-GitHub Identity A
-       │
-       ▼
-Shared Auth Identity A
-       │
-       ▼
-Sandbox A
-     ↙   ↘
-Session 1  Session 2
-```
-
-A different authenticated identity receives a different sandbox context.
-
----
-
-# Session Identity Consistency
-
-Although the sandbox is shared by identity, an individual MCP session cannot silently switch identities.
-
-For example:
-
-```text
-Session 123 → User A
-```
-
-followed by an attempt to use:
-
-```text
-Session 123 → User B
-```
-
-should be rejected.
-
-This prevents state created under one identity from being reused under another identity.
-
----
-
-# Sandbox Destruction
-
-Sandbox destruction remains associated with the shared authenticated identity.
-
-If another active session is still using the same shared identity, closing one session must not unnecessarily destroy resources required by the remaining session.
-
----
-
-# Git Operations
-
-Git operations use process APIs with explicit argument arrays wherever possible.
-
-This is safer than constructing shell commands from untrusted values.
-
-Git credentials should not be placed directly in command-line arguments.
-
-## Git Hooks
-
-Git operations involving credentials should avoid executing untrusted repository hooks where possible.
-
-This reduces the risk of a malicious repository executing code with access to the Krix environment during Git operations.
-
----
-
-# GitHub API Correctness
-
-Krix uses the GitHub API for GitHub-specific operations.
-
-API endpoints should match their semantic purpose.
-
-Examples include:
-
-- Repository issue types use the repository issue-type endpoint.
-- Organization issue fields use the appropriate organization-level API.
-- Sub-issues use GitHub's supported sub-issue relationship functionality.
-- Pending review comments use the review workflow rather than pretending a normal issue comment is a pending review comment.
-
-Krix does not fabricate repository configuration when the GitHub API does not return it.
-
----
-
-# Safe File Replacement
-
-The `str_replace_editor` operation is intentionally strict.
-
-The replacement target must occur exactly once.
-
-```text
-0 matches
-→ error
-
-1 match
-→ replace
-
-2+ matches
-→ error
-```
-
-When multiple occurrences exist, the tool reports their locations so an AI agent can refine its target.
-
-Example:
-
-```text
-old_str is ambiguous; found 3 occurrences.
-
-Occurrence 1: line 42
-Occurrence 2: line 87
-Occurrence 3: line 156
-
-No changes were made.
-Provide a more specific old_str.
-```
-
-This prevents accidental modification of the wrong section of a file.
-
----
-
-# Repository Search
-
-When exact repository matching is requested, Krix does not treat a fuzzy similarity match as an exact match.
-
-For example, `Krix` should not silently resolve to `Krix-old` when exact matching was requested.
-
-Fuzzy searching and exact searching are treated as different semantics.
-
----
-
-# Regex Safety
-
-User-provided regular expressions can consume significant CPU if they contain pathological patterns.
-
-Krix therefore applies validation and limits to dangerous regex operations.
-
-Regexes should not be treated as inherently safe merely because they are syntactically valid.
-
----
-
-# Error Handling
-
-Krix aims to return useful errors without exposing sensitive server information.
-
-Errors should not intentionally disclose:
-
-- API keys
-- GitHub tokens
-- Render tokens
-- private keys
-- server-side environment variables
-- unnecessary stack traces
-- sensitive command-line arguments
-
-Output sanitization is an additional defense layer, not the primary secret-protection mechanism.
-
----
-
-# Installation
-
-## Requirements
-
-Recommended environment:
-
-- Linux
-- Node.js
-- npm
-- Git
-- Bubblewrap (`bwrap`)
-- Docker for containerized deployment
-
-For production sandbox execution, Linux namespace support is required.
-
-## Local Development
-
-Clone the repository:
-
+### 1. Installation
 ```bash
+# Clone repository
 git clone https://github.com/imanki-t/Krix.git
 cd Krix
+
+# Install dependencies
+npm install
 ```
 
-Install dependencies:
-
+### 2. Build & Run
 ```bash
-npm ci
+# Build TypeScript
+npm run build
+
+# Start production server (default port 3000)
+npm start
+
+# Run development mode with hot reload
+npm run dev
 ```
 
-Create the environment file:
+---
 
-```bash
-cp .env.example .env
+## 🔌 MCP Client Integration
+
+### Streamable HTTP Endpoint (`/mcp`)
+Connect MCP clients (Antigravity, Claude Desktop, Cursor, or Custom SDKs) via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "krix": {
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "x-api-key": "your_mcp_secret_key_here",
+        "x-github-token": "ghp_your_personal_github_token",
+        "x-render-token": "rnd_your_render_api_key"
+      }
+    }
+  }
+}
 ```
 
-Edit `.env` and provide the required credentials.
+---
 
-Start the development server using the repository's configured development script.
+## 🧠 Krix MCP Skill for AI Agents
+
+The repository includes a complete agentic workflow skill in [`skills/krix-mcp/SKILL.md`](skills/krix-mcp/SKILL.md) and detailed reference documentation under [`skills/krix-mcp/references/`](skills/krix-mcp/references/):
+
+- [`agentic-tools-guide.md`](skills/krix-mcp/references/agentic-tools-guide.md): 17 Agentic Remote GitHub tools
+- [`sandbox-tools-guide.md`](skills/krix-mcp/references/sandbox-tools-guide.md): 14 Sandbox execution and local Git CLI tools
+- [`workflows-and-best-practices.md`](skills/krix-mcp/references/workflows-and-best-practices.md): Multi-tool workflow patterns and safety directives
+- [`render-tools-guide.md`](skills/krix-mcp/references/render-tools-guide.md): 21 Render cloud infrastructure tools
+- [`github-extended-tools-guide.md`](skills/krix-mcp/references/github-extended-tools-guide.md): 32 Extended GitHub tools (Issues, PRs, Reviews, Teams, Admin)
+
+AI agents can import this skill to automatically direct and coordinate agentic coding, GitHub operations, surgical edits, sandbox execution, and Render cloud management using Krix MCP tools.
 
 ---
 
-# Docker
+## 🏗️ System Architecture Overview
 
-The recommended production deployment uses Docker.
-
-Build:
-
-```bash
-docker build -t krix .
+```
+                         ┌─────────────────────────────────────────┐
+                         │               MCP Client                │
+                         │   (Antigravity / Claude / Cursor)       │
+                         └───────────────────┬─────────────────────┘
+                                             │ HTTP POST /mcp
+                                             ▼
+                         ┌─────────────────────────────────────────┐
+                         │             Krix MCP Server             │
+                         │          (Express / SDK @ :3000)        │
+                         └─────┬─────────────────┬───────────┬─────┘
+                               │                 │           │
+            ┌──────────────────▼──┐   ┌──────────▼─────┐  ┌──▼──────────────────┐
+            │ Core + Sandbox Tools│   │ Security Layer │  │ Dynamic Toolset     │
+            │ (Enabled by Default)│   │ & Trimmers     │  │ Categories          │
+            └─────────────────────┘   └────────────────┘  └─────────────────────┘
+                                                              │ load_toolset()
+                                        ┌─────────────────────┼─────────────────────┐
+                                        ▼                     ▼                     ▼
+                               ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+                               │github_issues_prs│   │     render      │   │   github_admin  │
+                               │   Workflows     │   │   Management    │   │  Extended Ops   │
+                               └─────────────────┘   └─────────────────┘   └─────────────────┘
 ```
 
-Run:
-
-```bash
-docker run --rm \
-  --env-file .env \
-  -p 3000:3000 \
-  krix
-```
-
-The Docker image includes Bubblewrap for sandbox isolation.
-
 ---
 
-# Production Deployment
+## 📄 License
 
-For a constrained deployment such as a 512 MB Render service, the recommended configuration is:
-
-```env
-ENABLE_ALL_TOOLS=false
-ENABLE_SANDBOX=true
-SANDBOX_ISOLATION_REQUIRED=true
-SANDBOX_SECURITY_LEVEL=high
-```
-
-Network defaults may remain enabled if your workflows require them:
-
-```env
-SANDBOX_EXEC_NETWORK_DEFAULT=true
-SANDBOX_RUN_NETWORK_DEFAULT=true
-SANDBOX_INSTALL_NETWORK_DEFAULT=true
-GIT_NETWORK_DEFAULT=true
-```
-
-If the deployment does not require internet access from arbitrary sandbox commands, disable it.
-
----
-
-# 512 MB Render Considerations
-
-Krix is designed with the 512 MB class of deployment in mind.
-
-However, 512 MB is the limit for the entire service, not merely the Node.js heap.
-
-Memory can be consumed by:
-
-```text
-Node.js
-+
-Krix
-+
-MCP SDK
-+
-GitHub client
-+
-Render client
-+
-Buffers
-+
-Child processes
-+
-Compilers
-+
-Git
-+
-npm
-+
-Bubblewrap
-```
-
-Therefore Krix intentionally leaves memory headroom.
-
-Application-level limits reduce the probability of uncontrolled memory growth, but they cannot replace the platform's resource controls.
-
-For workloads involving large compilers, large repositories, or heavy parallel execution, a larger instance is recommended.
-
----
-
-# API Authentication
-
-Clients should authenticate with:
-
-```http
-x-api-key: YOUR_KEY
-```
-
-or:
-
-```http
-Authorization: Bearer YOUR_KEY
-```
-
-Never place gateway secrets in URLs.
-
----
-
-# Security Levels
-
-Krix supports security restriction levels:
-
-```text
-low
-medium
-high
-```
-
-Example:
-
-```env
-COMMAND_RESTRICTION_LEVEL=high
-NETWORK_RESTRICTION_LEVEL=high
-```
-
-Higher levels should impose stricter restrictions.
-
-For production environments, `high` is recommended where functionality permits.
-
----
-
-# Resource Cleanup
-
-Krix uses TTL-based cleanup for transient state.
-
-Cleanup covers areas such as:
-
-- MCP sessions
-- Authentication contexts
-- Output caches
-- Render sessions
-- Background processes
-- Persistent shells
-
-Cleanup is designed to be idempotent where possible.
-
-This is important because multiple lifecycle events may occur for the same session.
-
----
-
-# Process Cleanup
-
-Background processes have bounded lifetimes.
-
-When processes terminate:
-
-- output buffers are released
-- timers are cleared
-- process metadata is removed
-- empty process tables are removed
-
-This prevents exited processes from leaving unnecessary objects in memory.
-
----
-
-# Persistent Shell Cleanup
-
-Persistent shells are bounded and associated with session/auth lifecycle.
-
-Their output buffers are capped.
-
-When no longer required, the shell is terminated and its state is removed.
-
----
-
-# Temporary Files
-
-Compilation and execution may create temporary files.
-
-These files are contained within the sandbox workspace and are removed when the shared sandbox is destroyed.
-
-Long-lived workloads should still avoid unnecessarily generating huge numbers of temporary files.
-
----
-
-# Security Best Practices
-
-For production:
-
-1. Use a long random `MCP_API_KEY`.
-2. Never commit `.env`.
-3. Use the smallest GitHub permissions necessary.
-4. Use the smallest Render permissions necessary.
-5. Keep Bubblewrap isolation enabled.
-6. Keep the sandbox security level high.
-7. Disable sandbox networking when it is not required.
-8. Monitor Render memory and CPU usage.
-9. Keep dependencies updated.
-10. Do not expose the Krix gateway publicly without authentication.
-11. Rotate compromised credentials immediately.
-12. Avoid running untrusted workloads on infrastructure containing unrelated secrets.
-
----
-
-# Threat Model
-
-Krix assumes that the AI agent can provide malicious input.
-
-Potential attacks include:
-
-- Path traversal
-- Symlink traversal
-- Command injection
-- Shell injection
-- Environment-variable manipulation
-- Regex denial of service
-- Memory exhaustion
-- CPU exhaustion
-- Disk exhaustion
-- Process exhaustion
-- Session confusion
-- API misuse
-- Malicious Git repositories
-- Malicious Git hooks
-- Oversized requests
-- Oversized command output
-
-Krix uses multiple controls to reduce these risks.
-
----
-
-# Important Security Limitation
-
-Bubblewrap significantly improves isolation, but it is not a virtual machine.
-
-Krix still runs inside the same Render service/container.
-
-The sandbox is therefore:
-
-```text
-strong application + Linux namespace isolation
-```
-
-rather than:
-
-```text
-independent VM
-```
-
-For hostile multi-tenant workloads requiring extremely strong isolation, use a dedicated sandbox service, microVM, or VM-based execution environment.
-
----
-
-# Network Security Limitation
-
-When sandbox networking is enabled, the sandbox can potentially reach network destinations accessible from the Render service.
-
-The following:
-
-```env
-SANDBOX_EXEC_NETWORK_DEFAULT=true
-```
-
-does not mean "internet access only."
-
-It means network access is available according to the sandbox/network environment.
-
-For strict egress control, use a network firewall or proxy outside Krix.
-
----
-
-# Troubleshooting
-
-## Bubblewrap is missing
-
-If:
-
-```env
-SANDBOX_ISOLATION_REQUIRED=true
-```
-
-and `bwrap` cannot be found, sandbox execution will fail.
-
-Install Bubblewrap or use the provided Docker image.
-
-## Sandbox execution is rejected
-
-Check:
-
-```env
-ENABLE_SANDBOX=true
-SANDBOX_ISOLATION_REQUIRED=true
-```
-
-Then verify that Bubblewrap is installed and namespace support is available.
-
-## Network operation fails
-
-Check the appropriate variable:
-
-```env
-SANDBOX_EXEC_NETWORK_DEFAULT=true
-SANDBOX_RUN_NETWORK_DEFAULT=true
-SANDBOX_INSTALL_NETWORK_DEFAULT=true
-GIT_NETWORK_DEFAULT=true
-```
-
-A capability may require network access even if another capability has it enabled.
-
-## Resource limit reached
-
-If Krix reports a session, process, queue, output, or memory limit:
-
-1. Check whether workloads are still running.
-2. Allow idle resources to expire.
-3. Reduce concurrent operations.
-4. Increase the relevant limit only if the deployment has sufficient resources.
-5. Monitor Render memory before increasing limits.
-
-Do not blindly increase every limit on a 512 MB service.
-
----
-
-# Development
-
-The repository is TypeScript-based.
-
-When modifying Krix:
-
-1. Understand the existing architecture.
-2. Preserve security boundaries.
-3. Avoid introducing shell interpolation.
-4. Validate all user-controlled paths.
-5. Bound all untrusted resource usage.
-6. Add cleanup for every new long-lived resource.
-7. Add TTLs where appropriate.
-8. Add maximum sizes where appropriate.
-9. Test error paths.
-10. Test concurrent behavior.
-
----
-
-# Security Review Checklist
-
-Before shipping a change:
-
-### Input
-
-- [ ] Is user input validated?
-- [ ] Is maximum size enforced?
-- [ ] Is maximum count enforced?
-
-### Filesystem
-
-- [ ] Is the path contained within the sandbox?
-- [ ] Are symlinks handled?
-- [ ] Can `..` escape?
-- [ ] Can absolute paths escape?
-
-### Processes
-
-- [ ] Is the command argument-safe?
-- [ ] Is shell execution actually necessary?
-- [ ] Is there a timeout?
-- [ ] Is output bounded?
-- [ ] Is process count bounded?
-- [ ] Is cleanup guaranteed?
-
-### Environment
-
-- [ ] Are secrets excluded?
-- [ ] Are dangerous runtime variables restricted?
-- [ ] Is total environment size bounded?
-
-### Network
-
-- [ ] Is network access actually required?
-- [ ] Is it controlled by configuration?
-- [ ] Could arbitrary network access expose internal services?
-
-### Memory
-
-- [ ] Is the allocation bounded?
-- [ ] Is the cache bounded?
-- [ ] Is there a TTL?
-- [ ] Is there a global maximum?
-
-### Sessions
-
-- [ ] Can identity change unexpectedly?
-- [ ] Is session cleanup guaranteed?
-- [ ] Are shared resources reference-counted appropriately?
-
----
-
-# Contributing
-
-When contributing to Krix, security-sensitive changes should include tests.
-
-Particularly important areas include:
-
-- Sandbox isolation
-- Authentication
-- Git operations
-- Path validation
-- Process management
-- Resource limits
-- GitHub API integrations
-- Render API integrations
-
-Avoid introducing dependencies solely to replace simple, well-understood functionality unless the dependency provides a meaningful security or maintenance benefit.
-
----
-
-# Reporting Security Issues
-
-Do not publicly disclose sensitive vulnerabilities before they have been responsibly addressed.
-
-If you discover:
-
-- authentication bypass
-- sandbox escape
-- credential exposure
-- command injection
-- arbitrary filesystem access
-- remote code execution outside the intended sandbox
-- cross-session authorization issues
-
-treat the issue as high priority.
-
----
-
-# License
-
-See the repository's `LICENSE` file for the applicable license.
-
----
-
-# Summary
-
-Krix is designed to give AI agents powerful development capabilities without giving those capabilities unrestricted access to the Krix server.
-
-Its security model combines:
-
-```text
-Authentication
-      +
-Input validation
-      +
-Filesystem containment
-      +
-Bubblewrap isolation
-      +
-Linux namespaces
-      +
-Environment filtering
-      +
-Network controls
-      +
-Process limits
-      +
-Memory limits
-      +
-Output limits
-      +
-TTL cleanup
-      +
-API-level validation
-```
-
-The objective is not to make arbitrary code execution magically risk-free.
-
-The objective is to ensure that every powerful capability has a clearly defined boundary, that resources cannot grow indefinitely, and that failures are handled safely rather than silently weakening the security model.
+MIT License © [imanki-t](https://github.com/imanki-t)
