@@ -220,8 +220,13 @@ export function registerClient(req: Request, res: Response): void {
       return;
     }
 
+    const logoUri = typeof body.logo_uri === 'string' && /^https:\/\//i.test(body.logo_uri)
+      ? body.logo_uri.slice(0, 1024)
+      : (typeof body.client_logo === 'string' && /^https:\/\//i.test(body.client_logo) ? body.client_logo.slice(0, 1024) : undefined);
+
     const metadata = {
       client_name: typeof body.client_name === 'string' ? body.client_name.slice(0, 200) : undefined,
+      logo_uri: logoUri,
       redirect_uris: [...new Set(redirectUris as string[])]
     };
 
@@ -230,6 +235,7 @@ export function registerClient(req: Request, res: Response): void {
     res.status(201).json({
       client_id: clientId,
       client_name: metadata.client_name,
+      logo_uri: metadata.logo_uri,
       redirect_uris: metadata.redirect_uris,
       token_endpoint_auth_method: 'none',
       grant_types: ['authorization_code', 'refresh_token'],
