@@ -83,6 +83,15 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
 }
 
 const app = express();
+app.disable('x-powered-by');
+
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
 app.use(express.json({ limit: RESOURCE_LIMITS.maxRequestBodyBytes }));
 app.use(express.urlencoded({ extended: false, limit: '32kb' }));
 app.use('/assets', express.static('assets'));
