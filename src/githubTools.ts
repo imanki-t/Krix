@@ -891,14 +891,15 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('create_branch', {
-    description: 'Create branch.',
+    description: 'Create branch. refSha accepts a full 40-char commit SHA, a short SHA, or an existing branch/tag name — it is resolved to a full SHA automatically.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), branch: z.string(), refSha: z.string() },
     annotations: getToolAnnotations('create_branch')
   }, async (args: any) => {
     const { owner, repo, branch, refSha } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      await octokit.git.createRef({ owner: target.owner, repo: target.repo, ref: `refs/heads/${branch}`, sha: refSha });
+      const sha = await resolveFullSha(octokit, target.owner, target.repo, refSha);
+      await octokit.git.createRef({ owner: target.owner, repo: target.repo, ref: `refs/heads/${branch}`, sha });
       return formatOptimizedResponse(`Branch '${branch}' created.`);
     } catch (err) { return handleGitHubError(err); }
   });
