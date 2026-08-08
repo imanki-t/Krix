@@ -1,1047 +1,236 @@
-import 'dotenv/config';
 import crypto from 'node:crypto';
 import type { Request, Response } from 'express';
 
-const ISSUER = (process.env.OAUTH_ISSUER || '').replace(/\/$/, '');
-const SIGNING_SECRET = process.env.OAUTH_SIGNING_SECRET || '';
-const RESOURCE = `${ISSUER}/mcp`;
-
-const ACCESS_TTL_SECONDS = 60 * 60;           // 1 hour
-const AUTH_CODE_TTL_SECONDS = 5 * 60;         // 5 minutes
-const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
-
-type ClientMetadata = {
-  client_id: string;
-  client_name?: string;
-  logo_uri?: string;
-  redirect_uris: string[];
-};
-
-// Security: In-memory sliding window rate limiter & single-use auth code store
-const usedAuthCodes = new Map<string, number>();
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_MAX_ENTRIES = 4096;
-const USED_AUTH_CODE_MAX_ENTRIES = 20000;
-
-function pruneRateLimitMap(now: number = Date.now()): void {
-  for (const [key, entry] of rateLimitMap) {
-    if (now > entry.resetTime) rateLimitMap.delete(key);
-  }
-  if (rateLimitMap.size <= RATE_LIMIT_MAX_ENTRIES) return;
-  const oldest = [...rateLimitMap.entries()]
-    .sort((a, b) => a[1].resetTime - b[1].resetTime)
-    .slice(0, rateLimitMap.size - RATE_LIMIT_MAX_ENTRIES);
-  for (const [key] of oldest) rateLimitMap.delete(key);
+interface AuthorizationRequest {
+  clientId: string;
+  redirectUri: string;
+  state?: string;
+  codeChallenge: string;
+  codeChallengeMethod: 'S256';
+  scope?: string;
+  createdAt: number;
 }
 
-function pruneUsedAuthCodes(now: number = nowSeconds()): void {
-  for (const [nonce, exp] of usedAuthCodes) {
-    if (exp <= now) usedAuthCodes.delete(nonce);
-  }
+interface AuthorizationCode extends AuthorizationRequest {
+  code: string;
+  apiKey: string;
+  used: boolean;
 }
 
-function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
-  const now = Date.now();
-  pruneRateLimitMap(now);
-  const entry = rateLimitMap.get(key);
-  if (!entry || now > entry.resetTime) {
-    rateLimitMap.set(key, { count: 1, resetTime: now + windowMs });
-    return true;
-  }
-  if (entry.count >= limit) {
-    return false;
-  }
-  entry.count += 1;
-  return true;
+interface AccessToken {
+  apiKey: string;
+  clientId: string;
+  scope?: string;
+  expiresAt: number;
 }
 
-function getClientIp(req: Request): string {
-  // Do not trust a client-supplied X-Forwarded-For value for security
-  // decisions. Express is intentionally left with trust proxy disabled.
-  return req.socket.remoteAddress || req.ip || 'unknown';
+const authorizationRequests = new Map<string, AuthorizationRequest>();
+const authorizationCodes = new Map<string, AuthorizationCode>();
+const accessTokens = new Map<string, AccessToken>();
+const registeredClients = new Map<string, { clientName?: string; redirectUris: string[] }>();
+
+const AUTH_TTL_MS = 10 * 60 * 1000;
+const TOKEN_TTL_MS = 60 * 60 * 1000;
+
+function baseUrl(req: Request): string {
+  const configured = process.env.PUBLIC_BASE_URL?.replace(/\/$/, '');
+  if (configured) return configured;
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000').split(',')[0].trim();
+  return `${forwardedProto}://${host}`;
 }
 
-function requireConfig(): void {
-  if (!ISSUER || !/^https:\/\//i.test(ISSUER)) {
-    throw new Error('OAUTH_ISSUER must be the public HTTPS Krix URL.');
-  }
-  if (SIGNING_SECRET.length < 32) {
-    throw new Error('OAUTH_SIGNING_SECRET must be at least 32 characters.');
-  }
+function randomToken(bytes = 32): string {
+  return crypto.randomBytes(bytes).toString('base64url');
 }
 
-function b64url(input: string | Buffer): string {
-  return Buffer.from(input).toString('base64url');
+function htmlEscape(value: string): string {
+  return value.replace(/[&<>'"]/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  })[char]!);
 }
 
-function unb64url(input: string): string {
-  return Buffer.from(input, 'base64url').toString('utf8');
-}
-
-function hmac(data: string): string {
-  return crypto.createHmac('sha256', SIGNING_SECRET).update(data).digest('base64url');
-}
-
-function timingSafeEqualString(a: string, b: string): boolean {
-  const aa = Buffer.from(a);
-  const bb = Buffer.from(b);
-  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
-}
-
-function encodeSigned(payload: Record<string, unknown>): string {
-  requireConfig();
-  const body = b64url(JSON.stringify(payload));
-  return `${body}.${hmac(body)}`;
-}
-
-function decodeSigned<T extends Record<string, any>>(value: string): T | null {
+function validRedirectUri(value: string): boolean {
   try {
-    requireConfig();
-    const dot = value.lastIndexOf('.');
-    if (dot <= 0) return null;
-
-    const body = value.slice(0, dot);
-    const signature = value.slice(dot + 1);
-    const expected = hmac(body);
-    if (!timingSafeEqualString(signature, expected)) return null;
-
-    return JSON.parse(unb64url(body)) as T;
-  } catch {
-    return null;
-  }
-}
-
-function nowSeconds(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function validExpiry(exp: unknown): exp is number {
-  return typeof exp === 'number' && Number.isFinite(exp) && exp > nowSeconds();
-}
-
-function safeRedirectUri(uri: unknown): uri is string {
-  // MCP clients may use HTTPS redirect URIs. Loopback HTTP is allowed for local clients.
-  if (typeof uri !== 'string' || uri.length > 2048) return false;
-  try {
-    const url = new URL(uri);
-    return url.protocol === 'https:' ||
-      (url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname));
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.hostname === 'localhost' || url.hostname === '127.0.0.1';
   } catch {
     return false;
   }
 }
 
-function clientIdFor(metadata: Omit<ClientMetadata, 'client_id'>): string {
-  // Stateless client registration: the client ID contains signed metadata.
-  const payload = {
-    v: 1,
-    name: metadata.client_name || '',
-    logo: metadata.logo_uri || '',
-    redirects: [...metadata.redirect_uris].sort()
-  };
-  return `https://${new URL(ISSUER).host}/oauth/client/${encodeSigned(payload)}`;
+function verifyPkce(verifier: string, challenge: string): boolean {
+  const digest = crypto.createHash('sha256').update(verifier).digest('base64url');
+  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(challenge));
 }
 
-function parseClient(clientId: unknown): ClientMetadata | null {
-  if (typeof clientId !== 'string' || clientId.length > 2048) return null;
+export function oauthAuthorize(req: Request, res: Response): void {
+  const q = req.query;
+  const clientId = String(q.client_id || '');
+  const redirectUri = String(q.redirect_uri || '');
+  const responseType = String(q.response_type || '');
+  const codeChallenge = String(q.code_challenge || '');
+  const method = String(q.code_challenge_method || '');
 
-  try {
-    const prefix = `https://${new URL(ISSUER).host}/oauth/client/`;
-    if (!clientId.startsWith(prefix)) return null;
-
-    const payload = decodeSigned<Record<string, any>>(clientId.slice(prefix.length));
-    if (!payload || payload.v !== 1 || !Array.isArray(payload.redirects)) return null;
-    if (payload.redirects.length === 0 || payload.redirects.length > 20) return null;
-    if (payload.redirects.some((uri: unknown) => !safeRedirectUri(uri))) return null;
-
-    return {
-      client_id: clientId,
-      client_name: typeof payload.name === 'string' ? payload.name : undefined,
-      logo_uri: typeof payload.logo === 'string' && /^https:\/\//i.test(payload.logo) ? payload.logo : undefined,
-      redirect_uris: payload.redirects
-    };
-  } catch {
-    return null;
-  }
-}
-
-function resolveDynamicClientLogo(clientName?: string, redirectUris: string[] = [], explicitLogo?: string): string | undefined {
-  if (explicitLogo && /^https:\/\//i.test(explicitLogo)) {
-    return explicitLogo;
+  if (responseType !== 'code' || !clientId || !redirectUri || !codeChallenge || method !== 'S256' || !validRedirectUri(redirectUri)) {
+    res.status(400).type('text/plain').send('Invalid OAuth authorization request. PKCE (S256) is required.');
+    return;
   }
 
-  // Resolve well-known clients before redirect-domain fallbacks. Gemini Spark
-  // commonly registers as "Spark" or "Custom apps for Spark"; resolving the
-  // redirect URI first would incorrectly return a generic favicon.
-  if (clientName) {
-    const nameLower = clientName.toLowerCase().trim();
-
-    if (nameLower.includes('gemini') || nameLower.includes('spark') || nameLower.includes('google')) {
-      return 'https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a611345.svg';
-    }
-    if (nameLower.includes('claude')) return 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/logo.png';
-    if (nameLower.includes('cursor')) return 'https://www.cursor.com/favicon.ico';
-    if (nameLower.includes('copilot') || nameLower.includes('github')) return 'https://github.githubassets.com/favicons/favicon.png';
-    if (nameLower.includes('chatgpt') || nameLower.includes('openai')) return 'https://openai.com/favicon.ico';
-    if (nameLower.includes('antigravity')) return 'https://antigravity.dev/favicon.ico';
-
-    const domainMatch = nameLower.match(/([a-z0-9-]+\.[a-z]{2,})/);
-    if (domainMatch) {
-      return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domainMatch[1])}&sz=128`;
-    }
+  const registered = registeredClients.get(clientId);
+  const allowedUris = registered?.redirectUris || [];
+  if (allowedUris.length > 0 && !allowedUris.includes(redirectUri)) {
+    res.status(400).type('text/plain').send('redirect_uri is not registered for this client.');
+    return;
   }
 
-  // Try extracting origin domain from redirect URIs for otherwise unknown
-  // web/cloud clients. This remains a browser-side image request; Krix never
-  // fetches an attacker-controlled logo URL server-side.
-  for (const uri of redirectUris) {
-    try {
-      const url = new URL(uri);
-      if (url.protocol === 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
-        return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(url.hostname)}&sz=128`;
-      }
-    } catch {}
-  }
+  const requestId = randomToken(18);
+  authorizationRequests.set(requestId, {
+    clientId,
+    redirectUri,
+    state: q.state ? String(q.state) : undefined,
+    codeChallenge,
+    codeChallengeMethod: 'S256',
+    scope: q.scope ? String(q.scope) : undefined,
+    createdAt: Date.now()
+  });
 
-  if (clientName) {
-    const cleanName = clientName.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
-    if (cleanName) {
-      return `https://www.google.com/s2/favicons?domain=${cleanName}.com&sz=128`;
-    }
-  }
+  const appName = process.env.APP_NAME || 'Krix';
+  const logoUrl = process.env.APP_LOGO_URL || `${baseUrl(req)}/logo.svg`;
+  const clientName = registered?.clientName || String(q.client_name || 'MCP client');
 
-  return undefined;
-}
-
-export function oauthResource(): string {
-  return RESOURCE;
-}
-
-export function protectedResourceMetadataUrl(): string {
-  return `${ISSUER}/.well-known/oauth-protected-resource`;
-}
-
-export function sendProtectedResourceMetadata(_req: Request, res: Response): void {
-  try {
-    requireConfig();
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    const logoUrl = `${ISSUER}/logo.jpg`;
-    res.json({
-      resource: RESOURCE,
-      authorization_servers: [ISSUER],
-      bearer_methods_supported: ['header'],
-      scopes_supported: ['mcp'],
-      logo_uri: logoUrl,
-      icon_url: logoUrl,
-      icons: [{ src: logoUrl, mimeType: 'image/jpeg', sizes: ['512x512'] }]
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server misconfigured.' });
-  }
-}
-
-export function sendAuthorizationServerMetadata(_req: Request, res: Response): void {
-  try {
-    requireConfig();
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    const logoUrl = `${ISSUER}/logo.jpg`;
-    res.json({
-      issuer: ISSUER,
-      authorization_endpoint: `${ISSUER}/oauth/authorize`,
-      token_endpoint: `${ISSUER}/oauth/token`,
-      registration_endpoint: `${ISSUER}/oauth/register`,
-      response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
-      code_challenge_methods_supported: ['S256'],
-      token_endpoint_auth_methods_supported: ['none'],
-      scopes_supported: ['mcp'],
-      logo_uri: logoUrl,
-      icon_url: logoUrl,
-      icons: [{ src: logoUrl, mimeType: 'image/jpeg', sizes: ['512x512'] }],
-      // We deliberately use stateless DCR. Client metadata is carried in the signed client_id.
-      client_id_metadata_document_supported: false
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server misconfigured.' });
-  }
-}
-
-export function registerClient(req: Request, res: Response): void {
-  try {
-    requireConfig();
-
-    if (!checkRateLimit(`register:${getClientIp(req)}`, 15, 60000)) {
-      res.status(429).json({ error: 'slow_down', error_description: 'Rate limit exceeded for client registration.' });
-      return;
-    }
-
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-
-    const body = req.body || {};
-    const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
-
-    if (
-      !redirectUris.length ||
-      redirectUris.length > 20 ||
-      redirectUris.some((uri: unknown) => !safeRedirectUri(uri))
-    ) {
-      res.status(400).json({
-        error: 'invalid_client_metadata',
-        error_description: 'redirect_uris must contain valid HTTPS URLs or local loopback HTTP URLs.'
-      });
-      return;
-    }
-
-    const logoUri = typeof body.logo_uri === 'string' && /^https:\/\//i.test(body.logo_uri)
-      ? body.logo_uri.slice(0, 1024)
-      : (typeof body.client_logo === 'string' && /^https:\/\//i.test(body.client_logo) ? body.client_logo.slice(0, 1024) : undefined);
-
-    const metadata = {
-      client_name: typeof body.client_name === 'string' ? body.client_name.slice(0, 200) : undefined,
-      logo_uri: logoUri,
-      redirect_uris: [...new Set(redirectUris as string[])]
-    };
-
-    const clientId = clientIdFor(metadata);
-
-    res.status(201).json({
-      client_id: clientId,
-      client_name: metadata.client_name,
-      logo_uri: metadata.logo_uri,
-      redirect_uris: metadata.redirect_uris,
-      token_endpoint_auth_method: 'none',
-      grant_types: ['authorization_code', 'refresh_token'],
-      response_types: ['code']
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server misconfigured.' });
-  }
-}
-
-export function authorize(req: Request, res: Response): void {
-  try {
-    requireConfig();
-
-    if (!checkRateLimit(`auth_get:${getClientIp(req)}`, 30, 60000)) {
-      res.status(429).send('Rate limit exceeded. Please try again in a minute.');
-      return;
-    }
-
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('X-Frame-Options', 'DENY');
-    const cspNonce = crypto.randomBytes(16).toString('base64');
-    res.setHeader(
-      'Content-Security-Policy',
-      [
-        "default-src 'self'",
-        "base-uri 'none'",
-        "object-src 'none'",
-        `script-src 'nonce-${cspNonce}'`,
-        "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' https: data: blob:",
-        "connect-src 'none'",
-        "form-action 'self'",
-        "frame-ancestors 'none'",
-        "upgrade-insecure-requests"
-      ].join('; ')
-    );
-
-    const {
-      response_type,
-      client_id,
-      redirect_uri,
-      scope = 'mcp',
-      state,
-      code_challenge,
-      code_challenge_method = 'S256',
-      resource = RESOURCE
-    } = req.query;
-
-    const client = parseClient(client_id);
-    const redirect = typeof redirect_uri === 'string' ? redirect_uri : '';
-    const safeState = typeof state === 'string' ? state : '';
-
-    if (
-      response_type !== 'code' ||
-      safeState.length > 2048 ||
-      !client ||
-      !client.redirect_uris.includes(redirect) ||
-      code_challenge_method !== 'S256' ||
-      typeof code_challenge !== 'string' ||
-      !/^[A-Za-z0-9_-]{43,128}$/.test(code_challenge) ||
-      resource !== RESOURCE ||
-      (typeof scope === 'string' && scope !== 'mcp')
-    ) {
-      res.status(400).send('Invalid OAuth authorization request.');
-      return;
-    }
-
-    // Dynamically resolve client logo (supports Gemini Spark, AntiGravity, Claude, Cursor, OpenAI, or custom redirect domains)
-    const logoUrl = resolveDynamicClientLogo(client.client_name, client.redirect_uris, client.logo_uri);
-
-    // Generate stateless signed anti-CSRF token
-    const csrfToken = encodeSigned({
-      typ: 'csrf',
-      client_id: client.client_id,
-      exp: nowSeconds() + 600,
-      nonce: crypto.randomBytes(16).toString('base64url')
-    });
-
-    const hidden = (name: string, value: string) =>
-      `<input type="hidden" name="${name}" value="${escapeHtml(value)}">`;
-
-    res.type('html').send(`<!doctype html>
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' https:; base-uri 'none'; frame-ancestors 'none'; object-src 'none'");
+  res.setHeader('Cache-Control', 'no-store');
+  res.type('html').send(`<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Authorize ${escapeHtml(client.client_name || 'MCP Client')} &ndash; Krix</title>
-<link rel="icon" type="image/jpeg" href="/logo.jpg">
-<link rel="shortcut icon" href="/logo.jpg">
-<link rel="apple-touch-icon" href="/logo.jpg">
-<meta name="application-name" content="Krix">
-<meta name="theme-color" content="#4f46e5">
-<meta property="og:title" content="Krix Authorization Gateway">
-<meta property="og:description" content="Authorize access to your Krix MCP tools and sandbox environment.">
-<meta property="og:image" content="/logo.jpg">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect ${htmlEscape(appName)}</title>
+<link rel="icon" href="${htmlEscape(logoUrl)}" type="image/svg+xml">
 <style>
-  :root {
-    --bg: #f8fafc;
-    --card-bg: #ffffff;
-    --card-border: #e2e8f0;
-    --text-main: #0f172a;
-    --text-muted: #64748b;
-    --accent: #4f46e5;
-    --accent-hover: #4338ca;
-    --accent-glow: rgba(79, 70, 229, 0.15);
-    --input-bg: #f1f5f9;
-    --input-border: #cbd5e1;
-    --input-focus: #4f46e5;
-    --badge-bg: #e0e7ff;
-    --badge-text: #3730a3;
-    --shield-bg: #ecfdf5;
-    --shield-text: #065f46;
-    --shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01);
-  }
-
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0b0f19;
-      --card-bg: #111827;
-      --card-border: #1f2937;
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --accent: #6366f1;
-      --accent-hover: #4f46e5;
-      --accent-glow: rgba(99, 102, 241, 0.25);
-      --input-bg: #1e293b;
-      --input-border: #334155;
-      --input-focus: #6366f1;
-      --badge-bg: #312e81;
-      --badge-text: #e0e7ff;
-      --shield-bg: #064e3b;
-      --shield-text: #a7f3d0;
-      --shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-    }
-  }
-
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background-color: var(--bg);
-    color: var(--text-main);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 100vh;
-    padding: 24px;
-    line-height: 1.5;
-  }
-
-  @keyframes fadeInUp {
-    from { opacity: 0; transform: translateY(16px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-
-  @keyframes pulseGlow {
-    0%, 100% { opacity: 0.5; transform: scale(1); }
-    50% { opacity: 1; transform: scale(1.12); }
-  }
-
-  .card {
-    background: var(--card-bg);
-    border: 1px solid var(--card-border);
-    border-radius: 20px;
-    padding: 36px 32px;
-    max-width: 440px;
-    width: 100%;
-    box-shadow: var(--shadow);
-    animation: fadeInUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  }
-
-  .brand-header {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 18px;
-    margin-bottom: 28px;
-  }
-
-  .node-logo {
-    width: 52px;
-    height: 52px;
-    border-radius: 14px;
-    object-fit: cover;
-    border: 2px solid var(--card-border);
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-  }
-
-  .client-avatar {
-    width: 52px;
-    height: 52px;
-    border-radius: 14px;
-    background: var(--badge-bg);
-    color: var(--badge-text);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: 700;
-    font-size: 20px;
-    border: 2px solid var(--card-border);
-    overflow: hidden;
-    position: relative;
-  }
-
-  .client-logo-img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-
-  .client-initial {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    height: 100%;
-  }
-
-  .connection-line {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--accent);
-  }
-
-  .connection-line svg {
-    animation: pulseGlow 2s infinite ease-in-out;
-  }
-
-  .title-group {
-    text-align: center;
-    margin-bottom: 24px;
-  }
-
-  .title-group h1 {
-    font-size: 22px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    margin-bottom: 8px;
-  }
-
-  .title-group p {
-    font-size: 14px;
-    color: var(--text-muted);
-  }
-
-  .scope-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-    background: var(--shield-bg);
-    color: var(--shield-text);
-    border-radius: 20px;
-    font-size: 12px;
-    font-weight: 600;
-    margin-top: 12px;
-  }
-
-  .form-group {
-    margin-top: 24px;
-  }
-
-  .form-group label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-muted);
-    margin-bottom: 8px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-
-  .input-wrapper {
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
-
-  .input-icon {
-    position: absolute;
-    left: 14px;
-    color: var(--text-muted);
-    pointer-events: none;
-  }
-
-  input[type="password"] {
-    width: 100%;
-    padding: 12px 14px 12px 42px;
-    font-size: 15px;
-    background: var(--input-bg);
-    border: 1px solid var(--input-border);
-    border-radius: 12px;
-    color: var(--text-main);
-    outline: none;
-    transition: border-color 0.2s ease, box-shadow 0.2s ease;
-  }
-
-  input[type="password"]:focus {
-    border-color: var(--input-focus);
-    box-shadow: 0 0 0 4px var(--accent-glow);
-  }
-
-  .btn-authorize {
-    width: 100%;
-    padding: 13px;
-    margin-top: 20px;
-    border: none;
-    border-radius: 12px;
-    background: var(--accent);
-    color: #ffffff;
-    font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    transition: background-color 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
-  }
-
-  .btn-authorize:hover {
-    background: var(--accent-hover);
-    box-shadow: 0 4px 12px var(--accent-glow);
-  }
-
-  .btn-authorize:active {
-    transform: scale(0.98);
-  }
-
-  .security-footer {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    margin-top: 22px;
-    font-size: 12px;
-    color: var(--text-muted);
-    text-align: center;
-  }
-
-  .security-footer svg {
-    flex-shrink: 0;
-  }
-</style>
-<script nonce="${cspNonce}">
-  window.addEventListener('DOMContentLoaded', () => {
-    document.querySelectorAll('img[data-client-logo]').forEach((img) => {
-      img.addEventListener('error', () => {
-        img.style.display = 'none';
-        const fallback = img.nextElementSibling;
-        if (fallback) fallback.style.display = 'flex';
-      }, { once: true });
-    });
-  });
-</script>
-</head>
-<body>
-<div class="card">
-  <div class="brand-header">
-    <div class="client-avatar" title="${escapeHtml(client.client_name || 'Client')}">
-      ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(client.client_name || 'Client')}" class="client-logo-img" data-client-logo>` : ''}
-      <div class="client-initial" ${logoUrl ? 'style="display:none;"' : ''}>
-        ${escapeHtml((client.client_name || 'C').charAt(0).toUpperCase())}
-      </div>
-    </div>
-    <div class="connection-line">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-      </svg>
-    </div>
-    <img src="/logo.jpg" alt="Krix Logo" class="node-logo">
-  </div>
-
-  <div class="title-group">
-    <h1>Authorize Krix Access</h1>
-    <p><b>${escapeHtml(client.client_name || 'An MCP client')}</b> is requesting permission to execute Krix MCP tools on your behalf.</p>
-    <div class="scope-badge">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-        <polyline points="9 12 11 14 15 10"/>
-      </svg>
-      MCP Server &amp; Tools Access
-    </div>
-  </div>
-
-  <form method="post" action="/oauth/authorize">
-    ${hidden('client_id', client.client_id)}
-    ${hidden('redirect_uri', redirect)}
-    ${hidden('scope', 'mcp')}
-    ${hidden('state', safeState)}
-    ${hidden('code_challenge', code_challenge)}
-    ${hidden('resource', RESOURCE)}
-    ${hidden('_csrf', csrfToken)}
-
-    <div class="form-group">
-      <label for="approval_key">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="7.5" cy="15.5" r="5.5"/>
-          <path d="m21 2-9.6 9.6"/>
-          <path d="m15.5 7.5 3 3"/>
-        </svg>
-        Krix API Key
-      </label>
-      <div class="input-wrapper">
-        <svg class="input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-        </svg>
-        <input id="approval_key" type="password" name="approval_key" placeholder="Enter secret API key" autocomplete="current-password" required autofocus>
-      </div>
-    </div>
-
-    <button type="submit" class="btn-authorize">
-      Authorize Access
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-        <line x1="5" y1="12" x2="19" y2="12"/>
-        <polyline points="12 5 19 12 12 19"/>
-      </svg>
-    </button>
-  </form>
-
-  <div class="security-footer">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="12" cy="12" r="10"/>
-      <line x1="12" y1="16" x2="12" y2="12"/>
-      <line x1="12" y1="8" x2="12.01" y2="8"/>
-    </svg>
-    Only authorize applications and clients you recognize.
-  </div>
-</div>
-</body>
-</html>`);
-  } catch (error: any) {
-    res.status(500).send('OAuth configuration error.');
-  }
+:root{color-scheme:light;--ink:#111113;--muted:#73737a;--line:#e7e7e9;--surface:#fff;--soft:#f5f5f6;--accent:#111113;}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#f4f4f3;color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;padding:24px}.shell{width:min(460px,100%)}.card{background:rgba(255,255,255,.96);border:1px solid var(--line);border-radius:28px;padding:32px;box-shadow:0 24px 70px rgba(0,0,0,.08)}.brand{display:flex;align-items:center;gap:14px;margin-bottom:28px}.logo{width:48px;height:48px;border-radius:15px;border:1px solid var(--line);object-fit:cover;background:#111}.eyebrow{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700}.title{font-size:30px;line-height:1.08;letter-spacing:-.04em;margin:7px 0 10px}.copy{color:var(--muted);line-height:1.6;margin:0 0 26px}.client{display:inline-flex;align-items:center;background:var(--soft);border-radius:999px;padding:8px 12px;font-size:13px;font-weight:650;margin-bottom:22px}.field{display:block;font-size:13px;font-weight:700;margin:0 0 8px}.input{width:100%;height:50px;border:1px solid #d9d9dc;border-radius:14px;background:#fff;padding:0 15px;font:inherit;outline:none}.input:focus{border-color:#888;box-shadow:0 0 0 4px #1111110b}.button{width:100%;height:50px;margin-top:16px;border:0;border-radius:14px;background:#111113;color:#fff;font:inherit;font-weight:750;cursor:pointer}.button:hover{background:#2a2a2d}.hint{font-size:12px;color:var(--muted);margin-top:16px;text-align:center}.footer{margin-top:16px;text-align:center;color:#999;font-size:12px}
+</style></head><body><main class="shell"><section class="card">
+<div class="brand"><img class="logo" id="logo" src="${htmlEscape(logoUrl)}" alt="${htmlEscape(appName)} logo"><div><div class="eyebrow">Secure connection</div><strong>${htmlEscape(appName)}</strong></div></div>
+<div class="client">Connecting from ${htmlEscape(clientName)}</div>
+<h1 class="title">Authorize access</h1>
+<p class="copy">Enter your Krix access key to authorize this MCP connection. Your key is used only to establish the connection and is never shown to the client.</p>
+<form id="authorize-form">
+<input type="hidden" id="request_id" value="${htmlEscape(requestId)}">
+<label class="field" for="access_key">Access key</label>
+<input class="input" id="access_key" type="password" autocomplete="current-password" required autofocus placeholder="Enter your Krix access key">
+<button class="button" type="submit">Authorize connection</button>
+</form>
+<div class="hint">OAuth 2.1 · PKCE · one-time authorization code</div>
+</section><div class="footer">${htmlEscape(appName)} MCP Gateway</div></main>
+<script>
+(function(){const form=document.getElementById('authorize-form'); form?.addEventListener('submit',async function(event){event.preventDefault(); const key=document.getElementById('access_key').value; const requestId=document.getElementById('request_id').value; const button=form.querySelector('button'); button.disabled=true; button.textContent='Authorizing…'; try { const body=new URLSearchParams({request_id:requestId,access_key:key}); const response=await fetch('/oauth/authorize',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}); if(response.redirected){window.location.assign(response.url);return;} if(!response.ok) throw new Error(await response.text()); window.location.assign(response.url); } catch(error){ button.disabled=false; button.textContent='Authorize connection'; alert('Authorization failed. Please check your access key and try again.'); } }); const img=document.getElementById('logo'); if(!img)return; img.addEventListener('error',function(){img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="24" fill="#111"/><path d="M24 48 40 24h16L40 48l16 24H40L24 48Zm28 0 16-24h4l-16 24 16 24h-4L52 48Z" fill="white"/></svg>');},{once:true});})();
+</script></body></html>`);
 }
 
-export function authorizePost(req: Request, res: Response): void {
-  try {
-    requireConfig();
+export function oauthAuthorizePost(req: Request, res: Response): void {
+  const requestId = String(req.body?.request_id || '');
+  const accessKey = String(req.body?.access_key || '');
+  const auth = authorizationRequests.get(requestId);
 
-    if (!checkRateLimit(`auth_post:${getClientIp(req)}`, 10, 60000)) {
-      res.status(429).send('Rate limit exceeded. Too many authorization attempts.');
-      return;
-    }
-
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('X-Frame-Options', 'DENY');
-    const cspNonce = crypto.randomBytes(16).toString('base64');
-    res.setHeader(
-      'Content-Security-Policy',
-      [
-        "default-src 'self'",
-        "base-uri 'none'",
-        "object-src 'none'",
-        `script-src 'nonce-${cspNonce}'`,
-        "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' https: data: blob:",
-        "connect-src 'none'",
-        "form-action 'self'",
-        "frame-ancestors 'none'",
-        "upgrade-insecure-requests"
-      ].join('; ')
-    );
-
-    const {
-      client_id,
-      redirect_uri,
-      scope = 'mcp',
-      state = '',
-      code_challenge,
-      resource = RESOURCE,
-      approval_key,
-      _csrf
-    } = req.body || {};
-    const safeState = typeof state === 'string' ? state : '';
-
-    if (safeState.length > 2048) {
-      res.status(400).send('Invalid OAuth state.');
-      return;
-    }
-
-    // Validate anti-CSRF token
-    const csrfPayload = typeof _csrf === 'string' ? decodeSigned<Record<string, any>>(_csrf) : null;
-    if (
-      !csrfPayload ||
-      csrfPayload.typ !== 'csrf' ||
-      csrfPayload.client_id !== client_id ||
-      !validExpiry(csrfPayload.exp)
-    ) {
-      res.status(400).send('CSRF validation failed or token expired.');
-      return;
-    }
-
-    // Origin / Referer check for post requests
-    const origin = req.headers['origin'] || req.headers['referer'];
-    if (typeof origin === 'string' && /^https:\/\//i.test(origin)) {
-      try {
-        const originHost = new URL(origin).host;
-        const issuerHost = new URL(ISSUER).host;
-        if (originHost !== issuerHost) {
-          res.status(400).send('Cross-origin form submission blocked.');
-          return;
-        }
-      } catch {}
-    }
-
-    const client = parseClient(client_id);
-    const configuredKey = process.env.MCP_API_KEY || '';
-
-    if (
-      !client ||
-      !client.redirect_uris.includes(redirect_uri) ||
-      resource !== RESOURCE ||
-      scope !== 'mcp' ||
-      typeof code_challenge !== 'string' ||
-      !/^[A-Za-z0-9_-]{43,128}$/.test(code_challenge) ||
-      !configuredKey ||
-      !timingSafeEqualString(String(approval_key || ''), configuredKey)
-    ) {
-      res.status(400).send('Authorization denied.');
-      return;
-    }
-
-    // The authorization code is signed and self-contained.
-    const code = encodeSigned({
-      typ: 'authorization_code',
-      client_id,
-      redirect_uri,
-      code_challenge,
-      resource: RESOURCE,
-      scope: 'mcp',
-      iat: nowSeconds(),
-      exp: nowSeconds() + AUTH_CODE_TTL_SECONDS,
-      nonce: crypto.randomBytes(16).toString('base64url')
-    });
-
-    const target = new URL(redirect_uri);
-    target.searchParams.set('code', code);
-    if (safeState) target.searchParams.set('state', safeState);
-    res.redirect(target.toString());
-  } catch (error: any) {
-    res.status(500).send('OAuth configuration error.');
+  if (!auth || Date.now() - auth.createdAt > AUTH_TTL_MS) {
+    res.status(400).type('text/plain').send('Authorization request expired. Please restart the connection.');
+    return;
   }
+  authorizationRequests.delete(requestId);
+
+  if (!process.env.MCP_API_KEY || accessKey !== process.env.MCP_API_KEY) {
+    res.status(401).type('text/html').send('<!doctype html><html><body style="font-family:system-ui;display:grid;place-items:center;min-height:100vh"><div><h2>Authorization failed</h2><p>The access key is invalid.</p><p><a href="javascript:history.back()">Go back</a></p></div></body></html>');
+    return;
+  }
+
+  const code = randomToken(32);
+  authorizationCodes.set(code, { ...auth, code, apiKey: accessKey, used: false });
+  const redirect = new URL(auth.redirectUri);
+  redirect.searchParams.set('code', code);
+  if (auth.state) redirect.searchParams.set('state', auth.state);
+  res.redirect(302, redirect.toString());
 }
 
-export function token(req: Request, res: Response): void {
-  try {
-    requireConfig();
+export function oauthToken(req: Request, res: Response): void {
+  const grantType = String(req.body?.grant_type || '');
+  const code = String(req.body?.code || '');
+  const clientId = String(req.body?.client_id || '');
+  const redirectUri = String(req.body?.redirect_uri || '');
+  const verifier = String(req.body?.code_verifier || '');
 
-    if (!checkRateLimit(`token:${getClientIp(req)}`, 30, 60000)) {
-      res.status(429).json({ error: 'slow_down', error_description: 'Rate limit exceeded for token endpoint.' });
-      return;
-    }
-
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-
-    const grantType = req.body?.grant_type;
-    if (grantType === 'authorization_code') {
-      issueFromCode(req, res);
-      return;
-    }
-    if (grantType === 'refresh_token') {
-      issueFromRefresh(req, res);
-      return;
-    }
-    res.status(400).json({ error: 'unsupported_grant_type' });
-  } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server error.' });
+  if (grantType !== 'authorization_code' || !code || !clientId || !redirectUri || !verifier) {
+    res.status(400).json({ error: 'invalid_request' });
+    return;
   }
-}
 
-function issueFromCode(req: Request, res: Response): void {
-  const { code, client_id, redirect_uri, code_verifier, resource = RESOURCE } = req.body || {};
-  const payload = typeof code === 'string'
-    ? decodeSigned<Record<string, any>>(code)
-    : null;
-
-  const client = parseClient(client_id);
-
-  if (
-    !payload ||
-    payload.typ !== 'authorization_code' ||
-    !validExpiry(payload.exp) ||
-    !client ||
-    payload.client_id !== client_id ||
-    payload.redirect_uri !== redirect_uri ||
-    payload.resource !== resource ||
-    payload.scope !== 'mcp' ||
-    typeof code_verifier !== 'string' ||
-    code_verifier.length < 43 ||
-    code_verifier.length > 128
-  ) {
+  const record = authorizationCodes.get(code);
+  if (!record || record.used || Date.now() - record.createdAt > AUTH_TTL_MS || record.clientId !== clientId || record.redirectUri !== redirectUri) {
     res.status(400).json({ error: 'invalid_grant' });
     return;
   }
-
-  // Single-use enforcement: authorization code replay prevention. Keep only
-  // unexpired nonces so the store stays bounded without ever clearing recent
-  // entries wholesale (which would re-enable replay).
-  pruneUsedAuthCodes();
-  if (typeof payload.nonce === 'string' && usedAuthCodes.has(payload.nonce)) {
-    res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code already redeemed.' });
-    return;
-  }
-  const expectedChallenge = crypto.createHash('sha256').update(code_verifier).digest('base64url');
-  if (!timingSafeEqualString(expectedChallenge, payload.code_challenge)) {
-    res.status(400).json({ error: 'invalid_grant' });
+  if (!verifyPkce(verifier, record.codeChallenge)) {
+    res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed.' });
     return;
   }
 
-  if (typeof payload.nonce === 'string') {
-    if (usedAuthCodes.size >= USED_AUTH_CODE_MAX_ENTRIES) {
-      pruneUsedAuthCodes();
-    }
-    if (usedAuthCodes.size >= USED_AUTH_CODE_MAX_ENTRIES) {
-      res.status(503).json({ error: 'temporarily_unavailable' });
-      return;
-    }
-    usedAuthCodes.set(payload.nonce, payload.exp);
-  }
+  record.used = true;
+  authorizationCodes.delete(code);
+  const accessToken = randomToken(32);
+  const expiresIn = Math.floor(TOKEN_TTL_MS / 1000);
+  accessTokens.set(accessToken, { apiKey: record.apiKey, clientId, scope: record.scope, expiresAt: Date.now() + TOKEN_TTL_MS });
 
-  issueTokens(res, client_id, payload.scope, payload.resource);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: expiresIn, scope: record.scope || 'mcp' });
 }
 
-function issueFromRefresh(req: Request, res: Response): void {
-  const supplied = String(req.body?.refresh_token || '');
-  const payload = decodeSigned<Record<string, any>>(supplied);
-
-  if (
-    !payload ||
-    payload.typ !== 'refresh_token' ||
-    !validExpiry(payload.exp) ||
-    typeof payload.client_id !== 'string' ||
-    payload.resource !== RESOURCE ||
-    payload.scope !== 'mcp'
-  ) {
-    res.status(400).json({ error: 'invalid_grant' });
+export function oauthRegister(req: Request, res: Response): void {
+  const redirectUris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris.map(String) : [];
+  if (!redirectUris.length || redirectUris.some((uri: string) => !validRedirectUri(uri))) {
+    res.status(400).json({ error: 'invalid_redirect_uri' });
     return;
   }
+  const clientId = `krix_${randomToken(18)}`;
+  registeredClients.set(clientId, { clientName: req.body?.client_name ? String(req.body.client_name) : undefined, redirectUris });
+  res.status(201).json({ client_id: clientId, client_name: req.body?.client_name || 'MCP client', redirect_uris: redirectUris, token_endpoint_auth_method: 'none', grant_types: ['authorization_code'], response_types: ['code'] });
+}
 
-  const client = parseClient(req.body?.client_id);
-  if (!client || client.client_id !== payload.client_id) {
-    res.status(400).json({ error: 'invalid_grant' });
-    return;
+export function resolveOAuthAccessToken(token: string): string | undefined {
+  const record = accessTokens.get(token);
+  if (!record) return undefined;
+  if (Date.now() >= record.expiresAt) {
+    accessTokens.delete(token);
+    return undefined;
   }
-
-  issueTokens(res, payload.client_id, payload.scope, payload.resource);
+  return record.apiKey;
 }
 
-function issueTokens(res: Response, clientId: string, scope: string, resource: string): void {
-  const now = nowSeconds();
-
-  const accessToken = encodeSigned({
-    typ: 'access_token',
-    iss: ISSUER,
-    aud: resource,
-    sub: clientId,
-    scope,
-    iat: now,
-    exp: now + ACCESS_TTL_SECONDS,
-    jti: crypto.randomBytes(16).toString('base64url')
-  });
-
-  const refreshToken = encodeSigned({
-    typ: 'refresh_token',
-    iss: ISSUER,
-    aud: resource,
-    client_id: clientId,
-    scope,
-    iat: now,
-    exp: now + REFRESH_TTL_SECONDS,
-    jti: crypto.randomBytes(32).toString('base64url')
-  });
-
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.set('Pragma', 'no-cache');
-  res.json({
-    access_token: accessToken,
-    token_type: 'Bearer',
-    expires_in: ACCESS_TTL_SECONDS,
-    refresh_token: refreshToken,
-    scope
-  });
+export function oauthMetadata(req: Request) {
+  const base = baseUrl(req);
+  return {
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    registration_endpoint: `${base}/oauth/register`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none'],
+    scopes_supported: ['mcp'],
+    logo_uri: process.env.APP_LOGO_URL || `${base}/logo.svg`
+  };
 }
 
-function decodeValidAccessToken(tokenValue: string): Record<string, any> | null {
-  if (typeof tokenValue !== 'string' || tokenValue.length > 4096) return null;
-  const payload = decodeSigned<Record<string, any>>(tokenValue);
-  if (
-    !payload ||
-    payload.typ !== 'access_token' ||
-    payload.iss !== ISSUER ||
-    payload.aud !== RESOURCE ||
-    typeof payload.sub !== 'string' ||
-    payload.scope !== 'mcp' ||
-    !validExpiry(payload.exp)
-  ) {
-    return null;
-  }
-  return payload;
+export function protectedResourceMetadata(req: Request) {
+  const base = baseUrl(req);
+  return { resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: ['mcp'] };
 }
 
-export function verifyAccessToken(tokenValue: string): boolean {
-  return !!decodeValidAccessToken(tokenValue);
-}
-
-/**
- * Returns a stable per-token identity for sandbox/session isolation. The
- * access-token jti is intentionally included so different OAuth tokens for
- * the same public client cannot share a sandbox.
- */
-export function getAccessTokenIdentity(tokenValue: string): string | undefined {
-  const payload = decodeValidAccessToken(tokenValue);
-  if (!payload || typeof payload.jti !== 'string' || payload.jti.length < 16) return undefined;
-  return `oauth:${payload.sub}:${payload.jti}`;
-}
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  }[c] || c));
-}
+const cleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of authorizationRequests) if (now - value.createdAt > AUTH_TTL_MS) authorizationRequests.delete(key);
+  for (const [key, value] of authorizationCodes) if (now - value.createdAt > AUTH_TTL_MS || value.used) authorizationCodes.delete(key);
+  for (const [key, value] of accessTokens) if (now >= value.expiresAt) accessTokens.delete(key);
+}, 60_000);
+cleanup.unref();
