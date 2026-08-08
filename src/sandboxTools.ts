@@ -692,15 +692,28 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('git_checkout', {
-    description: 'Switch or create a branch in the active cloned repo.',
+    description: 'Switch or create a branch in the active cloned repo. Automatically fetches from origin first if the branch is not yet known locally (e.g. it was created remotely after the clone).',
     inputSchema: { branch: z.string(), create: z.boolean().optional().default(false) },
     annotations: getToolAnnotations('git_checkout')
   }, async (args: any) => {
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+
       const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
-      const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
+      let { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
+
+      if (err && !args.create) {
+        // Local checkout failed — the branch may exist on origin but not yet
+        // locally (e.g. it was created remotely after this clone). Fetch it
+        // and retry once before giving up.
+        const fetchCmd = `git ${authFlag(githubToken)}fetch origin ${args.branch}:${args.branch}`;
+        const fetchRes = await run(fetchCmd, ctx.sandboxDir, 15000);
+        if (!fetchRes.err) {
+          ({ err, stdout, stderr } = await run(`git checkout ${args.branch}`, ctx.sandboxDir, 15000));
+        }
+      }
+
       if (err) return execResponse(sessionId, err, stdout, stderr);
       updateSessionContext(sessionId, { branch: args.branch });
       return formatOptimizedResponse({ branch: args.branch });
