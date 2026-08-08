@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
-  <title>Krix</title><desc>Minimal Krix gateway mark</desc>
-  <rect width="128" height="128" rx="32" fill="#111113"/>
-  <path d="M34 29h18v27l21-27h22L69 62l27 37H74L52 69v30H34z" fill="#fff"/>
-  <circle cx="96" cy="30" r="7" fill="#fff" opacity=".42"/>
-</svg>
