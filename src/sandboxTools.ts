@@ -35,10 +35,6 @@ function procTable(sessionId: string): Map<number, ActiveProcess> {
   return t;
 }
 
-// Proactive safety net alongside the on-demand pruning in sandbox_ps: a
-// caller who backgrounds jobs but never polls sandbox_ps would otherwise
-// keep exited entries (and their buffered output) alive forever. Sweeps
-// every identity's table on a timer regardless of whether anyone's asking.
 const processTablePruneTimer = setInterval(() => {
   const now = Date.now();
   for (const table of processTables.values()) {
@@ -49,9 +45,6 @@ const processTablePruneTimer = setInterval(() => {
 }, 5 * 60 * 1000);
 processTablePruneTimer.unref();
 
-// Keeps only the most recent BG_BUF_CAP chars of a background process's
-// output — bounds memory for long-running/chatty jobs instead of buffering
-// unbounded stdout/stderr for the lifetime of the sandbox.
 function appendCapped(buf: string, chunk: string, cap: number = BG_BUF_CAP): string {
   const next = buf + chunk;
   return next.length > cap ? next.slice(next.length - cap) : next;
@@ -63,12 +56,6 @@ function trunc(s: string, cap: number = OUT_CAP): string {
   return clean.length > cap ? `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated]` : clean;
 }
 
-// --- Paginated output cache -------------------------------------------
-// trunc() alone drops anything past its cap with no way to retrieve it.
-// truncWithCache() additionally stashes the full string (only when it was
-// actually truncated) under a short-lived id, scoped per session so one
-// session can never read another's cached output. sandbox_output serves
-// paginated reads from this cache.
 interface CachedOutput { content: string; createdAt: number; }
 const outputCache = new Map<string, Map<string, CachedOutput>>();
 const OUTPUT_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -120,10 +107,6 @@ function execResponse(sessionId: string, err: any, stdout: string, stderr: strin
 }
 
 function sandboxEnv(sessionId?: string): NodeJS.ProcessEnv {
-  // process.env.HOME can point at a directory that doesn't exist in this
-  // container (e.g. /home/sbx_userXXXX), which makes npm/pip fail with
-  // ENOENT trying to create their cache/config dirs there. Pin HOME (and
-  // the npm cache) to the sandbox's own writable tmp dir instead.
   const safeHome = path.join(os.tmpdir(), 'krix_home');
   try { require('node:fs').mkdirSync(safeHome, { recursive: true }); } catch {}
   const sessionEnv = sessionId ? (getSessionContext(sessionId).env || {}) : {};
@@ -150,8 +133,6 @@ async function sandboxRoot(sessionId: string): Promise<string> {
 
 async function workDir(sessionId: string): Promise<string> {
   const ctx = getSessionContext(sessionId);
-  // A persisted default cwd (set via set_active_context) wins over the
-  // cloned-repo/scratch-root default, but only if it still exists.
   if (ctx.cwd) {
     try { await fs.access(ctx.cwd); return ctx.cwd; } catch {}
   }
@@ -161,10 +142,6 @@ async function workDir(sessionId: string): Promise<string> {
   return sandboxRoot(sessionId);
 }
 
-// Resolves an optional user-supplied `dir` against the sandbox root (so
-// callers can target the cloned repo, a scratch subfolder, or any other
-// path within the sandbox — not just whatever workDir() currently returns),
-// creating it if needed. Falls back to workDir() when no dir is given.
 async function resolveDir(sessionId: string, dir?: string): Promise<string> {
   if (!dir) return workDir(sessionId);
   const root = await sandboxRoot(sessionId);
@@ -173,41 +150,14 @@ async function resolveDir(sessionId: string, dir?: string): Promise<string> {
   return target;
 }
 
-// --- Persistent shell sessions -------------------------------------------
-// sandbox_exec previously spawned a brand-new process via exec() on every
-// call, so `cd`, `export`, activating a venv, etc. never survived between
-// calls — the dir/env args added some of that back, but not real shell
-// state. This keeps one long-lived bash process alive per (identity,
-// session) pair — see shellKey() below — and pipes commands into its
-// stdin, reading output back out until a unique sentinel line appears.
-// stdout+stderr are merged (`2>&1`) for the
-// duration of each individual command only — bash redirections on a simple
-// command don't persist past that command — which sidesteps a race between
-// two separately-buffered pipes with no reliable way to know both streams
-// are done at the same moment.
 interface PersistentShell { proc: ChildProcess; buf: string; busy: boolean; }
 const persistentShells = new Map<string, PersistentShell>();
 const SHELL_HANG_MS = 60000;
 
-// Shell identity: authKey scopes it to the user (so one user's shell can
-// never be reached or torn down by another user), sessionId further scopes
-// it to a single session of that user (so concurrent sessions/tabs of the
-// SAME user each get their own shell instead of contending for one, and so
-// one session's idle-timeout/disconnect can't kill a shell another of that
-// user's sessions is still using). The sandbox filesystem is intentionally
-// still shared per-authKey (see sandboxRoot) — only the live shell process
-// is session-scoped.
 function shellKey(sessionId: string): string {
   return `${getAuthKeyForSession(sessionId)}::${sessionId}`;
 }
 
-// Guards shell creation against a race: getShell awaits workDir() before it
-// registers the new shell, so two concurrent calls for the same key
-// (no shell running yet) can both pass the `existing` check, both spawn a
-// bash process, and the second persistentShells.set() silently overwrites
-// the first — orphaning a live, untracked child process. Callers that land
-// mid-creation await the same in-flight promise instead of racing to spawn
-// their own.
 const shellCreation = new Map<string, Promise<PersistentShell>>();
 
 async function getShell(sessionId: string): Promise<PersistentShell> {
@@ -253,9 +203,6 @@ async function runInShell(sessionId: string, command: string, timeoutMs: number)
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      // We don't know what state the shell is in (mid-command, hung on
-      // input, etc.), so don't try to reuse it — kill it and let the next
-      // call spawn a fresh one. Only this session's shell is affected.
       killShell(shellKey(sessionId));
       resolve({ stdout: shell.buf, exit: -1, timedOut: true });
     }, timeoutMs);
@@ -277,18 +224,11 @@ async function runInShell(sessionId: string, command: string, timeoutMs: number)
 
     shell.proc.stdout?.on('data', check);
     shell.proc.stdin?.write(`${command} 2>&1\necho "${marker}:$?"\n`);
-    // In case the marker arrived in the same tick data already buffered.
     check();
   });
 }
-// ---------------------------------------------------------------------------
 
 export async function destroySandbox(sessionId: string, options: { deleteContext?: boolean } = { deleteContext: true }): Promise<void> {
-  // Capture the auth key BEFORE deleting session context — deleteSessionContext()
-  // removes the sessionId->authKey mapping, after which getAuthKeyForSession()
-  // falls back to 'anonymous', which would target the wrong (nonexistent)
-  // scratch directory and the wrong (empty) process table, leaving the real
-  // ones untouched.
   const authKey = getAuthKeyForSession(sessionId);
   const dirToRemove = path.join(os.tmpdir(), `krix_sbx_${authKey}`);
   const shellToKill = shellKey(sessionId);
@@ -375,9 +315,6 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const timeoutMs = Math.min(args.timeoutMs || 30000, 120000);
 
       if (args.persistent) {
-        // `dir` (if given) only cd's for this one command — it doesn't
-        // change the persistent shell's real cwd for future calls, same as
-        // a subshell cd would behave.
         const cmd = args.dir ? `cd "${cwd}" && ${args.command}` : args.command;
         const { stdout, exit, timedOut } = await runInShell(sessionId, cmd, Math.min(timeoutMs, SHELL_HANG_MS));
         if (timedOut) return formatError(`Command timed out after ${timeoutMs}ms and the persistent shell was restarted (its prior state is lost). Use background:true for long-running commands instead.`);
@@ -449,11 +386,6 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     annotations: getToolAnnotations('sandbox_install')
   }, async (args: any) => {
     try {
-      // Default (no dir given) is the auth-scoped root, not workDir() —
-      // workDir() returns the cloned repo's directory once one exists, and
-      // installing there modified the repo's real package.json/
-      // package-lock.json or dumped raw pip package files into the git
-      // working tree. Pass `dir` explicitly if you really want that.
       const cwd = args.dir ? await resolveDir(sessionId, args.dir) : await sandboxRoot(sessionId);
       const list = args.packages.join(' ');
       const cmd = args.manager === 'npm' ? `npm install ${list}` : `pip install --quiet --target=. ${list}`;
@@ -475,8 +407,6 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   }, async (args: any) => {
     const table = procTable(sessionId);
 
-    // Prune old exited entries so the table doesn't grow unbounded across
-    // many background runs — running processes are never pruned.
     const now = Date.now();
     for (const [pid, item] of table) {
       if (item.status === 'exited' && item.exitedAt && now - item.exitedAt.getTime() > EXITED_TTL_MS) table.delete(pid);
@@ -681,7 +611,6 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         await fs.access(path.join(dest, '.git'));
         isExisting = true;
       } catch {
-        // If folder exists but is empty or missing .git, remove it so we can re-clone cleanly
         try {
           await fs.rm(dest, { recursive: true, force: true });
         } catch {}
@@ -737,7 +666,6 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
       let { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
       if (err && !args.create) {
-        // Branch likely isn't known locally yet — fetch it from origin and retry once.
         const fetchCmd = `git fetch origin ${args.branch}:${args.branch}`;
         const fetchResult = await run(fetchCmd, ctx.sandboxDir, 15000);
         if (!fetchResult.err) {
