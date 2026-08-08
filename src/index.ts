@@ -11,7 +11,7 @@ import { registerGitHubTools } from './githubTools.js';
 import { registerRenderTools } from './renderTools.js';
 import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
 import {
-  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory, getSessionContext, registerSessionAuth
+  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory, getSessionContext, registerSessionAuth, RESOURCE_LIMITS
 } from './security.js';
 
 dotenv.config();
@@ -72,7 +72,7 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
 }
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: RESOURCE_LIMITS.maxRequestBodyBytes }));
 app.use('/assets', express.static('assets'));
 app.get('/logo.jpg', (_req, res) => res.sendFile(path.resolve('assets/logo.jpg')));
 
@@ -117,6 +117,15 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
         res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: error?.message }, id: req.body?.id || null });
       }
     }
+    return;
+  }
+
+  if (transports.size >= RESOURCE_LIMITS.maxSessions) {
+    res.status(429).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Krix session capacity reached. Wait for an idle session to expire and retry.' },
+      id: req.body?.id || null
+    });
     return;
   }
 

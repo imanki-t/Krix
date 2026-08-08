@@ -3,6 +3,33 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 
+
+// Resource ceilings tuned for small 512 MB-class hosts (including Render Free).
+// These are intentionally generous for normal agent workloads while keeping all
+// in-memory collections bounded. They are application-level guards, not a
+// replacement for container/OS memory limits.
+export const RESOURCE_LIMITS = {
+  maxSessions: 24,
+  maxAuthContexts: 128,
+  maxEnvVars: 128,
+  maxEnvBytes: 256 * 1024,
+  maxInputString: 2 * 1024 * 1024,
+  maxRegexLength: 16 * 1024,
+  maxRequestBodyBytes: 32 * 1024 * 1024,
+  maxOutputCacheEntriesGlobal: 64,
+  maxOutputCacheBytesGlobal: 32 * 1024 * 1024,
+  maxBackgroundProcessesPerAuth: 8,
+  maxBackgroundProcessesGlobal: 16,
+  maxPersistentShellsGlobal: 12,
+  maxConcurrentExecutionsGlobal: 4,
+  maxExecutionQueue: 8,
+  maxPushFiles: 100,
+  maxPushFileBytes: 4 * 1024 * 1024,
+  maxPushTotalBytes: 16 * 1024 * 1024,
+  maxSandboxFileBytes: 16 * 1024 * 1024,
+  maxSandboxDirBytes: 256 * 1024 * 1024,
+} as const;
+
 export enum PermissionLevel {
   READ_ONLY = 'READ_ONLY',
   MUTATING = 'MUTATING',
@@ -72,11 +99,25 @@ export function cleanupSessionState(sessionId: string): void {
 function authBucket(sessionId: string) {
   const key = sessionAuthKey.get(sessionId) || 'anonymous';
   let bucket = lastKnownContextByAuth.get(key);
-  if (bucket && Date.now() - bucket.lastUsed > AUTH_CONTEXT_TTL_MS) {
+  const now = Date.now();
+  if (bucket && now - bucket.lastUsed > AUTH_CONTEXT_TTL_MS) {
+    lastKnownContextByAuth.delete(key);
     bucket = undefined;
   }
-  if (!bucket) { bucket = { lastUsed: Date.now() }; lastKnownContextByAuth.set(key, bucket); }
-  else { bucket.lastUsed = Date.now(); }
+  if (!bucket) {
+    if (lastKnownContextByAuth.size >= RESOURCE_LIMITS.maxAuthContexts) {
+      let oldestKey: string | undefined;
+      let oldest = Infinity;
+      for (const [candidate, value] of lastKnownContextByAuth) {
+        if (value.lastUsed < oldest) { oldest = value.lastUsed; oldestKey = candidate; }
+      }
+      if (oldestKey) lastKnownContextByAuth.delete(oldestKey);
+    }
+    bucket = { lastUsed: now };
+    lastKnownContextByAuth.set(key, bucket);
+  } else {
+    bucket.lastUsed = now;
+  }
   return bucket;
 }
 

@@ -7,6 +7,7 @@ interface RenderSessionEntry { sessionId: string; lastActive: number; }
 const renderSessions = new Map<string, RenderSessionEntry>();
 
 const RENDER_SESSION_TTL_MS = 30 * 60 * 1000;
+const MAX_RENDER_SESSIONS = 8;
 const RENDER_SESSION_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 const renderSessionPruneTimer = setInterval(() => {
   const now = Date.now();
@@ -46,13 +47,22 @@ async function getRenderSession(renderToken: string): Promise<string> {
     }
     const sessionId = response.headers.get('mcp-session-id');
     if (!sessionId) throw new Error('Render MCP missing session header.');
-    renderSessions.set(cacheKey, { sessionId, lastActive: Date.now() });
+    if (renderSessions.size >= MAX_RENDER_SESSIONS) {
+    let oldestKey: string | undefined;
+    let oldest = Infinity;
+    for (const [key, entry] of renderSessions) {
+      if (entry.lastActive < oldest) { oldest = entry.lastActive; oldestKey = key; }
+    }
+    if (oldestKey) renderSessions.delete(oldestKey);
+  }
+  renderSessions.set(cacheKey, { sessionId, lastActive: Date.now() });
     return sessionId;
   } catch (err) { clearTimeout(timeoutId); throw err; }
 }
 
 async function callRenderTool(toolName: string, args: any, renderToken: string | undefined) {
   if (!renderToken) return formatError(new Error('Render API key missing.'));
+  const cacheKey = renderCacheKey(renderToken);
   try {
     const sessionId = await getRenderSession(renderToken);
     const controller = new AbortController();
@@ -69,7 +79,10 @@ async function callRenderTool(toolName: string, args: any, renderToken: string |
       if (res.status === 401 || res.status === 403) renderSessions.delete(renderCacheKey(renderToken));
       throw new Error(`Render MCP request failed (${res.status}): ${body.slice(0, 500)}`);
     }
-    const data: any = await res.json();
+    const raw = await res.text();
+    if (Buffer.byteLength(raw, 'utf8') > 8 * 1024 * 1024) throw new Error('Render MCP response exceeded the 8 MB safety limit.');
+    let data: any;
+    try { data = JSON.parse(raw); } catch { throw new Error('Render MCP returned invalid JSON.'); }
     if (data?.error) return formatError(new Error(data.error.message || JSON.stringify(data.error)));
     return formatOptimizedResponse(data?.result || data);
   } catch (err: any) {
