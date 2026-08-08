@@ -1,3 +1,1 @@
-Initial test content
-Updated Line 2 via str_replace_editor
-Updated Line 3 via patch_contents
+Batch updated test file 1
