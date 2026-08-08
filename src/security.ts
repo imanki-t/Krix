@@ -424,11 +424,129 @@ export function sanitizePath(inputPath: string, rootDir: string = process.cwd())
   return resolved;
 }
 
-export function sanitizeCommand(cmd: string): void {
-  const dangerous = [/rm\s+-rf\s+[\/]/i, /mkfs/i, /dd\s+if=/i, />\s*\/dev\/sd/i, /:()\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;/i];
-  for (const pattern of dangerous) {
-    if (pattern.test(cmd)) throw new Error('Security Alert: Command blocked due to safety policy.');
+export function getNetworkRestrictionLevel(): 'low' | 'medium' | 'high' {
+  const level = (process.env.NETWORK_RESTRICTION_LEVEL || 'low').toLowerCase();
+  if (level === 'high') return 'high';
+  if (level === 'medium') return 'medium';
+  return 'low';
+}
+
+export function getCommandRestrictionLevel(): 'low' | 'medium' | 'high' {
+  const level = (process.env.COMMAND_RESTRICTION_LEVEL || 'low').toLowerCase();
+  if (level === 'high') return 'high';
+  if (level === 'medium') return 'medium';
+  return 'low';
+}
+
+export function sanitizeNetworkInCommand(cmd: string): void {
+  const netLevel = getNetworkRestrictionLevel();
+
+  const privateIpPatterns = [
+    /169\.254\.169\.254/,
+    /127\.0\.0\.1/,
+    /0\.0\.0\.0/,
+    /localhost/i,
+    /::1/,
+    /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
+    /\b172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}\b/,
+    /\b192\.168\.\d{1,3}\.\d{1,3}\b/
+  ];
+
+  for (const pattern of privateIpPatterns) {
+    if (pattern.test(cmd)) {
+      throw new Error(`Security Alert: Access to internal or private IP address blocked under ${netLevel.toUpperCase()} network restriction level.`);
+    }
   }
+
+  if (netLevel === 'medium') {
+    const rawIpPattern = /https?:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/i;
+    if (rawIpPattern.test(cmd)) {
+      throw new Error('Security Alert: Direct IP address URLs blocked under MEDIUM network restriction level.');
+    }
+    const suspiciousSchemes = /(gopher|dict|file|ftp):\/\//i;
+    if (suspiciousSchemes.test(cmd)) {
+      throw new Error('Security Alert: Non-HTTP network protocol blocked under MEDIUM network restriction level.');
+    }
+  }
+
+  if (netLevel === 'high') {
+    const urls = cmd.match(/https?:\/\/([^\s\/:\'\"]+)/gi);
+    if (urls) {
+      const allowedDomains = [
+        'github.com',
+        'githubusercontent.com',
+        'npmjs.org',
+        'npmjs.com',
+        'pypi.org',
+        'pythonhosted.org',
+        'render.com',
+        'google.com',
+        'googleapis.com',
+        'cloudflare.com',
+        'crates.io',
+        'deno.land',
+        'maven.org',
+        'debian.org',
+        'ubuntu.com'
+      ];
+      for (const rawUrl of urls) {
+        const domainMatch = rawUrl.match(/https?:\/\/([^\s\/:\'\"]+)/i);
+        if (domainMatch && domainMatch[1]) {
+          const host = domainMatch[1].toLowerCase();
+          const isAllowed = allowedDomains.some(d => host === d || host.endsWith('.' + d));
+          if (!isAllowed) {
+            throw new Error(`Security Alert: Domain '${host}' is blocked under HIGH network restriction level.`);
+          }
+        }
+      }
+    }
+  }
+}
+
+export function sanitizeCommand(cmd: string): void {
+  const cmdLevel = getCommandRestrictionLevel();
+  const lowPatterns = [
+    /rm\s+-rf\s+[\/]/i,
+    /rm\s+-rf\s+\/\*/i,
+    /mkfs/i,
+    /dd\s+if=/i,
+    />\s*\/dev\/sd/i,
+    /:()\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;/i
+  ];
+  const medPatterns = [
+    ...lowPatterns,
+    /shutdown/i,
+    /reboot/i,
+    /init\s+0/i,
+    /chmod\s+-R\s+777\s+[\/]/i,
+    /\/etc\/passwd/i,
+    /\/etc\/shadow/i,
+    /\/etc\/sudoers/i,
+    /\/sbin\//i,
+    /\/bin\/rm/i
+  ];
+  const highPatterns = [
+    ...medPatterns,
+    /\bsudo\b/i,
+    /\bsu\b/i,
+    /\bdoas\b/i,
+    /\bnmap\b/i,
+    /\bnc\s+-l/i,
+    /\bnetcat\s+-l/i,
+    /\bsocat\b/i,
+    /\binsmod\b/i,
+    /\bmodprobe\b/i,
+    /\biptables\b/i
+  ];
+
+  const activePatterns = cmdLevel === 'high' ? highPatterns : (cmdLevel === 'medium' ? medPatterns : lowPatterns);
+  for (const pattern of activePatterns) {
+    if (pattern.test(cmd)) {
+      throw new Error(`Security Alert: Command blocked under ${cmdLevel.toUpperCase()} command restriction level.`);
+    }
+  }
+
+  sanitizeNetworkInCommand(cmd);
 }
 
 export function resolveInputString(plain?: string, b64?: string): string {
