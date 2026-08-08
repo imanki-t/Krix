@@ -56,7 +56,12 @@ export function getAuthKeyForSession(sessionId: string): string {
 function authBucket(sessionId: string) {
   const key = sessionAuthKey.get(sessionId) || 'anonymous';
   let bucket = lastKnownContextByAuth.get(key);
-  if (!bucket) { bucket = {}; lastKnownContextByAuth.set(key, bucket); }
+  if (bucket && Date.now() - bucket.lastUsed > AUTH_CONTEXT_TTL_MS) {
+    // Stale — drop it rather than silently resuming an old owner/repo/branch.
+    bucket = undefined;
+  }
+  if (!bucket) { bucket = { lastUsed: Date.now() }; lastKnownContextByAuth.set(key, bucket); }
+  else { bucket.lastUsed = Date.now(); }
   return bucket;
 }
 
