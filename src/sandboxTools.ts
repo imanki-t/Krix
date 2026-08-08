@@ -651,6 +651,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       await fs.mkdir(path.dirname(dest), { recursive: true });
       const url = `https://github.com/${owner}/${repo}.git`;
       const cmd = `git ${authFlag(githubToken)}clone --depth ${args.depth || 1} --branch ${branch} --single-branch "${url}" "${dest}"`;
+      sanitizeCommand(cmd);
       const { err, stdout, stderr } = await run(cmd, root, 60000);
       if (err) return execResponse(sessionId, err, stdout, stderr);
 
