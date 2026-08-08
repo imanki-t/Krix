@@ -331,12 +331,8 @@ export function authorize(req: Request, res: Response): void {
       return;
     }
 
-    // Determine primary client logo (logo_uri or auto-detected logo for Claude)
-    const logoUrl = client.logo_uri || (
-      /claude/i.test(client.client_name || '')
-        ? 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/logo.png'
-        : undefined
-    );
+    // Dynamically resolve client logo (supports Gemini Spark, AntiGravity, Claude, Cursor, OpenAI, or custom redirect domains)
+    const logoUrl = resolveDynamicClientLogo(client.client_name, client.redirect_uris, client.logo_uri);
 
     // Generate stateless signed anti-CSRF token
     const csrfToken = encodeSigned({
