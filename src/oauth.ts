@@ -146,6 +146,49 @@ function parseClient(clientId: unknown): ClientMetadata | null {
   }
 }
 
+function resolveDynamicClientLogo(clientName?: string, redirectUris: string[] = [], explicitLogo?: string): string | undefined {
+  if (explicitLogo && /^https:\/\//i.test(explicitLogo)) {
+    return explicitLogo;
+  }
+
+  // 1. Try extracting origin domain from redirect URIs (for web/cloud client apps)
+  for (const uri of redirectUris) {
+    try {
+      const url = new URL(uri);
+      if (url.protocol === 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
+        return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(url.hostname)}&sz=128`;
+      }
+    } catch {}
+  }
+
+  // 2. Dynamic matching based on client name or domain
+  if (clientName) {
+    const nameLower = clientName.toLowerCase().trim();
+
+    // Ecosystem brand matching
+    if (nameLower.includes('gemini')) return 'https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a611345.svg';
+    if (nameLower.includes('claude')) return 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/logo.png';
+    if (nameLower.includes('cursor')) return 'https://www.cursor.com/favicon.ico';
+    if (nameLower.includes('copilot') || nameLower.includes('github')) return 'https://github.githubassets.com/favicons/favicon.png';
+    if (nameLower.includes('chatgpt') || nameLower.includes('openai')) return 'https://openai.com/favicon.ico';
+    if (nameLower.includes('antigravity')) return 'https://antigravity.dev/favicon.ico';
+
+    // If client name is or contains a domain (e.g., "my-app.com")
+    const domainMatch = nameLower.match(/([a-z0-9-]+\.[a-z]{2,})/);
+    if (domainMatch) {
+      return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domainMatch[1])}&sz=128`;
+    }
+
+    // Dynamic fallback favicon fetch via brand name domain
+    const cleanName = nameLower.replace(/[^a-z0-9]/g, '');
+    if (cleanName) {
+      return `https://www.google.com/s2/favicons?domain=${cleanName}.com&sz=128`;
+    }
+  }
+
+  return undefined;
+}
+
 export function oauthResource(): string {
   return RESOURCE;
 }
