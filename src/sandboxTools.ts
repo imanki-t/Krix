@@ -606,6 +606,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const repo = args.repo || ctx.repo;
       if (!owner || !repo) throw new Error('owner/repo missing. Pass them or call set_active_context first.');
       const branch = args.branch || ctx.branch || 'main';
+      sanitizeCommand(branch);
 
       const root = await sandboxRoot(sessionId);
       const dest = path.join(root, owner, repo);
