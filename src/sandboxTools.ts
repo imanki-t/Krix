@@ -674,13 +674,47 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const branch = args.branch || ctx.branch || 'main';
 
       const root = await sandboxRoot(sessionId);
-      const dest = path.join(root, repo);
-      try {
-        await fs.access(dest);
-        updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
-        return formatOptimizedResponse({ note: 'already cloned', path: dest });
-      } catch {}
+      const dest = path.join(root, owner, repo);
 
+      let isExisting = false;
+      try {
+        await fs.access(path.join(dest, '.git'));
+        isExisting = true;
+      } catch {
+        // If folder exists but is empty or missing .git, remove it so we can re-clone cleanly
+        try {
+          await fs.rm(dest, { recursive: true, force: true });
+        } catch {}
+      }
+
+      if (isExisting) {
+        let checkoutErr: any = null;
+        const checkoutCmd = `git checkout ${branch}`;
+        let { err } = await run(checkoutCmd, dest, 15000);
+        if (err) {
+          const fetchCmd = `git ${authFlag(githubToken)}fetch origin ${branch}:${branch}`;
+          const fetchRes = await run(fetchCmd, dest, 15000);
+          if (!fetchRes.err) {
+            ({ err } = await run(`git checkout ${branch}`, dest, 15000));
+          } else {
+            const fetchRemote = await run(`git ${authFlag(githubToken)}fetch origin ${branch}`, dest, 15000);
+            if (!fetchRemote.err) {
+              ({ err } = await run(`git checkout -B ${branch} origin/${branch}`, dest, 15000));
+            }
+          }
+        }
+        if (err) checkoutErr = err;
+
+        updateSessionContext(sessionId, { owner, repo, branch, sandboxDir: dest });
+        return formatOptimizedResponse({
+          note: 'already cloned',
+          branch,
+          path: dest,
+          ...(checkoutErr ? { checkoutWarning: `Could not switch to branch '${branch}'` } : {})
+        });
+      }
+
+      await fs.mkdir(path.dirname(dest), { recursive: true });
       const url = `https://github.com/${owner}/${repo}.git`;
       const cmd = `git ${authFlag(githubToken)}clone --depth ${args.depth || 1} --branch ${branch} --single-branch "${url}" "${dest}"`;
       const { err, stdout, stderr } = await run(cmd, root, 60000);
