@@ -394,6 +394,20 @@ API keys should not be supplied through URLs.
 
 Avoid query-string secrets because URLs may appear in logs, tracing systems, proxies, browser history, or monitoring systems.
 
+## MCP OAuth Authentication
+
+For Claude, Cursor, Gemini Spark, AntiGravity, or any OAuth-capable MCP client, Krix provides built-in, stateless OAuth 2.0 authorization server support with Dynamic Client Registration (DCR), PKCE (S256), anti-CSRF tokens, sliding-window rate limiting, and dynamic client logo resolution.
+
+Configure the following environment variables in `.env`:
+
+```env
+# MCP OAuth (required for Claude / OAuth-capable MCP clients)
+# Set this to the exact public Krix URL, with no trailing slash.
+OAUTH_ISSUER=your_web_service_url
+# Long random secret (32+ characters). Keep this unchanged across redeploys.
+OAUTH_SIGNING_SECRET=your_33_characters_secret
+```
+
 ---
 
 # GitHub Authentication
