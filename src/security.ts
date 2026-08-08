@@ -17,34 +17,17 @@ export interface SessionContext {
   cwd?: string;
   env?: Record<string, string>;
   enabledCategories: Set<ToolCategory>;
-  /** True if this context was resumed from a prior session under the same
-   *  auth token (rather than starting fresh), and how old that data was. */
   resumedContext?: { fromPriorSession: true; idleMs: number };
 }
 
 const sessionContexts = new Map<string, SessionContext>();
 
-// This server can in principle be called with different GitHub tokens
-// (x-github-token header). Persisting "last known" owner/repo/branch/
-// sandboxDir must therefore be scoped to the authenticated identity, not
-// global — otherwise one caller's active repo could leak into another
-// caller's session after an mcp-session-id reset. sessionAuthKey maps the
-// live session to a hash of its token; lastKnownContextByAuth buckets
-// persisted context under that hash so it only ever resumes for the same
-// authenticated caller, never across identities.
 const sessionAuthKey = new Map<string, string>();
 const lastKnownContextByAuth = new Map<string, { owner?: string; repo?: string; branch?: string; sandboxDir?: string; cwd?: string; env?: Record<string, string>; lastUsed: number }>();
 
-// Without a TTL, this bucket would resurrect an owner/repo/branch/sandboxDir
-// into a brand-new session indefinitely — silently, with no signal to the
-// caller that the context wasn't fresh. Anything idle longer than this is
-// treated as stale and dropped rather than resumed. This is idle time, not
-// task duration — lastUsed refreshes on every tool call (see authBucket),
-// so a long-running task that keeps calling tools never trips this; only a
-// session that goes completely silent for the full window does.
-const MIN_AUTH_CONTEXT_TTL_MS = 5 * 60 * 1000;   // 5 minutes
-const MAX_AUTH_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const DEFAULT_AUTH_CONTEXT_TTL_MS = 60 * 60 * 1000;  // 1 hour
+const MIN_AUTH_CONTEXT_TTL_MS = 5 * 60 * 1000;
+const MAX_AUTH_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_AUTH_CONTEXT_TTL_MS = 60 * 60 * 1000;
 function resolveConfiguredTtl(): number {
   const raw = Number(process.env.AUTH_CONTEXT_TTL_MS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_AUTH_CONTEXT_TTL_MS;
@@ -52,12 +35,7 @@ function resolveConfiguredTtl(): number {
 }
 const AUTH_CONTEXT_TTL_MS = resolveConfiguredTtl();
 
-// authBucket() only overwrites a stale entry when that same key is touched
-// again — a key that's never revisited would otherwise sit in the map
-// forever. Actively sweep and remove anything past its TTL so the map is
-// bounded by recently-active tokens, not by every distinct token ever seen
-// over the process's lifetime.
-const AUTH_CONTEXT_PRUNE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const AUTH_CONTEXT_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 const authContextPruneTimer = setInterval(() => {
   const now = Date.now();
   for (const [key, bucket] of lastKnownContextByAuth) {
@@ -74,9 +52,6 @@ export function registerSessionAuth(sessionId: string, githubToken: string): voi
   sessionAuthKey.set(sessionId, hashAuth(githubToken));
 }
 
-// Exposed so other modules (e.g. sandboxTools) can key persistent
-// filesystem resources by the caller's identity rather than the raw
-// sessionId, which can churn between calls if mcp-session-id isn't resent.
 export function getAuthKeyForSession(sessionId: string): string {
   return sessionAuthKey.get(sessionId) || 'anonymous';
 }
@@ -85,7 +60,6 @@ function authBucket(sessionId: string) {
   const key = sessionAuthKey.get(sessionId) || 'anonymous';
   let bucket = lastKnownContextByAuth.get(key);
   if (bucket && Date.now() - bucket.lastUsed > AUTH_CONTEXT_TTL_MS) {
-    // Stale — drop it rather than silently resuming an old owner/repo/branch.
     bucket = undefined;
   }
   if (!bucket) { bucket = { lastUsed: Date.now() }; lastKnownContextByAuth.set(key, bucket); }
@@ -121,9 +95,7 @@ export function getSessionContext(sessionId: string): SessionContext {
     if (enableAdmin) initial.push('github_admin');
     if (enableRender) initial.push('render');
     if (enableSandbox) initial.push('sandbox');
-    // Peek at whether there's live (non-stale) prior data before authBucket()
-    // touches lastUsed, so we can tell the caller this context was resumed
-    // rather than fresh, and how long it had been sitting idle.
+
     const key = sessionAuthKey.get(sessionId) || 'anonymous';
     const priorRaw = lastKnownContextByAuth.get(key);
     const idleMs = priorRaw ? Date.now() - priorRaw.lastUsed : undefined;
@@ -148,10 +120,6 @@ export function updateSessionContext(sessionId: string, patch: Partial<SessionCo
   const current = getSessionContext(sessionId);
   Object.assign(current, patch);
   const known = authBucket(sessionId);
-  // Use 'in' rather than truthiness so an explicit clear (e.g. { sandboxDir:
-  // undefined } from sandbox_reset) actually propagates to the persisted
-  // bucket instead of being silently ignored — otherwise a session-id churn
-  // right after a reset would resurrect the stale value from the bucket.
   if ('owner' in patch) known.owner = patch.owner;
   if ('repo' in patch) known.repo = patch.repo;
   if ('branch' in patch) known.branch = patch.branch;
@@ -167,7 +135,6 @@ export function deleteSessionContext(sessionId: string): void {
 }
 
 export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
-  // Agentic Core Tools
   'set_active_context': PermissionLevel.READ_ONLY,
   'get_me': PermissionLevel.READ_ONLY,
   'get_file_contents': PermissionLevel.READ_ONLY,
@@ -189,7 +156,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'patch_contents': PermissionLevel.MUTATING,
   'sandbox_status': PermissionLevel.READ_ONLY,
 
-  // GitHub Issues & PRs
   'list_issues': PermissionLevel.READ_ONLY,
   'list_pull_requests': PermissionLevel.READ_ONLY,
   'issue_read': PermissionLevel.READ_ONLY,
@@ -206,7 +172,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'search_issues': PermissionLevel.READ_ONLY,
   'search_pull_requests': PermissionLevel.READ_ONLY,
 
-  // GitHub Admin & Extended
   'get_label': PermissionLevel.READ_ONLY,
   'get_release': PermissionLevel.READ_ONLY,
   'get_tag': PermissionLevel.READ_ONLY,
@@ -225,7 +190,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'request_copilot_review': PermissionLevel.MUTATING,
   'assign_copilot_to_issue': PermissionLevel.MUTATING,
 
-  // Render Tools
   'list_workspaces': PermissionLevel.READ_ONLY,
   'select_workspace': PermissionLevel.MUTATING,
   'get_selected_workspace': PermissionLevel.READ_ONLY,
@@ -248,7 +212,6 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'delete_env_var': PermissionLevel.MUTATING,
   'query_render_postgres': PermissionLevel.READ_ONLY,
 
-  // Sandbox & Git CLI Tools
   'sandbox_exec': PermissionLevel.MUTATING,
   'sandbox_run': PermissionLevel.MUTATING,
   'sandbox_install': PermissionLevel.MUTATING,
@@ -282,7 +245,6 @@ export function getToolAnnotations(toolName: string) {
 export type ToolCategory = 'core' | 'github_issues_prs' | 'github_admin' | 'render' | 'sandbox';
 
 export const TOOL_CATEGORY: Record<string, ToolCategory> = {
-  // Always-Enabled Agentic Core Tools
   set_active_context: 'core',
   get_me: 'core',
   get_file_contents: 'core',
@@ -302,7 +264,6 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   patch_contents: 'core',
   sandbox_status: 'core',
 
-  // Issues & PR Workflow Category
   list_issues: 'github_issues_prs',
   list_pull_requests: 'github_issues_prs',
   issue_read: 'github_issues_prs',
@@ -319,7 +280,6 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   search_issues: 'github_issues_prs',
   search_pull_requests: 'github_issues_prs',
 
-  // GitHub Extended / Admin Category
   get_commit: 'github_admin',
   search_commits: 'github_admin',
   get_label: 'github_admin',
@@ -340,7 +300,6 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   request_copilot_review: 'github_admin',
   assign_copilot_to_issue: 'github_admin',
 
-  // Render Cloud Services Category
   list_workspaces: 'render',
   select_workspace: 'render',
   get_selected_workspace: 'render',
@@ -363,7 +322,6 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
   delete_env_var: 'render',
   query_render_postgres: 'render',
 
-  // Sandbox & Local Git CLI Category
   sandbox_exec: 'sandbox',
   sandbox_run: 'sandbox',
   sandbox_install: 'sandbox',
@@ -441,7 +399,7 @@ export function sanitizeOutput(data: any): any {
       .replace(/(rnd_[a-zA-Z0-9]{24,32})/g, 'rnd_****')
       .replace(/(Bearer\s+)[a-zA-Z0-9._\-]+/gi, '$1[REDACTED]')
       .replace(/(x-api-key:\s*)[a-zA-Z0-9._\-]+/gi, '$1[REDACTED]')
-      .replace(/-----BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY-----[\s\S]+?-----END \1 KEY-----/g, '[REDACTED_KEY]');
+      .replace(/-----BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY-----\n[\s\S]+?\n-----END \1 KEY-----/g, '[REDACTED_KEY]');
   }
   if (typeof data === 'object') {
     const copy: any = Array.isArray(data) ? [] : {};
