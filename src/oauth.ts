@@ -416,6 +416,22 @@ export function authorize(req: Request, res: Response): void {
     font-weight: 700;
     font-size: 20px;
     border: 2px solid var(--card-border);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .client-logo-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .client-initial {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
   }
 
   .connection-line {
