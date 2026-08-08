@@ -44,9 +44,23 @@ function tagCategory(registry: Record<string, any>, categoryOf: Record<string, T
 }
 
 function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
+  const issuerUrl = (process.env.OAUTH_ISSUER || '').replace(/\/$/, '');
+  const logoUrl = issuerUrl ? `${issuerUrl}/logo.jpg` : undefined;
+
   const server = new McpServer({
     name: 'krix',
-    version: '1.0.0'
+    version: '1.0.0',
+    ...(logoUrl ? {
+      icons: [
+        {
+          src: logoUrl,
+          mimeType: 'image/jpeg',
+          sizes: ['512x512']
+        }
+      ],
+      iconUrl: logoUrl,
+      websiteUrl: issuerUrl
+    } : {})
   }, {
     capabilities: {
       tools: {
