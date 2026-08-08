@@ -202,11 +202,15 @@ export function sendProtectedResourceMetadata(_req: Request, res: Response): voi
     requireConfig();
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.setHeader('Pragma', 'no-cache');
+    const logoUrl = `${ISSUER}/logo.jpg`;
     res.json({
       resource: RESOURCE,
       authorization_servers: [ISSUER],
       bearer_methods_supported: ['header'],
-      scopes_supported: ['mcp']
+      scopes_supported: ['mcp'],
+      logo_uri: logoUrl,
+      icon_url: logoUrl,
+      icons: [{ src: logoUrl, mimeType: 'image/jpeg', sizes: ['512x512'] }]
     });
   } catch (error: any) {
     res.status(500).json({ error: 'server_configuration_error', error_description: 'Server misconfigured.' });
@@ -218,6 +222,7 @@ export function sendAuthorizationServerMetadata(_req: Request, res: Response): v
     requireConfig();
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.setHeader('Pragma', 'no-cache');
+    const logoUrl = `${ISSUER}/logo.jpg`;
     res.json({
       issuer: ISSUER,
       authorization_endpoint: `${ISSUER}/oauth/authorize`,
@@ -228,6 +233,9 @@ export function sendAuthorizationServerMetadata(_req: Request, res: Response): v
       code_challenge_methods_supported: ['S256'],
       token_endpoint_auth_methods_supported: ['none'],
       scopes_supported: ['mcp'],
+      logo_uri: logoUrl,
+      icon_url: logoUrl,
+      icons: [{ src: logoUrl, mimeType: 'image/jpeg', sizes: ['512x512'] }],
       // We deliberately use stateless DCR. Client metadata is carried in the signed client_id.
       client_id_metadata_document_supported: false
     });
