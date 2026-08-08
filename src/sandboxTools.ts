@@ -22,6 +22,7 @@ interface ActiveProcess {
   exitedAt: Date | null;
   stdout: string;
   stderr: string;
+  killTimer?: ReturnType<typeof setTimeout>;
 }
 
 const OUT_CAP = 100000;
@@ -70,6 +71,12 @@ function isolationArgs(root: string, cwd: string, network: boolean, env: NodeJS.
     '--new-session',
     '--cap-drop', 'ALL',
     '--unshare-all',
+    '--clearenv',
+    // Start from an empty root mount namespace. Only explicitly approved
+    // read-only system paths and the writable workspace are exposed below.
+    // This is what prevents /app, /proc (host), /root, /var, etc. from
+    // accidentally remaining visible through the host root filesystem.
+    '--tmpfs', '/',
     ...(network ? ['--share-net'] : []),
     '--proc', '/proc',
     '--dev', '/dev',
@@ -78,12 +85,13 @@ function isolationArgs(root: string, cwd: string, network: boolean, env: NodeJS.
     '--tmpfs', '/run',
     '--tmpfs', '/home',
     '--ro-bind', '/usr', '/usr',
+    '--ro-bind', '/usr/local', '/usr/local',
     '--ro-bind', '/bin', '/bin',
     '--ro-bind', '/sbin', '/sbin',
     '--ro-bind', '/lib', '/lib',
     '--ro-bind', '/etc', '/etc',
   ];
-  for (const dir of ['/lib64']) {
+  for (const dir of ['/lib64', '/opt']) {
     try { accessSync(dir, fsConstants.F_OK); args.push('--ro-bind', dir, dir); } catch {}
   }
   args.push('--bind', root, '/workspace');
@@ -196,6 +204,9 @@ const processTablePruneTimer = setInterval(() => {
     for (const [pid, item] of table) {
       if (item.status === 'exited' && item.exitedAt && now - item.exitedAt.getTime() > EXITED_TTL_MS) table.delete(pid);
     }
+  }
+  for (const [authKey, table] of processTables) {
+    if (table.size === 0) processTables.delete(authKey);
   }
 }, 5 * 60 * 1000);
 processTablePruneTimer.unref();
@@ -473,6 +484,19 @@ async function runInShell(sessionId: string, command: string, timeoutMs: number,
   });
 }
 
+export function cleanupSessionResources(sessionId: string): void {
+  // A Krix auth identity may have multiple live MCP sessions sharing one
+  // sandbox. Closing one session must not destroy that shared sandbox or kill
+  // processes belonging to the other sessions.
+  if (getAuthKeyForSession(sessionId)) {
+    killShell(shellKey(sessionId));
+    const cacheBucket = outputCache.get(sessionId);
+    if (cacheBucket) for (const id of cacheBucket.keys()) removeCachedOutput(cacheBucket, id);
+    outputCache.delete(sessionId);
+    deleteSessionContext(sessionId);
+  }
+}
+
 export async function destroySandbox(sessionId: string, options: { deleteContext?: boolean } = { deleteContext: true }): Promise<void> {
   const authKey = getAuthKeyForSession(sessionId);
   const dirToRemove = path.join(os.tmpdir(), `krix_sbx_${authKey}`);
@@ -618,21 +642,27 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         procTable(sessionId).set(pid, entry);
         proc.stdout?.on('data', (d) => { entry.stdout = appendCapped(entry.stdout, d.toString()); });
         proc.stderr?.on('data', (d) => { entry.stderr = appendCapped(entry.stderr, d.toString()); });
-        proc.on('exit', (code) => { entry.status = 'exited'; entry.exitCode = code; entry.exitedAt = new Date(); });
-        const maxRuntimeTimer = setTimeout(() => {
+        proc.on('exit', (code) => {
+          entry.status = 'exited';
+          entry.exitCode = code;
+          entry.exitedAt = new Date();
+          if (entry.killTimer) clearTimeout(entry.killTimer);
+        });
+        entry.killTimer = setTimeout(() => {
           if (entry.status === 'running') {
             try { entry.proc.kill('SIGKILL'); } catch {}
           }
         }, MAX_BACKGROUND_RUNTIME_MS);
-        maxRuntimeTimer.unref();
+        entry.killTimer.unref();
         return formatOptimizedResponse({ started: pid, command: args.command, dir: cwd });
       }
 
       const timeoutMs = Math.min(args.timeoutMs || 30000, 120000);
 
       if (args.persistent) {
-        const cmd = args.dir ? `cd "${cwd}" && ${args.command}` : args.command;
-        const { stdout, exit, timedOut } = await withExecutionSlot(() => runInShell(sessionId, cmd, Math.min(timeoutMs, SHELL_HANG_MS), args.network));
+        // runInShell already starts the shell with the validated cwd.
+        // Never interpolate a filesystem path into shell source.
+        const { stdout, exit, timedOut } = await withExecutionSlot(() => runInShell(sessionId, args.command, Math.min(timeoutMs, SHELL_HANG_MS), args.network));
         if (timedOut) return formatError(`Command timed out after ${timeoutMs}ms and the persistent shell was restarted (its prior state is lost). Use background:true for long-running commands instead.`);
         const out: Record<string, any> = {};
         const o = truncWithCache(sessionId, stdout);

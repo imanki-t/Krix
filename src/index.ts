@@ -9,9 +9,9 @@ import dotenv from 'dotenv';
 
 import { registerGitHubTools } from './githubTools.js';
 import { registerRenderTools } from './renderTools.js';
-import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
+import { registerSandboxTools, destroySandbox, cleanupSessionResources } from './sandboxTools.js';
 import {
-  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory, getSessionContext, registerSessionAuth, RESOURCE_LIMITS
+  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory, getSessionContext, registerSessionAuth, getAuthKeyForSession, RESOURCE_LIMITS
 } from './security.js';
 
 dotenv.config();
@@ -140,10 +140,19 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   });
 
   transport.onclose = () => {
-    if (transport.sessionId) {
-      destroySandbox(transport.sessionId);
-      transports.delete(transport.sessionId);
-    }
+    const closedId = transport.sessionId;
+    if (!closedId) return;
+    let closedAuth: string | undefined;
+    try { closedAuth = getAuthKeyForSession(closedId); } catch {}
+    transports.delete(closedId);
+    if (!closedAuth) return; // Already cleaned up by the idle/shutdown path.
+    const hasOtherSession = [...transports.keys()].some((id) => {
+      try { return getAuthKeyForSession(id) === closedAuth; } catch { return false; }
+    });
+    // The sandbox is shared by auth identity. Only the final live session for
+    // that identity may destroy the shared sandbox.
+    if (hasOtherSession) cleanupSessionResources(closedId);
+    else void destroySandbox(closedId);
   };
 
   const masterServer = createMasterServer(githubToken, renderToken, newSessionId);
@@ -166,9 +175,14 @@ const cleanupTimer = setInterval(() => {
   const maxIdle = 10 * 60 * 1000;
   for (const [id, entry] of transports.entries()) {
     if (now - entry.lastActive > maxIdle) {
-      destroySandbox(id);
-      try { entry.transport.close(); } catch {}
+      const authKey = (() => { try { return getAuthKeyForSession(id); } catch { return undefined; } })();
       transports.delete(id);
+      const hasOtherSession = authKey ? [...transports.keys()].some((otherId) => {
+        try { return getAuthKeyForSession(otherId) === authKey; } catch { return false; }
+      }) : false;
+      if (hasOtherSession) cleanupSessionResources(id);
+      else void destroySandbox(id);
+      try { entry.transport.close(); } catch {}
     }
   }
 }, 3 * 60 * 1000);
@@ -177,10 +191,23 @@ cleanupTimer.unref();
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => console.log(`🚀 Krix Active on Port ${PORT}`));
 
-function shutdown() {
+async function shutdown() {
   clearInterval(cleanupTimer);
-  for (const [id] of transports.entries()) destroySandbox(id);
-  server.close(() => process.exit(0));
+  const uniqueAuths = new Set<string>();
+  for (const [id] of transports.entries()) {
+    try {
+      const authKey = getAuthKeyForSession(id);
+      if (!uniqueAuths.has(authKey)) {
+        uniqueAuths.add(authKey);
+        await destroySandbox(id);
+      } else {
+        cleanupSessionResources(id);
+      }
+    } catch {}
+  }
+  transports.clear();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  process.exit(0);
 }
 
 process.on('SIGINT', shutdown);

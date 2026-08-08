@@ -565,32 +565,31 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('list_issue_fields', {
-    description: 'List custom issue fields.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
+    description: 'List custom issue fields defined for an organization. This is organization-level data, not repository labels.',
+    inputSchema: { org: z.string().optional(), owner: z.string().optional() },
     annotations: getToolAnnotations('list_issue_fields')
   }, async (args: any) => {
-    const { owner, repo } = args;
+    const org = args.org || args.owner;
+    if (!org) return formatError(new Error('Organization name is required (use org).'));
     try {
-      const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.issues.listLabelsForRepo({ owner: target.owner, repo: target.repo });
-      return formatOptimizedResponse(res.data.map(l => l.name));
+      const res = await octokit.request('GET /orgs/{org}/issue-fields', { org });
+      return formatOptimizedResponse(res.data);
     } catch (err) { return handleGitHubError(err); }
   });
 
   reg('list_issue_types', {
-    description: "List configured issue types.",
+    description: 'List issue types available for a repository, including organization inheritance and repository overrides.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional() },
     annotations: getToolAnnotations('list_issue_types')
   }, async (args: any) => {
-    const { owner, repo } = args;
     try {
-      const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.request('GET /orgs/{org}/issue-types', { org: target.owner });
-      return formatOptimizedResponse(res.data.map((t: any) => t.name));
-    } catch (err: any) {
-      if (err?.status === 404) return formatOptimizedResponse(['Bug', 'Feature', 'Task', 'Improvement']);
-      return handleGitHubError(err);
-    }
+      const target = resolveRepo(args.owner, args.repo, sessionId);
+      const res = await octokit.request('GET /repos/{owner}/{repo}/issue-types', {
+        owner: target.owner,
+        repo: target.repo
+      });
+      return formatOptimizedResponse(res.data);
+    } catch (err) { return handleGitHubError(err); }
   });
 
   reg('list_issues', {
@@ -889,11 +888,11 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('add_comment_to_pending_review', {
-    description: 'Add line comment to pending review.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), body: z.string(), path: z.string(), line: z.number(), commit_id: z.string().optional(), review_id: z.number() },
+    description: 'Create a line comment inside a new pending pull request review. The review remains pending until explicitly submitted.',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), body: z.string(), path: z.string(), line: z.number(), side: z.enum(['LEFT', 'RIGHT']).optional().default('RIGHT'), commit_id: z.string().optional() },
     annotations: getToolAnnotations('add_comment_to_pending_review')
   }, async (args: any) => {
-    const { owner, repo, pull_number, body, path, line, commit_id, review_id } = args;
+    const { owner, repo, pull_number, body, path, line, side, commit_id } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
       let activeCommitId = commit_id;
@@ -901,10 +900,15 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
         const pr = await octokit.pulls.get({ owner: target.owner, repo: target.repo, pull_number });
         activeCommitId = pr.data.head.sha;
       }
-      const res = await octokit.pulls.createReviewComment({
-        owner: target.owner, repo: target.repo, pull_number, body, path, line, commit_id: activeCommitId
+      const res = await octokit.pulls.createReview({
+        owner: target.owner,
+        repo: target.repo,
+        pull_number,
+        commit_id: activeCommitId,
+        event: '',
+        comments: [{ path, line, side, body }]
       });
-      return formatOptimizedResponse(`Comment ID: ${res.data.id}`);
+      return formatOptimizedResponse({ reviewId: res.data.id, state: res.data.state, pending: res.data.state === 'PENDING' });
     } catch (err) { return handleGitHubError(err); }
   });
 
@@ -922,7 +926,7 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('add_reply_to_pull_request_comment', {
-    description: 'Reply to PR comment.',
+    description: 'Reply to a pull request review comment.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), pull_number: z.number(), comment_id: z.number(), body: z.string() },
     annotations: getToolAnnotations('add_reply_to_pull_request_comment')
   }, async (args: any) => {
@@ -1173,15 +1177,26 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('sub_issue_write', {
-    description: 'Create sub-issue.',
+    description: 'Create a real GitHub sub-issue and attach it to a parent issue.',
     inputSchema: { owner: z.string().optional(), repo: z.string().optional(), parent_issue_number: z.number(), title: z.string(), body: z.string().optional() },
     annotations: getToolAnnotations('sub_issue_write')
   }, async (args: any) => {
     const { owner, repo, parent_issue_number, title, body } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      const res = await octokit.issues.create({ owner: target.owner, repo: target.repo, title: `[Sub-issue #${parent_issue_number}] ${title}`, body });
-      return formatOptimizedResponse(`Sub-issue #${res.data.number} created.`);
+      const created = await octokit.issues.create({ owner: target.owner, repo: target.repo, title, body });
+      const attached = await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/sub_issues', {
+        owner: target.owner,
+        repo: target.repo,
+        issue_number: parent_issue_number,
+        sub_issue_id: created.data.id
+      });
+      return formatOptimizedResponse({
+        createdIssue: { number: created.data.number, id: created.data.id, url: created.data.html_url },
+        parentIssue: parent_issue_number,
+        attached: true,
+        relationship: attached.data
+      });
     } catch (err) { return handleGitHubError(err); }
   });
 

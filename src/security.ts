@@ -208,6 +208,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionLevel> = {
   'git_tree': PermissionLevel.READ_ONLY,
   'patch_contents': PermissionLevel.MUTATING,
   'sandbox_status': PermissionLevel.READ_ONLY,
+  'sandbox_file': PermissionLevel.MUTATING,
 
   'list_issues': PermissionLevel.READ_ONLY,
   'list_pull_requests': PermissionLevel.READ_ONLY,
