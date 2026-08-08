@@ -692,7 +692,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   });
 
   reg('git_checkout', {
-    description: 'Switch or create a branch in the active cloned repo.',
+    description: 'Switch or create a branch in the active cloned repo. Automatically fetches the branch from origin first if it is not yet known locally.',
     inputSchema: { branch: z.string(), create: z.boolean().optional().default(false) },
     annotations: getToolAnnotations('git_checkout')
   }, async (args: any) => {
@@ -700,7 +700,15 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
-      const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
+      let { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
+      if (err && !args.create) {
+        // Branch likely isn't known locally yet — fetch it from origin and retry once.
+        const fetchCmd = `git fetch origin ${args.branch}:${args.branch}`;
+        const fetchResult = await run(fetchCmd, ctx.sandboxDir, 15000);
+        if (!fetchResult.err) {
+          ({ err, stdout, stderr } = await run(`git checkout ${args.branch}`, ctx.sandboxDir, 15000));
+        }
+      }
       if (err) return execResponse(sessionId, err, stdout, stderr);
       updateSessionContext(sessionId, { branch: args.branch });
       return formatOptimizedResponse({ branch: args.branch });
