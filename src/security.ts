@@ -85,6 +85,14 @@ export function getSessionContext(sessionId: string): SessionContext {
     const initial: ToolCategory[] = enableAll
       ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
       : ['core', 'sandbox'];
+    // Peek at whether there's live (non-stale) prior data before authBucket()
+    // touches lastUsed, so we can tell the caller this context was resumed
+    // rather than fresh, and how long it had been sitting idle.
+    const key = sessionAuthKey.get(sessionId) || 'anonymous';
+    const priorRaw = lastKnownContextByAuth.get(key);
+    const idleMs = priorRaw ? Date.now() - priorRaw.lastUsed : undefined;
+    const hadLiveData = !!priorRaw && idleMs! <= AUTH_CONTEXT_TTL_MS && (priorRaw.owner || priorRaw.repo || priorRaw.branch || priorRaw.sandboxDir);
+
     const known = authBucket(sessionId);
     sessionContexts.set(sessionId, {
       branch: known.branch || 'main',
@@ -93,7 +101,8 @@ export function getSessionContext(sessionId: string): SessionContext {
       sandboxDir: known.sandboxDir,
       cwd: known.cwd,
       env: known.env,
-      enabledCategories: new Set(initial)
+      enabledCategories: new Set(initial),
+      ...(hadLiveData ? { resumedContext: { fromPriorSession: true, idleMs: idleMs! } } : {})
     });
   }
   return sessionContexts.get(sessionId)!;
