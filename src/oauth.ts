@@ -271,6 +271,8 @@ ${hidden('resource', RESOURCE)}
 export function authorizePost(req: Request, res: Response): void {
   try {
     requireConfig();
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
 
     const {
       client_id,
