@@ -115,7 +115,7 @@ function sandboxEnv(sessionId?: string): Record<string, string> {
   const root = sessionId ? path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`) : path.join(os.tmpdir(), 'krix_sbx');
   const safeHome = path.join(root, '.home');
   const sessionEnv = sessionId ? (getSessionContext(sessionId).env || {}) : {};
-  const clean: NodeJS.ProcessEnv = {
+  const clean: Record<string, string> = {
     PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
     HOME: safeHome,
     TMPDIR: '/tmp',
