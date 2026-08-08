@@ -329,14 +329,16 @@ This prevents an operational configuration mistake from accidentally disabling t
 
 Krix allows network access to be configured independently for the major network-capable operations.
 
-The defaults are currently enabled:
+The secure defaults are now disabled:
 
 ```env
-SANDBOX_EXEC_NETWORK_DEFAULT=true
-SANDBOX_RUN_NETWORK_DEFAULT=true
-SANDBOX_INSTALL_NETWORK_DEFAULT=true
-GIT_NETWORK_DEFAULT=true
+SANDBOX_EXEC_NETWORK_DEFAULT=false
+SANDBOX_RUN_NETWORK_DEFAULT=false
+SANDBOX_INSTALL_NETWORK_DEFAULT=false
+GIT_NETWORK_DEFAULT=false
 ```
+
+Enable network access only for the capability that actually needs it.
 
 These control different capabilities.
 
@@ -407,6 +409,8 @@ OAUTH_ISSUER=your_web_service_url
 # Long random secret (32+ characters). Keep this unchanged across redeploys.
 OAUTH_SIGNING_SECRET=your_33_characters_secret
 ```
+
+Production hardening in this build also includes cross-origin-safe logo assets for MCP clients, a restrictive OAuth CSP with nonce-based fallback handling, bounded rate-limit/auth-code state, startup validation for gateway/OAuth secrets, non-root Docker execution, and Bubblewrap isolation with networking disabled by default.
 
 ---
 
@@ -1032,9 +1036,8 @@ high
 Example:
 
 ```env
-COMMAND_RESTRICTION_LEVEL=low
-NETWORK_RESTRICTION_LEVEL=low
-SANDBOX_SECURITY_LEVEL=high
+COMMAND_RESTRICTION_LEVEL=high
+NETWORK_RESTRICTION_LEVEL=high
 ```
 
 Higher levels should impose stricter restrictions.
