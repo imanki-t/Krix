@@ -15,6 +15,32 @@ type ClientMetadata = {
   redirect_uris: string[];
 };
 
+// Security: In-memory sliding window rate limiter & single-use auth code store
+const usedAuthCodes = new Set<string>();
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+
+function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(key);
+  if (!entry || now > entry.resetTime) {
+    rateLimitMap.set(key, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  if (entry.count >= limit) {
+    return false;
+  }
+  entry.count += 1;
+  return true;
+}
+
+function getClientIp(req: Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
 function requireConfig(): void {
   if (!ISSUER || !/^https:\/\//i.test(ISSUER)) {
     throw new Error('OAUTH_ISSUER must be the public HTTPS Krix URL.');
@@ -75,7 +101,7 @@ function validExpiry(exp: unknown): exp is number {
 
 function safeRedirectUri(uri: unknown): uri is string {
   // MCP clients may use HTTPS redirect URIs. Loopback HTTP is allowed for local clients.
-  if (typeof uri !== 'string') return false;
+  if (typeof uri !== 'string' || uri.length > 2048) return false;
   try {
     const url = new URL(uri);
     return url.protocol === 'https:' ||
@@ -96,7 +122,7 @@ function clientIdFor(metadata: Omit<ClientMetadata, 'client_id'>): string {
 }
 
 function parseClient(clientId: unknown): ClientMetadata | null {
-  if (typeof clientId !== 'string') return null;
+  if (typeof clientId !== 'string' || clientId.length > 2048) return null;
 
   try {
     const prefix = `https://${new URL(ISSUER).host}/oauth/client/`;
@@ -128,6 +154,8 @@ export function protectedResourceMetadataUrl(): string {
 export function sendProtectedResourceMetadata(_req: Request, res: Response): void {
   try {
     requireConfig();
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
     res.json({
       resource: RESOURCE,
       authorization_servers: [ISSUER],
@@ -135,13 +163,15 @@ export function sendProtectedResourceMetadata(_req: Request, res: Response): voi
       scopes_supported: ['mcp']
     });
   } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: error.message });
+    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server misconfigured.' });
   }
 }
 
 export function sendAuthorizationServerMetadata(_req: Request, res: Response): void {
   try {
     requireConfig();
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
     res.json({
       issuer: ISSUER,
       authorization_endpoint: `${ISSUER}/oauth/authorize`,
@@ -156,13 +186,21 @@ export function sendAuthorizationServerMetadata(_req: Request, res: Response): v
       client_id_metadata_document_supported: false
     });
   } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: error.message });
+    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server misconfigured.' });
   }
 }
 
 export function registerClient(req: Request, res: Response): void {
   try {
     requireConfig();
+
+    if (!checkRateLimit(`register:${getClientIp(req)}`, 15, 60000)) {
+      res.status(429).json({ error: 'slow_down', error_description: 'Rate limit exceeded for client registration.' });
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
 
     const body = req.body || {};
     const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
@@ -195,13 +233,23 @@ export function registerClient(req: Request, res: Response): void {
       response_types: ['code']
     });
   } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: error.message });
+    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server misconfigured.' });
   }
 }
 
 export function authorize(req: Request, res: Response): void {
   try {
     requireConfig();
+
+    if (!checkRateLimit(`auth_get:${getClientIp(req)}`, 30, 60000)) {
+      res.status(429).send('Rate limit exceeded. Please try again in a minute.');
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
 
     const {
       response_type,
@@ -231,8 +279,13 @@ export function authorize(req: Request, res: Response): void {
       return;
     }
 
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    // Generate stateless signed anti-CSRF token
+    const csrfToken = encodeSigned({
+      typ: 'csrf',
+      client_id: client.client_id,
+      exp: nowSeconds() + 600,
+      nonce: crypto.randomBytes(16).toString('base64url')
+    });
 
     const hidden = (name: string, value: string) =>
       `<input type="hidden" name="${name}" value="${escapeHtml(value)}">`;
@@ -259,18 +312,27 @@ ${hidden('scope', 'mcp')}
 ${hidden('state', typeof state === 'string' ? state : '')}
 ${hidden('code_challenge', code_challenge)}
 ${hidden('resource', RESOURCE)}
+${hidden('_csrf', csrfToken)}
 <label for="approval_key">Krix API key</label>
 <input id="approval_key" type="password" name="approval_key" autocomplete="current-password" required>
 <button type="submit">Authorize</button>
 </form></div></body></html>`);
   } catch (error: any) {
-    res.status(500).send(`OAuth configuration error: ${escapeHtml(error.message)}`);
+    res.status(500).send('OAuth configuration error.');
   }
 }
 
 export function authorizePost(req: Request, res: Response): void {
   try {
     requireConfig();
+
+    if (!checkRateLimit(`auth_post:${getClientIp(req)}`, 10, 60000)) {
+      res.status(429).send('Rate limit exceeded. Too many authorization attempts.');
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
 
@@ -281,8 +343,34 @@ export function authorizePost(req: Request, res: Response): void {
       state = '',
       code_challenge,
       resource = RESOURCE,
-      approval_key
+      approval_key,
+      _csrf
     } = req.body || {};
+
+    // Validate anti-CSRF token
+    const csrfPayload = typeof _csrf === 'string' ? decodeSigned<Record<string, any>>(_csrf) : null;
+    if (
+      !csrfPayload ||
+      csrfPayload.typ !== 'csrf' ||
+      csrfPayload.client_id !== client_id ||
+      !validExpiry(csrfPayload.exp)
+    ) {
+      res.status(400).send('CSRF validation failed or token expired.');
+      return;
+    }
+
+    // Origin / Referer check for post requests
+    const origin = req.headers['origin'] || req.headers['referer'];
+    if (typeof origin === 'string' && /^https:\/\//i.test(origin)) {
+      try {
+        const originHost = new URL(origin).host;
+        const issuerHost = new URL(ISSUER).host;
+        if (originHost !== issuerHost) {
+          res.status(400).send('Cross-origin form submission blocked.');
+          return;
+        }
+      } catch {}
+    }
 
     const client = parseClient(client_id);
     const configuredKey = process.env.MCP_API_KEY || '';
@@ -301,8 +389,7 @@ export function authorizePost(req: Request, res: Response): void {
       return;
     }
 
-    // The authorization code is signed and self-contained, so it survives restarts.
-    // PKCE prevents an intercepted code from being redeemed without the verifier.
+    // The authorization code is signed and self-contained.
     const code = encodeSigned({
       typ: 'authorization_code',
       client_id,
@@ -320,13 +407,21 @@ export function authorizePost(req: Request, res: Response): void {
     if (state) target.searchParams.set('state', state);
     res.redirect(target.toString());
   } catch (error: any) {
-    res.status(500).send(`OAuth configuration error: ${escapeHtml(error.message)}`);
+    res.status(500).send('OAuth configuration error.');
   }
 }
 
 export function token(req: Request, res: Response): void {
   try {
     requireConfig();
+
+    if (!checkRateLimit(`token:${getClientIp(req)}`, 30, 60000)) {
+      res.status(429).json({ error: 'slow_down', error_description: 'Rate limit exceeded for token endpoint.' });
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
 
     const grantType = req.body?.grant_type;
     if (grantType === 'authorization_code') {
@@ -339,7 +434,7 @@ export function token(req: Request, res: Response): void {
     }
     res.status(400).json({ error: 'unsupported_grant_type' });
   } catch (error: any) {
-    res.status(500).json({ error: 'server_configuration_error', error_description: error.message });
+    res.status(500).json({ error: 'server_configuration_error', error_description: 'Server error.' });
   }
 }
 
@@ -360,10 +455,24 @@ function issueFromCode(req: Request, res: Response): void {
     payload.redirect_uri !== redirect_uri ||
     payload.resource !== resource ||
     payload.scope !== 'mcp' ||
-    typeof code_verifier !== 'string'
+    typeof code_verifier !== 'string' ||
+    code_verifier.length < 43 ||
+    code_verifier.length > 128
   ) {
     res.status(400).json({ error: 'invalid_grant' });
     return;
+  }
+
+  // Single-use enforcement: authorization code replay prevention
+  if (typeof payload.nonce === 'string' && usedAuthCodes.has(payload.nonce)) {
+    res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code already redeemed.' });
+    return;
+  }
+  if (typeof payload.nonce === 'string') {
+    usedAuthCodes.add(payload.nonce);
+    if (usedAuthCodes.size > 10000) {
+      usedAuthCodes.clear();
+    }
   }
 
   const expectedChallenge = crypto.createHash('sha256').update(code_verifier).digest('base64url');
@@ -414,9 +523,6 @@ function issueTokens(res: Response, clientId: string, scope: string, resource: s
     jti: crypto.randomBytes(16).toString('base64url')
   });
 
-  // Stateless refresh token. It is a bearer credential and therefore should
-  // be treated like a secret. Rotation is represented by issuing a new token
-  // on every refresh; server-side revocation would require persistent storage.
   const refreshToken = encodeSigned({
     typ: 'refresh_token',
     iss: ISSUER,
@@ -428,7 +534,7 @@ function issueTokens(res: Response, clientId: string, scope: string, resource: s
     jti: crypto.randomBytes(32).toString('base64url')
   });
 
-  res.set('Cache-Control', 'no-store');
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.set('Pragma', 'no-cache');
   res.json({
     access_token: accessToken,
@@ -440,6 +546,7 @@ function issueTokens(res: Response, clientId: string, scope: string, resource: s
 }
 
 export function verifyAccessToken(tokenValue: string): boolean {
+  if (typeof tokenValue !== 'string' || tokenValue.length > 4096) return false;
   const payload = decodeSigned<Record<string, any>>(tokenValue);
   return !!payload &&
     payload.typ === 'access_token' &&
