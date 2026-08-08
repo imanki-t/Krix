@@ -1,6 +1,7 @@
 {
   "name": "krix",
   "version": "1.0.0",
+  "license": "MIT",
   "description": "Krix",
   "main": "dist/index.js",
   "type": "module",
