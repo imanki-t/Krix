@@ -51,14 +51,13 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
 
   registerGitHubTools(server, octokit, sessionId, registry);
   tagCategory(registry, categoryOf, 'github_admin');
-  
+
   registerRenderTools(server, () => renderToken, registry);
   tagCategory(registry, categoryOf, 'render');
-  
+
   registerSandboxTools(server, sessionId, githubToken, registry);
   tagCategory(registry, categoryOf, 'sandbox');
 
-  // Re-enable any category already unlocked for this session, disable others
   const ctx = getSessionContext(sessionId);
   for (const [name, handle] of Object.entries(registry)) {
     const cat = categoryOf[name];
