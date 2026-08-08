@@ -392,6 +392,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const cwd = args.dir ? await resolveDir(sessionId, args.dir) : await sandboxRoot(sessionId);
       const list = args.packages.join(' ');
       const cmd = args.manager === 'npm' ? `npm install ${list}` : `pip install --quiet --target=. ${list}`;
+      sanitizeCommand(cmd);
       const { err, stdout, stderr } = await run(cmd, cwd, 90000, sessionId);
       if (err) return execResponse(sessionId, err, stdout, stderr);
       return formatOptimizedResponse({ installed: args.packages, path: cwd });
