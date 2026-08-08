@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
