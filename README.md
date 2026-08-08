@@ -252,6 +252,12 @@ Connect MCP clients (Antigravity, Claude Desktop, Cursor, or Custom SDKs) via St
 
 ---
 
+## 🧠 Krix MCP Skill for AI Agents
+
+The repository includes a complete agentic workflow skill in [`skills/krix-mcp/SKILL.md`](skills/krix-mcp/SKILL.md) and detailed tool guides under [`skills/krix-mcp/references/`](skills/krix-mcp/references/). AI agents can import this skill to automatically direct and coordinate agentic coding, GitHub operations, surgical edits, and sandbox execution using Krix MCP tools.
+
+---
+
 ## 🏗️ System Architecture Overview
 
 ```
