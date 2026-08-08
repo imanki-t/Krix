@@ -33,9 +33,11 @@ load_toolset({ category: "all" })               // Enable all categories concurr
 - **`view_file_outline`**: Extracts high-level AST symbol structures (classes, methods, functions, exports).
 
 ### 4. Enterprise Security & Memory Hygiene
-- **Zero-Trust Credential Masking**: Automatically redacts GitHub tokens (`ghp_*`, `github_pat_*`), Render keys (`rnd_*`), Bearer tokens, and SSH/RSA private keys from all outputs.
+- **Zero-Trust Credential Masking**: Automatically redacts GitHub tokens (`ghp_*`, `github_pat_*`), Render keys (`rnd_*`), Bearer [REDACTED], and SSH/RSA private keys from all outputs.
 - **Path Escape Protection**: Enforces path resolution bounds (`sanitizePath`) prohibiting access outside `/tmp` or working directory roots.
-- **Command Blocklist**: Pre-evaluates shell commands to block destructive patterns (`rm -rf /`, `mkfs`, `dd if=`, fork bombs).
+- **Multi-Level Safety Filters**: Configurable via `COMMAND_RESTRICTION_LEVEL` and `NETWORK_RESTRICTION_LEVEL` (`low`, `medium`, `high`, defaulting to `low`):
+  - **Command Levels**: `low` protects against total destruction (`rm -rf /`, `mkfs`, fork bombs); `medium` blocks administrative modifications (`shutdown`, `reboot`, `chmod 777 /`, `/etc/passwd`); `high` blocks privilege escalation (`sudo`, `su`), port listeners (`nc -l`), and kernel tools.
+  - **Network Levels**: `low` blocks internal/private IP targeting (`169.254.169.254`, `127.0.0.1`, private CIDR blocks) for SSRF protection; `medium` blocks raw IP URLs and non-HTTP protocols; `high` restricts outbound traffic to a trusted domain allowlist.
 - **ReDoS Defense**: VM-sandboxed regular expression execution (`safeRegexTest`) with a 200ms hard timeout.
 - **Automatic Lifecycle Sweeps**:
   - **10-min Idle Teardown**: Inactive session transports and sandboxes are automatically destroyed (`destroySandbox`).
