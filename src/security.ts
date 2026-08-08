@@ -30,7 +30,13 @@ const sessionContexts = new Map<string, SessionContext>();
 // persisted context under that hash so it only ever resumes for the same
 // authenticated caller, never across identities.
 const sessionAuthKey = new Map<string, string>();
-const lastKnownContextByAuth = new Map<string, { owner?: string; repo?: string; branch?: string; sandboxDir?: string; cwd?: string; env?: Record<string, string> }>();
+const lastKnownContextByAuth = new Map<string, { owner?: string; repo?: string; branch?: string; sandboxDir?: string; cwd?: string; env?: Record<string, string>; lastUsed: number }>();
+
+// Without a TTL, this bucket would resurrect an owner/repo/branch/sandboxDir
+// into a brand-new session indefinitely — silently, with no signal to the
+// caller that the context wasn't fresh. Anything idle longer than this is
+// treated as stale and dropped rather than resumed.
+const AUTH_CONTEXT_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 function hashAuth(token: string): string {
   return crypto.createHash('sha256').update(token || 'anonymous').digest('hex').slice(0, 16);
