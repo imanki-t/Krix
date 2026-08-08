@@ -88,11 +88,13 @@ The Krix MCP toolset consists of 31 specialized tools split across 2 main operat
 
 ## Detailed Reference Documentation
 
-Comprehensive, super-detailed documentation and parameter schemas for all 31 tools and operational workflows are available in the bundled reference files:
+Comprehensive, super-detailed documentation and parameter schemas for all tools and operational workflows are available in the bundled reference files:
 
 - `skills/krix-mcp/references/agentic-tools-guide.md`: Exhaustive guide for all 17 Agentic Remote GitHub tools, schemas, usage examples, and parameters.
 - `skills/krix-mcp/references/sandbox-tools-guide.md`: Exhaustive guide for all 14 Sandbox Environment & Local Sync tools, runtimes, background process management, and offline constraints.
 - `skills/krix-mcp/references/workflows-and-best-practices.md`: End-to-end multi-tool workflows for codebase discovery, surgical editing, feature development, sandbox testing, and Pull Request submission.
+- `skills/krix-mcp/references/render-tools-guide.md`: Exhaustive guide for all 21 Render cloud management tools.
+- `skills/krix-mcp/references/github-extended-tools-guide.md`: Exhaustive guide for all 32 Extended GitHub tools (Issues, PRs, Reviews, Teams, Admin).
 
 ---
 
