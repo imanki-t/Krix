@@ -35,8 +35,19 @@ const lastKnownContextByAuth = new Map<string, { owner?: string; repo?: string; 
 // Without a TTL, this bucket would resurrect an owner/repo/branch/sandboxDir
 // into a brand-new session indefinitely — silently, with no signal to the
 // caller that the context wasn't fresh. Anything idle longer than this is
-// treated as stale and dropped rather than resumed.
-const AUTH_CONTEXT_TTL_MS = 60 * 60 * 1000; // 1 hour
+// treated as stale and dropped rather than resumed. This is idle time, not
+// task duration — lastUsed refreshes on every tool call (see authBucket),
+// so a long-running task that keeps calling tools never trips this; only a
+// session that goes completely silent for the full window does.
+const MIN_AUTH_CONTEXT_TTL_MS = 5 * 60 * 1000;   // 5 minutes
+const MAX_AUTH_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const DEFAULT_AUTH_CONTEXT_TTL_MS = 60 * 60 * 1000;  // 1 hour
+function resolveConfiguredTtl(): number {
+  const raw = Number(process.env.AUTH_CONTEXT_TTL_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_AUTH_CONTEXT_TTL_MS;
+  return Math.min(MAX_AUTH_CONTEXT_TTL_MS, Math.max(MIN_AUTH_CONTEXT_TTL_MS, raw));
+}
+const AUTH_CONTEXT_TTL_MS = resolveConfiguredTtl();
 
 function hashAuth(token: string): string {
   return crypto.createHash('sha256').update(token || 'anonymous').digest('hex').slice(0, 16);
