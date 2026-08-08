@@ -669,6 +669,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+      sanitizeCommand(args.branch);
       const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
       let { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
       if (err && !args.create) {
