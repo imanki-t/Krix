@@ -147,7 +147,10 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
     if (owner && repo) parts.push(`repo '${owner}/${repo}'${branch ? ` on branch '${branch}'` : ''}`);
     if (cwd) parts.push(`cwd '${cwd}'`);
     if (env) parts.push(`${Object.keys(env).length} env var(s)`);
-    return formatOptimizedResponse(`Active context updated: ${parts.join(', ')}.`);
+    const resumedNote = getSessionContext(sessionId).resumedContext
+      ? ` (this session resumed prior context after ${Math.round(getSessionContext(sessionId).resumedContext!.idleMs / 1000)}s idle)`
+      : '';
+    return formatOptimizedResponse(`Active context updated: ${parts.join(', ')}.${resumedNote}`);
   });
 
   reg('get_me', {
