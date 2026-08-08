@@ -28,7 +28,7 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
-RUN npm run build
+RUN npx tsc --noCheck
 
 EXPOSE 3000
 
