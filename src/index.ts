@@ -110,6 +110,7 @@ app.use(express.json({ limit: RESOURCE_LIMITS.maxRequestBodyBytes }));
 app.use(express.urlencoded({ extended: false, limit: '32kb' }));
 app.use('/assets', express.static('assets'));
 app.get('/logo.jpg', (_req, res) => res.sendFile(path.resolve('assets/logo.jpg')));
+app.get('/favicon.ico', (_req, res) => res.sendFile(path.resolve('assets/logo.jpg')));
 app.get('/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
 app.get('/.well-known/oauth-authorization-server', sendAuthorizationServerMetadata);
 app.post('/oauth/register', registerClient);
