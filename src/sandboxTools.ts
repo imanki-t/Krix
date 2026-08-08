@@ -606,6 +606,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const repo = args.repo || ctx.repo;
       if (!owner || !repo) throw new Error('owner/repo missing. Pass them or call set_active_context first.');
       const branch = args.branch || ctx.branch || 'main';
+      sanitizeCommand(branch);
 
       const root = await sandboxRoot(sessionId);
       const dest = path.join(root, owner, repo);
@@ -650,6 +651,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       await fs.mkdir(path.dirname(dest), { recursive: true });
       const url = `https://github.com/${owner}/${repo}.git`;
       const cmd = `git ${authFlag(githubToken)}clone --depth ${args.depth || 1} --branch ${branch} --single-branch "${url}" "${dest}"`;
+      sanitizeCommand(cmd);
       const { err, stdout, stderr } = await run(cmd, root, 60000);
       if (err) return execResponse(sessionId, err, stdout, stderr);
 
@@ -667,6 +669,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     try {
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
+      sanitizeCommand(args.branch);
       const cmd = `git checkout ${args.create ? '-b ' : ''}${args.branch}`;
       let { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 15000);
       if (err && !args.create) {
@@ -718,6 +721,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const cmd = `git diff ${args.staged ? '--cached ' : ''}-- ${args.path ? `"${args.path}"` : ''}`;
+      sanitizeCommand(cmd);
       const { err, stdout, stderr } = await run(cmd, ctx.sandboxDir, 10000);
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
@@ -732,6 +736,8 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       const ctx = getSessionContext(sessionId);
       if (!ctx.sandboxDir) throw new Error('No repo cloned. Call git_clone first.');
       const branch = args.branch || ctx.branch || 'main';
+      sanitizeCommand(branch);
+      sanitizeCommand(args.message);
       if (args.branch) {
         updateSessionContext(sessionId, { branch: args.branch });
         await run(`git checkout ${args.branch}`, ctx.sandboxDir, 10000);
