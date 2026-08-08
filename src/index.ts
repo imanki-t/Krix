@@ -74,6 +74,8 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
+app.use('/assets', express.static('assets'));
+app.get('/logo.jpg', (_req, res) => res.sendFile(path.resolve('assets/logo.jpg')));
 
 app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   if (!MCP_API_KEY) {
