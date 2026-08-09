@@ -132,15 +132,86 @@ function sandboxEnv(sessionId?: string): Record<string, string> {
   return clean;
 }
 
-function sandboxMode(): 'bwrap' | 'host' | 'disabled' {
-  const mode = (process.env.SANDBOX_MODE || 'disabled').toLowerCase();
-  if (mode === 'bwrap') return mode;
-  if (mode === 'host' && process.env.ALLOW_UNSAFE_HOST_SANDBOX === 'true') return mode;
-  if (mode === 'disabled') return mode;
-  return 'disabled';
+// The *desired* isolation mode, purely from configuration. 'bwrap' is the safe default
+// even when SANDBOX_MODE is unset, so an operator who forgets to set it gets a clear,
+// actionable error (see resolveMode) instead of every sandbox tool silently no-op'ing.
+function desiredSandboxMode(): 'bwrap' | 'host' | 'disabled' {
+  const mode = (process.env.SANDBOX_MODE || 'bwrap').toLowerCase();
+  if (mode === 'host') return 'host';
+  if (mode === 'disabled') return 'disabled';
+  return 'bwrap';
 }
 
-function bwrapArgs(sessionId: string, cwd: string, command: string, network = false): string[] {
+// Many container platforms (Render, Cloud Run, Fly.io shared runners, and most managed
+// PaaS Docker hosts) do not grant the kernel privilege bubblewrap needs to create
+// unprivileged user namespaces, even though the `bwrap` binary itself is installed. Where
+// the previous release hard-required bwrap and simply failed every sandbox tool call with
+// no explanation, we now probe for real usability once (cheap, cached for process
+// lifetime) and, when the operator has explicitly opted in via ALLOW_UNSAFE_HOST_SANDBOX,
+// degrade gracefully to host-mode execution instead of breaking every tool.
+let bwrapProbe: Promise<{ usable: boolean; reason?: string }> | null = null;
+function probeBwrap(): Promise<{ usable: boolean; reason?: string }> {
+  if (!bwrapProbe) {
+    bwrapProbe = new Promise((resolve) => {
+      execFile('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/', '/', '--', 'true'], { timeout: 5000 }, (err: any, _stdout, stderr) => {
+        if (!err) { resolve({ usable: true }); return; }
+        const msg = String(stderr || err?.message || '').trim();
+        if (err?.code === 'ENOENT') resolve({ usable: false, reason: 'the bwrap binary is not installed on this host' });
+        else if (/no permission|not permitted|operation not permitted|user namespace/i.test(msg)) resolve({ usable: false, reason: 'the kernel/container runtime does not permit unprivileged user namespaces (common on Render, Cloud Run, and similar PaaS hosts)' });
+        else resolve({ usable: false, reason: msg.slice(0, 220) || 'bwrap failed to start' });
+      });
+    });
+  }
+  return bwrapProbe;
+}
+
+let bwrapFallbackWarned = false;
+function warnBwrapFallbackOnce(reason?: string): void {
+  if (bwrapFallbackWarned) return;
+  bwrapFallbackWarned = true;
+  console.warn(`[krix] bubblewrap sandbox isolation is unavailable (${reason || 'unknown reason'}). Falling back to host-mode execution because ALLOW_UNSAFE_HOST_SANDBOX=true. Sandbox commands are still confined to this container, but not further isolated by bwrap namespaces.`);
+}
+
+interface ResolvedMode { mode: 'bwrap' | 'host' | null; error?: string; }
+
+async function resolveMode(): Promise<ResolvedMode> {
+  const desired = desiredSandboxMode();
+
+  if (desired === 'disabled') {
+    return { mode: null, error: 'Sandbox execution is disabled (SANDBOX_MODE=disabled). Set SANDBOX_MODE=bwrap (recommended, strongest isolation) or SANDBOX_MODE=host with ALLOW_UNSAFE_HOST_SANDBOX=true to enable sandbox tools.' };
+  }
+
+  if (desired === 'host') {
+    if (process.env.ALLOW_UNSAFE_HOST_SANDBOX !== 'true') {
+      return { mode: null, error: 'SANDBOX_MODE=host also requires ALLOW_UNSAFE_HOST_SANDBOX=true. This confirms you understand host mode only relies on this container/process boundary, not bubblewrap namespace isolation.' };
+    }
+    return { mode: 'host' };
+  }
+
+  // desired === 'bwrap'
+  const probe = await probeBwrap();
+  if (probe.usable) return { mode: 'bwrap' };
+  if (process.env.ALLOW_UNSAFE_HOST_SANDBOX === 'true') {
+    warnBwrapFallbackOnce(probe.reason);
+    return { mode: 'host' };
+  }
+  return {
+    mode: null,
+    error: `bubblewrap sandbox isolation is unavailable in this environment (${probe.reason}). Fix: set ALLOW_UNSAFE_HOST_SANDBOX=true to automatically fall back to host-mode execution (still container-isolated, just not bwrap-namespaced), or deploy on a host that supports unprivileged user namespaces (a self-managed Docker/VM host run with --cap-add=SYS_ADMIN or --privileged).`
+  };
+}
+
+// Arbitrary sandboxed commands have no network access by default inside bwrap for
+// defense-in-depth (a compromised/careless script can't exfiltrate data or pull further
+// payloads). Set SANDBOX_NETWORK=true to restore unrestricted network access for
+// run_command/run_file/persistent-shell sessions, matching pre-hardening behavior.
+// install_packages and git_* tools always get network regardless of this flag — they
+// need it to function and use their own scoped credential handling.
+function defaultSandboxNetwork(): boolean {
+  return process.env.SANDBOX_NETWORK === 'true';
+}
+
+function bwrapArgs(sessionId: string, cwd: string, command: string | null, network = false): string[] {
   const root = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
   const env = sandboxEnv(sessionId);
   const args = [
@@ -160,19 +231,19 @@ function bwrapArgs(sessionId: string, cwd: string, command: string, network = fa
   ];
   if (network) args.push('--share-net');
   for (const [key, value] of Object.entries(env)) args.push('--setenv', key, value);
-  if (command) args.push('/bin/bash', '--noprofile', '--norc', '-lc', command);
+  // command === null means "interactive/persistent shell, no single command to run".
+  if (command !== null) args.push('/bin/bash', '--noprofile', '--norc', '-lc', command);
   else args.push('/bin/bash', '--noprofile', '--norc');
   return args;
 }
 
-
-function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?: string, network = false): Promise<{ err: any; stdout: string; stderr: string }> {
+async function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?: string, network = false): Promise<{ err: any; stdout: string; stderr: string }> {
+  if (!sessionId) return { err: Object.assign(new Error('Sandbox session missing.'), { code: 126 }), stdout: '', stderr: 'Sandbox session missing.' };
+  const resolved = await resolveMode();
+  if (!resolved.mode) return { err: Object.assign(new Error(resolved.error), { code: 126 }), stdout: '', stderr: resolved.error || 'Sandbox unavailable.' };
+  const env = sandboxEnv(sessionId);
   return new Promise((resolve) => {
-    const mode = sandboxMode();
-    if (mode === 'disabled') { resolve({ err: Object.assign(new Error('Sandbox is disabled in production configuration.'), { code: 126 }), stdout: '', stderr: 'Sandbox disabled.' }); return; }
-    if (!sessionId) { resolve({ err: Object.assign(new Error('Sandbox session missing.'), { code: 126 }), stdout: '', stderr: 'Sandbox session missing.' }); return; }
-    const env = sandboxEnv(sessionId);
-    if (mode === 'host') {
+    if (resolved.mode === 'host') {
       exec(cmd, { cwd, timeout, env, maxBuffer: 4 * 1024 * 1024, shell: '/bin/bash' }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
       return;
     }
@@ -231,8 +302,9 @@ async function getShell(sessionId: string): Promise<PersistentShell> {
 
   const creation = (async () => {
     const cwd = await workDir(sessionId);
-    if (sandboxMode() === 'disabled') throw new Error('Sandbox is disabled. Set SANDBOX_MODE=bwrap for production isolation.');
-    if (sandboxMode() === 'host') {
+    const resolved = await resolveMode();
+    if (!resolved.mode) throw new Error(resolved.error);
+    if (resolved.mode === 'host') {
       const proc = spawn('bash', ['--noprofile', '--norc'], { cwd, env: sandboxEnv(sessionId), stdio: ['pipe', 'pipe', 'pipe'] });
       const shell: PersistentShell = { proc, buf: '', busy: false };
       proc.stdout?.on('data', (d) => { shell.buf = appendCapped(shell.buf, d.toString(), BG_BUF_CAP); });
@@ -240,9 +312,8 @@ async function getShell(sessionId: string): Promise<PersistentShell> {
       persistentShells.set(key, shell);
       return shell;
     }
-    const args = bwrapArgs(sessionId, cwd, '', false);
-    const commandIndex = args.lastIndexOf('-lc');
-    args[commandIndex + 1] = '';
+    // command: null starts an interactive shell (no trailing `-lc <command>` args).
+    const args = bwrapArgs(sessionId, cwd, null, defaultSandboxNetwork());
     const proc = spawn('bwrap', args, { cwd: '/', stdio: ['pipe', 'pipe', 'pipe'] });
     const shell: PersistentShell = { proc, buf: '', busy: false };
     proc.stdout?.on('data', (d) => { shell.buf = appendCapped(shell.buf, d.toString(), BG_BUF_CAP); });
@@ -415,12 +486,13 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
       if (args.background) {
         if (procTable(sessionId).size >= MAX_BACKGROUND_PROCESSES) throw new Error(`Maximum of ${MAX_BACKGROUND_PROCESSES} background sandbox processes reached.`);
-        if (sandboxMode() === 'disabled') throw new Error('Sandbox is disabled. Set SANDBOX_MODE=bwrap for production isolation.');
+        const resolved = await resolveMode();
+        if (!resolved.mode) throw new Error(resolved.error);
         let proc: ChildProcess;
-        if (sandboxMode() === 'host') {
+        if (resolved.mode === 'host') {
           proc = spawn('/bin/bash', ['--noprofile', '--norc', '-lc', args.command], { cwd, env: sandboxEnv(sessionId), stdio: ['ignore', 'pipe', 'pipe'] });
         } else {
-          proc = spawn('bwrap', bwrapArgs(sessionId, cwd, args.command, false), { cwd: '/', stdio: ['ignore', 'pipe', 'pipe'] });
+          proc = spawn('bwrap', bwrapArgs(sessionId, cwd, args.command, defaultSandboxNetwork()), { cwd: '/', stdio: ['ignore', 'pipe', 'pipe'] });
         }
         if (!proc.pid) throw new Error('Failed to start background process.');
         const pid = proc.pid;
@@ -445,7 +517,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         return formatOptimizedResponse(Object.keys(out).length ? out : { stdout: '(ok, no output)' });
       }
 
-      const { err, stdout, stderr } = await run(args.command, cwd, timeoutMs, sessionId);
+      const { err, stdout, stderr } = await run(args.command, cwd, timeoutMs, sessionId, defaultSandboxNetwork());
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
   });
@@ -491,7 +563,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         throw new Error('Provide either `code` or `filePath`.');
       }
 
-      const { err, stdout, stderr } = await run(cmd, cwd, 45000, sessionId);
+      const { err, stdout, stderr } = await run(cmd, cwd, 45000, sessionId, defaultSandboxNetwork());
       return execResponse(sessionId, err, stdout, stderr);
     } catch (err) { return formatError(err); }
     finally {
@@ -693,6 +765,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       check('git', 'git --version');
       check('go', 'go version');
       check('bwrap', 'bwrap --version');
+      const resolved = await resolveMode();
 
       const ctx = getSessionContext(sessionId);
       let cloned = false;
@@ -714,7 +787,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
         cwd: ctx.cwd,
         envVars: ctx.env ? Object.keys(ctx.env).length : undefined,
         persistentShellAlive: !!persistentShells.get(shellKey(sessionId)),
-        isolationMode: sandboxMode(),
+        configuredSandboxMode: desiredSandboxMode(),
+        effectiveSandboxMode: resolved.mode || 'unavailable',
+        ...(resolved.error ? { sandboxError: resolved.error } : {}),
         ...(ctx.resumedContext ? { resumed: true, resumedAfterIdleMs: ctx.resumedContext.idleMs } : { resumed: false })
       });
     } catch (err) { return formatError(err); }

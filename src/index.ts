@@ -54,7 +54,7 @@ function tagCategory(registry: Record<string, any>, categoryOf: Record<string, T
 }
 
 function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
-  const server = new McpServer({ name: 'krix', version: '2.0.0' }, { capabilities: { tools: { listChanged: true } } });
+  const server = new McpServer({ name: 'krix', version: '2.1.0' }, { capabilities: { tools: { listChanged: true } } });
   const octokit = new Octokit({ auth: githubToken || undefined });
   const registry: Record<string, any> = {};
   const categoryOf: Record<string, ToolCategory> = {};
@@ -127,8 +127,13 @@ app.use((req, res, next) => { if (!validateOrigin(req, res)) return; next(); });
 app.use(express.json({ limit: process.env.MCP_BODY_LIMIT || '5mb', strict: true, type: ['application/json', 'application/*+json'] }));
 app.use(express.urlencoded({ extended: false, limit: '16kb', parameterLimit: 20 }));
 app.use('/assets', express.static(path.resolve('assets'), { dotfiles: 'deny', index: false, maxAge: '7d', immutable: false }));
+// Logo is served from a single canonical PNG so every consumer (OAuth account-linking
+// screens, browser favicons, tool avatars) resolves the same working asset. Previously a
+// /logo.svg route pointed at a file that didn't exist in assets/, which 404'd/500'd
+// anywhere it was referenced (including the OAuth metadata logo_uri) and produced the
+// broken-image / red-placeholder icon seen on connector "link account" screens.
 app.get('/logo.png', (_req, res) => { res.type('image/png'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.sendFile(path.resolve('assets/logo.png')); });
-app.get('/logo.svg', (_req, res) => { res.type('image/svg+xml'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.sendFile(path.resolve('assets/logo.svg')); });
+app.get('/logo.jpg', (_req, res) => { res.type('image/jpeg'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.sendFile(path.resolve('assets/logo.jpg')); });
 app.get('/favicon.svg', (_req, res) => res.redirect(302, '/logo.png'));
 app.get('/favicon.ico', (_req, res) => res.redirect(302, '/logo.png'));
 

@@ -119,6 +119,14 @@ function sameOriginLogo(req: Request): string {
   return `${baseUrl(req)}/logo.png`;
 }
 
+// Best-effort content type for the <link rel="icon"> tag. APP_LOGO_URL can point at any
+// image; only the guaranteed-to-exist same-origin default is known to be a PNG.
+function logoMimeType(logoUrl: string): string {
+  if (/\.svg(?:\?.*)?$/i.test(logoUrl)) return 'image/svg+xml';
+  if (/\.jpe?g(?:\?.*)?$/i.test(logoUrl)) return 'image/jpeg';
+  return 'image/png';
+}
+
 function reject(res: Response, status: number, message: string): void {
   setNoStore(res);
   res.status(status).json({ error: message });
@@ -166,10 +174,11 @@ export function oauthAuthorize(req: Request, res: Response): void {
 
     const appName = process.env.APP_NAME || 'Krix';
     const logoUrl = sameOriginLogo(req);
+    const logoType = logoMimeType(logoUrl);
     const nonce = randomToken(18);
     setNoStore(res);
     res.setHeader('Content-Security-Policy', `default-src 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'`);
-    res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Authorize ${htmlEscape(appName)}</title><link rel="icon" href="${htmlEscape(logoUrl)}" type="image/svg+xml"><style>
+    res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Authorize ${htmlEscape(appName)}</title><link rel="icon" href="${htmlEscape(logoUrl)}" type="${logoType}"><style>
 :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111;background:#f3f3f1}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}.wrap{width:min(470px,100%)}.card{background:#fff;border:1px solid #dededb;border-radius:28px;padding:32px;box-shadow:0 24px 80px rgba(0,0,0,.09)}.brand{display:flex;align-items:center;gap:13px}.logo{width:48px;height:48px;border-radius:15px;border:1px solid #dededb;object-fit:cover;background:#111}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.14em;font-weight:800;color:#777}.name{font-weight:800;margin-top:4px}.client{margin-top:24px;display:inline-flex;padding:8px 11px;border-radius:999px;background:#f1f1ef;font-size:13px;font-weight:700}.title{font-size:32px;letter-spacing:-.045em;line-height:1.05;margin:18px 0 10px}.copy{color:#666;line-height:1.6;margin:0 0 24px}.field{font-size:13px;font-weight:750;display:block;margin-bottom:8px}.input{width:100%;height:52px;border:1px solid #d5d5d2;border-radius:14px;padding:0 15px;font:inherit;outline:0;background:#fff}.input:focus{border-color:#111;box-shadow:0 0 0 4px rgba(0,0,0,.07)}.button{width:100%;height:52px;border:0;border-radius:14px;background:#111;color:#fff;font:inherit;font-weight:800;margin-top:14px;cursor:pointer}.button:disabled{opacity:.55;cursor:wait}.status{min-height:20px;color:#b42318;font-size:13px;margin-top:12px}.meta{margin-top:18px;text-align:center;color:#8a8a86;font-size:12px}.footer{text-align:center;color:#999;font-size:12px;margin-top:15px}</style></head><body><main class="wrap"><section class="card"><div class="brand"><img class="logo" id="logo" src="${htmlEscape(logoUrl)}" alt="${htmlEscape(appName)} logo"><div><div class="eyebrow">Secure MCP connection</div><div class="name">${htmlEscape(appName)}</div></div></div><div class="client">Connecting: ${htmlEscape(client.clientName)}</div><h1 class="title">Authorize access</h1><p class="copy">Enter your Krix access key to authorize this connector. The key is verified server-side and is never returned to the client.</p><label class="field" for="access-key">Access key</label><input class="input" id="access-key" type="password" autocomplete="current-password" spellcheck="false" autofocus><button class="button" id="authorize">Authorize connection</button><div class="status" id="status" role="alert" aria-live="polite"></div><div class="meta">OAuth 2.1 · PKCE S256 · one-time code</div></section><div class="footer">${htmlEscape(appName)} MCP Gateway</div></main><script nonce="${nonce}">
 (()=>{const b=document.getElementById('authorize'),i=document.getElementById('access-key'),s=document.getElementById('status');const requestId=${JSON.stringify(requestId)};b.addEventListener('click',async()=>{s.textContent='';if(!i.value){s.textContent='Enter your access key.';return}b.disabled=true;b.textContent='Authorizing…';try{const r=await fetch('/oauth/authorize',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},body:new URLSearchParams({request_id:requestId,access_key:i.value})});const j=await r.json().catch(()=>({}));if(r.redirected){location.assign(r.url);return}if(r.status>=300&&r.status<400&&r.headers.get('location')){location.assign(r.headers.get('location'));return}if(!r.ok)throw new Error(j.error||'Authorization failed.');location.assign(j.redirect_uri)}catch(e){s.textContent=e instanceof Error?e.message:'Authorization failed.';b.disabled=false;b.textContent='Authorize connection';}});i.addEventListener('keydown',e=>{if(e.key==='Enter')b.click()});const img=document.getElementById('logo');img.addEventListener('error',()=>{img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="24" fill="#111"/><path d="M22 22h18l9 18 9-18h18L58 48l18 26H58l-9-18-9 18H22l18-26Z" fill="#fff"/></svg>')},{once:true})})();</script></body></html>`);
   } catch {
@@ -200,9 +209,36 @@ export async function oauthAuthorizePost(req: Request, res: Response): Promise<v
   res.status(200).json({ redirect_uri: redirect.toString() });
 }
 
+// Access tokens (and authorization codes, and registered clients) live only in memory,
+// so a redeploy/restart wipes them and any previously-linked client would normally have
+// to redo the interactive "Authorize access" flow. Setting MCP_REFRESH_TOKEN gives every
+// client a standard OAuth refresh_token that is validated against this env value instead
+// of in-memory state — so it keeps working across restarts, and standard-compliant MCP
+// clients will use it to silently mint a new access_token instead of re-prompting the
+// user. Treat it like a second master secret: generate a long random value and keep it
+// private.
+function configuredRefreshToken(): string | undefined {
+  const value = process.env.MCP_REFRESH_TOKEN?.trim();
+  return value && value.length >= 20 ? value : undefined;
+}
+
 export function oauthToken(req: Request, res: Response): void {
   if (!checkLimit(req, res, 'oauth-token', 30, 60_000)) return;
   const grantType = String(req.body?.grant_type || '');
+
+  if (grantType === 'refresh_token') {
+    const refreshToken = configuredRefreshToken();
+    const provided = String(req.body?.refresh_token || '');
+    if (!refreshToken || !provided || !timingSafeEqualText(provided, refreshToken)) { reject(res, 400, 'invalid_grant'); return; }
+    if (accessTokens.size >= MAX_TOKENS) { reject(res, 503, 'token_capacity_reached'); return; }
+    const token = randomToken(48);
+    const now = Date.now();
+    accessTokens.set(hash(token), { tokenHash: hash(token), clientId: 'static-refresh', scope: SUPPORTED_SCOPE, createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_MS, lastUsedAt: now });
+    setNoStore(res);
+    res.json({ access_token: token, token_type: 'Bearer', expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000), scope: SUPPORTED_SCOPE, refresh_token: refreshToken });
+    return;
+  }
+
   const code = String(req.body?.code || '');
   const clientId = String(req.body?.client_id || '');
   const redirectUri = String(req.body?.redirect_uri || '');
@@ -217,7 +253,8 @@ export function oauthToken(req: Request, res: Response): void {
   const now = Date.now();
   accessTokens.set(hash(token), { tokenHash: hash(token), clientId, scope: record.scope, createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_MS, lastUsedAt: now });
   setNoStore(res);
-  res.json({ access_token: token, token_type: 'Bearer', expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000), scope: record.scope });
+  const refreshToken = configuredRefreshToken();
+  res.json({ access_token: token, token_type: 'Bearer', expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000), scope: record.scope, ...(refreshToken ? { refresh_token: refreshToken } : {}) });
 }
 
 export function oauthRegister(req: Request, res: Response): void {
@@ -231,7 +268,8 @@ export function oauthRegister(req: Request, res: Response): void {
   const now = Date.now();
   clients.set(clientId, { clientId, clientName: name || 'MCP client', redirectUris: uniqueUris, createdAt: now, lastUsedAt: now });
   setNoStore(res);
-  res.status(201).json({ client_id: clientId, client_name: name || 'MCP client', redirect_uris: uniqueUris, token_endpoint_auth_method: 'none', grant_types: ['authorization_code'], response_types: ['code'], code_challenge_methods_supported: ['S256'] });
+  const grantTypes = configuredRefreshToken() ? ['authorization_code', 'refresh_token'] : ['authorization_code'];
+  res.status(201).json({ client_id: clientId, client_name: name || 'MCP client', redirect_uris: uniqueUris, token_endpoint_auth_method: 'none', grant_types: grantTypes, response_types: ['code'], code_challenge_methods_supported: ['S256'] });
 }
 
 export function oauthRevoke(req: Request, res: Response): void {
@@ -253,7 +291,8 @@ export function resolveOAuthAccessToken(token: string): { clientId: string; scop
 
 export function oauthMetadata(req: Request) {
   const base = baseUrl(req);
-  return { issuer: base, authorization_endpoint: `${base}/oauth/authorize`, token_endpoint: `${base}/oauth/token`, registration_endpoint: `${base}/oauth/register`, revocation_endpoint: `${base}/oauth/revoke`, response_types_supported: ['code'], grant_types_supported: ['authorization_code'], code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'], scopes_supported: [SUPPORTED_SCOPE], logo_uri: sameOriginLogo(req) };
+  const grantTypes = configuredRefreshToken() ? ['authorization_code', 'refresh_token'] : ['authorization_code'];
+  return { issuer: base, authorization_endpoint: `${base}/oauth/authorize`, token_endpoint: `${base}/oauth/token`, registration_endpoint: `${base}/oauth/register`, revocation_endpoint: `${base}/oauth/revoke`, response_types_supported: ['code'], grant_types_supported: grantTypes, code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'], scopes_supported: [SUPPORTED_SCOPE], logo_uri: sameOriginLogo(req) };
 }
 
 export function protectedResourceMetadata(req: Request) {
