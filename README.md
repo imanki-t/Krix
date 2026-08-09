@@ -380,10 +380,15 @@ headers can connect directly:
 
 ## Troubleshooting
 
-**The connector's "link account" screen shows a broken/placeholder logo.**
-Make sure `PUBLIC_BASE_URL` is set to your real, reachable HTTPS URL — that's what
-connectors fetch `/logo.png` from. Visit `https://<your-domain>/logo.png` directly in a
-browser to confirm it loads.
+**The connector's "link account" / app-list screen shows a broken/placeholder logo.**
+Two independent things need to be right:
+1. `PUBLIC_BASE_URL` must be your real, reachable HTTPS URL — visit
+   `https://<your-domain>/logo.png` directly in a browser to confirm it loads.
+2. The `initialize` response must include `serverInfo.icons` (per [SEP-973](https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/2573),
+   the mechanism connectors like Gemini's "Custom apps for Spark" and newer Claude/ChatGPT
+   builds actually use to render the icon) — this requires
+   `@modelcontextprotocol/sdk >= 1.27.0` (this repo pins `^1.30.0`) and `PUBLIC_BASE_URL`
+   being set. If you forked this before the SDK bump, `npm install` to pick it up.
 
 **Sandbox tools (`sandbox_exec`, `git_clone`, ...) fail with a sandbox/isolation error.**
 Call `sandbox_status` and check `effectiveSandboxMode` and `sandboxError`. If it says
