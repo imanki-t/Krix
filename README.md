@@ -1,220 +1,327 @@
-# Production security / deployment
+# Krix
 
-Krix 2.0 is designed for production deployment behind HTTPS. Before connecting a real MCP client:
+**Krix** is a production-grade Model Context Protocol (MCP) server that gives AI agents
+control over **GitHub repositories**, **Render cloud infrastructure**, and an **isolated
+execution sandbox** with persistent bash shells, language runtimes, and local Git CLI
+tools — all over a single unified HTTP transport, with OAuth 2.1 for connectors like
+Claude, Gemini, and ChatGPT.
 
-1. Set `NODE_ENV=production` and `PUBLIC_BASE_URL=https://<your-domain>`.
-2. Generate a strong random `MCP_API_KEY` (at least 32 characters; 64+ random characters is recommended).
-3. Keep GitHub and Render credentials in Render's secret environment variables.
-4. Keep `ALLOW_LEGACY_API_KEY=false` and `ALLOW_CLIENT_CREDENTIAL_HEADERS=false` unless a legacy integration explicitly requires them.
-5. Keep `SANDBOX_MODE=bwrap`. The Docker image installs bubblewrap and runs Krix as a non-root user.
-6. Do not enable `ALLOW_UNSAFE_HOST_SANDBOX` for production.
-7. Use the `/healthz` and `/readyz` endpoints for platform health checks.
-8. Review `SECURITY.md` before exposing the service publicly.
-
-The OAuth connector uses authorization-code + PKCE S256, exact redirect URI matching, one-time authorization codes, opaque short-lived access tokens, rate limits, session binding, and no API keys in URLs.
-
-# Krix 
-
-**Krix** is a production-grade Model Context Protocol (MCP) server that empowers AI agents with complete control over **GitHub Repositories**, **Render Cloud Infrastructure**, and an **Isolated Execution Sandbox** with persistent bash shells, language runtimes, and local Git CLI tools over a unified HTTP transport.
-
-Engineered for **LLM token conservation**, **multi-tenant identity isolation**, and **zero-trust security**, Krix combines 80+ tools behind a lazy-loading architecture with payload compression, credential scrubbing, and automated memory cleanup.
+Engineered for **LLM token conservation**, **multi-tenant identity isolation**, and
+**zero-trust security**: 80+ tools behind a lazy-loading architecture, with payload
+compression, credential scrubbing, and automated memory cleanup.
 
 ---
 
-## 🚀 Key Features & Innovations
+## Quick start
 
-### 1. Token-Efficient Lazy Toolset Loading (`load_toolset`)
-To maximize token budget and prevent exceeding model context windows, Krix initializes with a lightweight default suite (**Core + Sandbox Tools**). Additional specialized categories can be dynamically enabled on demand:
+```bash
+git clone https://github.com/imanki-t/Krix.git
+cd Krix
+npm install
+cp .env.example .env    # then fill in MCP_API_KEY, GITHUB_PERSONAL_ACCESS_TOKEN, etc.
+npm run build
+npm start                # or: npm run dev  (hot reload)
+```
+
+The server listens on `PORT` (default `3000`) and exposes the MCP endpoint at `/mcp`.
+
+### Deploying to Render
+
+1. Push this repo to GitHub and create a new **Web Service** on Render pointing at it —
+   Render will build the included `Dockerfile` automatically.
+2. In the service's **Environment** tab, set at minimum `NODE_ENV=production`,
+   `PUBLIC_BASE_URL=https://<your-service>.onrender.com`, `MCP_API_KEY`, and your
+   `GITHUB_PERSONAL_ACCESS_TOKEN` / `RENDER_API_KEY`. See `.env.example` for the full,
+   commented list — every variable there is safe to paste directly into Render's env UI.
+3. Once deployed, health checks are available at `/healthz` (liveness) and `/readyz`
+   (readiness — checks that required config is present).
+4. Read the **Sandbox isolation** section below before relying on the sandbox tools —
+   Render (like most managed PaaS hosts) does not support `bwrap`'s namespace isolation
+   out of the box, and Krix's default configuration is already tuned to handle that.
+
+---
+
+## Environment configuration
+
+Every variable Krix reads is documented in **[`.env.example`](.env.example)** — copy it
+to `.env` for local dev or paste the values into your host's environment UI. That file
+is the source of truth; the table below is a quick-reference summary.
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `NODE_ENV` | _(unset)_ | `production` enables strict startup checks and HSTS. |
+| `PORT` | `3000` | HTTP port. |
+| `PUBLIC_BASE_URL` | _(required in prod)_ | Public HTTPS URL, used for OAuth endpoints, the logo URL, and Origin validation. |
+| `MCP_API_KEY` | _(required)_ | Master secret. Used as the OAuth "access key" and, if `ALLOW_LEGACY_API_KEY=true`, as a direct bearer token. |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` / `GITHUB_PAT` | _(none)_ | Server-side GitHub credential. |
+| `RENDER_API_KEY` / `RENDER_PAT` | _(none)_ | Server-side Render credential. |
+| `APP_NAME` | `Krix` | Display name on the OAuth consent screen. |
+| `APP_LOGO_URL` | _(same-origin `/logo.png`)_ | Override the logo shown on OAuth/connector screens. |
+| `ALLOW_LEGACY_API_KEY` | `true` | Accept `MCP_API_KEY` directly as `Authorization: Bearer` / `x-api-key`, bypassing the OAuth dance. |
+| `ALLOW_CLIENT_CREDENTIAL_HEADERS` | `false` | Allow clients to supply their own `x-github-token` / `x-render-token`. |
+| `MCP_REFRESH_TOKEN` | _(none)_ | See **Staying authenticated across redeploys** below. |
+| `MAX_MCP_SESSIONS`, `MCP_RATE_LIMIT`, `MCP_BODY_LIMIT`, `MCP_SESSION_IDLE_MS`, `REQUEST_TIMEOUT_MS`, `HEADERS_TIMEOUT_MS`, `KEEP_ALIVE_TIMEOUT_MS` | see `.env.example` | Session/request limits. |
+| `MCP_ALLOWED_ORIGINS` | _(none)_ | Extra allowed Origins, beyond `PUBLIC_BASE_URL`. |
+| `TRUST_PROXY` | `true` | Trust `X-Forwarded-*` headers from your reverse proxy/PaaS. |
+| `ENABLE_ALL_TOOLS` | `false` | Force-enable every tool category. |
+| `ENABLE_GITHUB_ISSUES_PRS`, `ENABLE_GITHUB_ADMIN`, `ENABLE_RENDER` | `false` | Per-category tool flags. |
+| `ENABLE_SANDBOX` | `true` | Enable the sandbox/local-git tool category. |
+| `SANDBOX_MODE` | `bwrap` | `bwrap` (isolated), `host` (container-only isolation, requires `ALLOW_UNSAFE_HOST_SANDBOX=true`), or `disabled`. |
+| `ALLOW_UNSAFE_HOST_SANDBOX` | `true` | Permit automatic/explicit fallback to host-mode sandbox execution. See below. |
+| `SANDBOX_NETWORK` | `false` | Give arbitrary sandboxed commands network access (installs/git always get it regardless). |
+| `ENABLE_CONTEXT_RESUME` | `true` | Resume the previous repo/branch/sandbox-dir context on reconnect with the same GitHub token. |
+| `AUTH_CONTEXT_TTL_MS` | `3600000` | How long a resumable context is retained. |
+
+---
+
+## Sandbox isolation
+
+Sandbox tools (`sandbox_exec`, `sandbox_run`, `sandbox_install`, `git_clone`, etc.) run
+inside [`bwrap`](https://github.com/containers/bubblewrap) for real OS-level isolation: a
+read-only view of the system, no visibility into other sessions' files, and network
+access only for the specific operations that need it.
+
+**The catch:** `bwrap` needs the kernel to allow *unprivileged user namespaces*. Several
+managed container platforms — Render web services, Cloud Run, and similar PaaS hosts —
+block this by default, even though the `bwrap` binary is installed and present. On those
+platforms `bwrap` fails immediately with a namespace-permission error.
+
+Krix handles this automatically:
+
+- On startup it does **not** assume anything; the first sandbox tool call **probes**
+  whether `bwrap` actually works in the current environment (cached for the life of the
+  process, so this costs nothing on subsequent calls).
+- If `bwrap` works, it's used — you get full namespace isolation, no action needed.
+- If it doesn't, and `ALLOW_UNSAFE_HOST_SANDBOX=true` (the default), Krix **automatically
+  falls back** to running sandbox commands directly in the container — still isolated
+  from your host machine by Docker, just without the extra `bwrap` namespace boundary —
+  and logs a one-time warning so you know it happened.
+- If it doesn't, and `ALLOW_UNSAFE_HOST_SANDBOX=false`, sandbox tools return a clear,
+  actionable error instead of a bare "sandbox disabled" message.
+
+Call `sandbox_status` at any time to see `configuredSandboxMode` (what you asked for) vs.
+`effectiveSandboxMode` (what's actually running) for the current deployment.
+
+If you're self-hosting on a Docker host that supports privileged containers, you can get
+full `bwrap` isolation everywhere by running the container with `--cap-add=SYS_ADMIN` (or
+`--privileged`) — on hosts like Render that don't offer that, the automatic fallback
+above is what keeps sandbox tools working at all.
+
+---
+
+## Staying authenticated across redeploys
+
+OAuth access tokens (and pending authorization codes/registered clients) are kept in
+memory for speed and simplicity, which means **a redeploy or restart wipes them** — by
+default, any client that already linked its account (Claude, Gemini, ChatGPT, etc.)
+would have to redo the interactive "Authorize access" screen afterward.
+
+To avoid that, set `MCP_REFRESH_TOKEN` in your environment to a long random value
+(generate one the same way as `MCP_API_KEY`, and keep it just as private). Once set:
+
+- Every access token Krix issues comes with this value as its `refresh_token`.
+- A spec-compliant OAuth client stores that refresh token and automatically exchanges it
+  for a fresh access token whenever the old one expires *or* stops being recognized
+  (exactly what happens after a redeploy) — without ever showing the user another
+  "Authorize access" prompt.
+- Because the refresh token is a fixed value read from your environment (not something
+  stored in the in-memory maps that get wiped), it keeps working across every restart.
+
+You can also drive this by hand if you ever need a token outside of a client's automatic
+refresh:
+
+```bash
+curl -s -X POST "$PUBLIC_BASE_URL/oauth/token" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d "grant_type=refresh_token&refresh_token=$MCP_REFRESH_TOKEN"
+```
+
+This returns a fresh `access_token` immediately, with no browser step at all.
+
+---
+
+## Key features
+
+### 1. Token-efficient lazy toolset loading (`load_toolset`)
+
+To maximize token budget and avoid blowing model context windows, Krix initializes with
+a lightweight default suite (**core + sandbox tools**). Additional categories load on
+demand:
 
 ```ts
-load_toolset({ category: "github_issues_prs" }) // Issues, PRs, Reviews, Comments
-load_toolset({ category: "github_admin" })      // Releases, Tags, Collaborators, Copilot
-load_toolset({ category: "render" })            // Render Cloud Services, Deploys, Logs, Postgres
-load_toolset({ category: "all" })               // Enable all categories concurrently
+load_toolset({ category: "github_issues_prs" }) // Issues, PRs, reviews, comments
+load_toolset({ category: "github_admin" })      // Releases, tags, collaborators, Copilot
+load_toolset({ category: "render" })            // Render services, deploys, logs, Postgres
+load_toolset({ category: "all" })               // Enable everything at once
 ```
 
-### 2. Isolated Multi-Tenant Execution Sandbox
-- **Identity-Scoped File System**: Sandboxes are isolated under `/tmp/krix_sbx_${authKey}/` where `authKey` is a SHA-256 hash of the caller's GitHub token. User data never leaks across sessions or accounts.
-- **Persistent Shell State**: Keeps long-lived `bash` sessions per `(authKey, sessionId)` pair. `cd`, `export`, and venv activations persist between tool calls.
-- **Race-Guarded Concurrency**: In-flight shell creation is promise-guarded to prevent concurrent requests from spawning orphan processes.
-- **Safe Environment**: Automatically pins `HOME` to `/tmp/krix_home/` with pre-created cache directories, preventing `npm` and `pip` `ENOENT` failures in containerized environments.
-- **Context-Aware Reset (`sandbox_reset`)**: Wipes scratch files, persistent shells, and background processes while safely preserving active Git context (`owner`, `repo`, `branch`).
+### 2. Isolated multi-tenant execution sandbox
 
-### 3. Surgical Code Editing & Structural Search
-- **`str_replace_editor`**: Performs exact string block replacement. On match failure, it calculates **Levenshtein Distance Similarity** and returns a line-numbered context hint showing the closest matching code lines with similarity percentages. Supports Base64 (`old_str_b64`, `new_str_b64`).
-- **`patch_contents`**: Enables direct line-range edits (`startLine` to `endLine`) without requiring string matching.
-- **`get_file_contents`**: Line-windowed file reader (100 lines default, 500 max) with line number prefixes and a 100KB payload threshold.
-- **`grep`**: High-performance pattern search with regex, file extension filtering (`type: "ts"`), path globs, context lines, and case sensitivity.
-- **`view_file_outline`**: Extracts high-level AST symbol structures (classes, methods, functions, exports).
+- **Identity-scoped filesystem**: each session's sandbox lives under its own
+  `/tmp/krix_sbx_<key>/` directory. Data never leaks across sessions or accounts.
+- **Persistent shell state**: long-lived `bash` sessions per session, so `cd`, `export`,
+  and virtualenv activations persist between tool calls.
+- **Race-guarded concurrency**: in-flight shell creation is promise-guarded so concurrent
+  requests can't spawn orphan processes.
+- **Context-aware reset (`sandbox_reset`)**: wipes scratch files, shells, and background
+  processes while preserving the active Git context (`owner`, `repo`, `branch`).
 
-### 4. Enterprise Security & Memory Hygiene
-- **Zero-Trust Credential Masking**: Automatically redacts GitHub tokens (`ghp_*`, `github_pat_*`), Render keys (`rnd_*`), Bearer tokens, and SSH/RSA private keys from all outputs.
-- **Path Escape Protection**: Enforces path resolution bounds (`sanitizePath`) prohibiting access outside `/tmp` or working directory roots.
-- **Command Blocklist**: Pre-evaluates shell commands to block destructive patterns (`rm -rf /`, `mkfs`, `dd if=`, fork bombs).
-- **ReDoS Defense**: VM-sandboxed regular expression execution (`safeRegexTest`) with a 200ms hard timeout.
-- **Automatic Lifecycle Sweeps**:
-  - **10-min Idle Teardown**: Inactive session transports and sandboxes are automatically destroyed (`destroySandbox`).
-  - **15-min Output Cache TTL**: Truncated shell outputs (`sandbox_output`) are cached per session and automatically purged on expiration or reset.
-  - **10-min Process Table TTL**: Background job entries (`sandbox_ps`) are swept on a 5-minute timer. Buffer output is hard-capped at 200KB per process.
+### 3. Surgical code editing & structural search
+
+- **`str_replace_editor`**: exact string block replacement. On a failed match, it
+  computes Levenshtein similarity and returns a line-numbered hint pointing at the
+  closest matching code. Supports Base64 (`old_str_b64`, `new_str_b64`).
+- **`patch_contents`**: direct line-range edits without string matching.
+- **`get_file_contents`**: windowed line reader (100 default, 500 max) with line-number
+  prefixes and a 100KB payload cap.
+- **`grep`**: pattern search with regex, extension filters, path globs, and context
+  lines.
+- **`view_file_outline`**: high-level AST symbol outlines (classes, functions, exports).
+
+### 4. Security & memory hygiene
+
+- **OAuth 2.1 + PKCE (S256)** for connector account-linking, with exact redirect-URI
+  matching, one-time authorization codes, short-lived opaque access tokens, per-endpoint
+  rate limiting, and MCP session binding — a session can only be resumed by the same
+  authorization that created it.
+- **Credential masking**: GitHub tokens (`ghp_*`, `github_pat_*`), Render keys (`rnd_*`),
+  OpenAI/AWS-style keys, bearer tokens, and SSH/RSA private keys are redacted from every
+  tool response.
+- **Path escape protection**: all sandbox file paths are resolved and verified (including
+  symlink resolution) to stay within the session's sandbox root.
+- **Command blocklist** for destructive patterns (`rm -rf /`, `mkfs`, `dd if=`, fork
+  bombs, namespace/mount/privilege-escalation tools).
+- **ReDoS defense**: VM-sandboxed regex execution with a 200ms hard timeout.
+- **Automatic lifecycle sweeps**: idle session/sandbox teardown, output-cache TTL,
+  background-process TTL and a hard process-lifetime cap.
+
+See **[`SECURITY.md`](SECURITY.md)** for the full threat model and hardening checklist.
 
 ---
 
-## 🛠️ Tool Categories & Matrix
+## Tool categories & reference
 
-### Core Agentic Tools (`core` — Always Enabled)
-| Tool Name | Type | Description |
+### Core agentic tools (`core` — always enabled)
+
+| Tool | Type | Description |
 | :--- | :--- | :--- |
-| `set_active_context` | `READ_ONLY` | Sets default `owner`, `repo`, and `branch`. Persists across session resets per auth key. |
-| `get_me` | `READ_ONLY` | Retrieves authenticated GitHub user profile information. |
-| `get_file_contents` | `READ_ONLY` | Reads windowed line ranges of a file (100 default, 500 max lines). |
-| `str_replace_editor` | `MUTATING` | Surgically replaces code blocks with Levenshtein similarity context feedback on match errors. |
-| `patch_contents` | `MUTATING` | Replaces specified line ranges directly by 1-indexed line numbers. |
-| `create_or_update_file` | `MUTATING` | Creates or updates files via plain text or Base64 (`content_b64`). |
-| `delete_file` | `MUTATING` | Deletes a file from a repository branch. |
-| `grep` | `READ_ONLY` | Pattern search supporting regex, file extension filters, globs, and context windowing. |
-| `view_file_outline` | `READ_ONLY` | Extracts high-level AST symbol outlines (classes, functions, exports). |
-| `git_tree` | `READ_ONLY` | Recursively indexes file tree structures with `tree_sha`, `offset`, `limit`, and path search `q`. |
-| `list_branches` | `READ_ONLY` | Lists branches in the active repository. |
-| `create_branch` | `MUTATING` | Creates a new branch from a specified ref/commit SHA. |
-| `delete_branch` | `MUTATING` | Deletes a branch from the repository. |
-| `push_files` | `MUTATING` | Batch commits and pushes multiple files in a single operation. |
-| `create_pull_request` | `MUTATING` | Opens a new pull request between head and base branches. |
-| `search_code` | `READ_ONLY` | Searches code across GitHub repositories. |
-| `search_repositories` | `READ_ONLY` | Searches GitHub repositories (`exact: true` returns single best match). |
-| `sandbox_status` | `READ_ONLY` | Inspects sandbox memory, runtimes (Node, Python, Go, Git), active repo/branch, and shell state. |
+| `set_active_context` | READ_ONLY | Sets default `owner`, `repo`, `branch`. |
+| `get_me` | READ_ONLY | Authenticated GitHub user profile. |
+| `get_file_contents` | READ_ONLY | Windowed line-range file reader. |
+| `str_replace_editor` | MUTATING | Surgical code block replacement with similarity hints. |
+| `patch_contents` | MUTATING | Replaces specified line ranges directly. |
+| `create_or_update_file` | MUTATING | Creates/updates files (text or `content_b64`). |
+| `delete_file` | MUTATING | Deletes a file from a branch. |
+| `grep` | READ_ONLY | Pattern search: regex, extension filters, globs, context. |
+| `view_file_outline` | READ_ONLY | AST symbol outline. |
+| `git_tree` | READ_ONLY | Recursive tree index with search. |
+| `list_branches` | READ_ONLY | Lists branches. |
+| `create_branch` | MUTATING | Creates a branch from a ref/SHA. |
+| `delete_branch` | MUTATING | Deletes a branch. |
+| `push_files` | MUTATING | Batch commit/push multiple files. |
+| `create_pull_request` | MUTATING | Opens a PR. |
+| `search_code` | READ_ONLY | Searches code across GitHub. |
+| `search_repositories` | READ_ONLY | Searches repositories. |
+| `sandbox_status` | READ_ONLY | Sandbox memory, runtimes, isolation mode, active repo/branch. |
 
----
+### Execution sandbox & local Git (`sandbox` — enabled by default)
 
-### Execution Sandbox & Local Git (`sandbox` — Enabled by Default)
-| Tool Name | Type | Description |
+| Tool | Type | Description |
 | :--- | :--- | :--- |
-| `sandbox_exec` | `MUTATING` | Executes shell commands in a persistent bash shell or isolated process with backgrounding support (`background: true`). |
-| `sandbox_run` | `MUTATING` | Runs inline code snippets across supported runtimes (`py`, `js`, `ts`, `sh`, `go`, `java`, `cpp`, `c`, `rs`, `rb`, `php`). |
-| `sandbox_install` | `MUTATING` | Installs dependencies via `npm` or `pip` targeting isolated sandbox directories. |
-| `sandbox_ps` | `READ_ONLY` | Lists, inspects output, or terminates background processes. |
-| `sandbox_output` | `READ_ONLY` | Reads paginated stdout/stderr for truncated shell execution results. |
-| `sandbox_reset` | `MUTATING` | Cleans scratch files, kills persistent shells and background jobs while preserving active Git context. |
-| `git_clone` | `MUTATING` | Clones a repository into the sandbox working directory. |
-| `git_checkout` | `MUTATING` | Switches or creates local branches in the cloned repository. |
-| `git_pull` | `MUTATING` | Performs fast-forward pull on the active sandbox branch. |
-| `git_status` | `READ_ONLY` | Inspects working tree status and untracked files in the sandbox. |
-| `git_diff` | `READ_ONLY` | Generates staged or unstaged git diff output. |
-| `git_commit_push` | `MUTATING` | Stages, commits, and pushes changes from the sandbox repository. |
+| `sandbox_exec` | MUTATING | Runs shell commands (persistent shell or isolated process, `background: true` supported). |
+| `sandbox_run` | MUTATING | Runs inline code snippets (`py`, `js`, `ts`, `sh`, `go`, `java`, `cpp`, `c`, `rs`, `rb`, `php`). |
+| `sandbox_install` | MUTATING | Installs dependencies via `npm` or `pip`. |
+| `sandbox_ps` | READ_ONLY | Lists/inspects/terminates background processes. |
+| `sandbox_output` | READ_ONLY | Paginated stdout/stderr for truncated results. |
+| `sandbox_reset` | MUTATING | Clears scratch files/shells/jobs, keeps Git context. |
+| `git_clone` | MUTATING | Clones a repo into the sandbox. |
+| `git_checkout` | MUTATING | Switches/creates a local branch. |
+| `git_pull` | MUTATING | Fast-forward pulls the active branch. |
+| `git_status` | READ_ONLY | Working tree status. |
+| `git_diff` | READ_ONLY | Staged/unstaged diff. |
+| `git_commit_push` | MUTATING | Stages, commits, and pushes. |
 
----
+### GitHub issues & pull requests (`github_issues_prs` — lazy loaded)
 
-### GitHub Issues & Pull Requests (`github_issues_prs` — Lazy Loaded)
-Enable via `load_toolset({ category: "github_issues_prs" })`:
+Enable via `load_toolset({ category: "github_issues_prs" })`.
 
-| Tool Name | Type | Description |
+| Tool | Type | Description |
 | :--- | :--- | :--- |
-| `list_issues` | `READ_ONLY` | Lists repository issues filtered by state, labels, assignee, or creator. |
-| `issue_read` | `READ_ONLY` | Reads detailed issue title, body, comments, and state. |
-| `issue_write` | `MUTATING` | Creates a new issue or updates an existing issue. |
-| `sub_issue_write` | `MUTATING` | Attaches a sub-issue to a parent issue. |
-| `add_issue_comment` | `MUTATING` | Adds a comment to an issue or pull request. |
-| `list_pull_requests` | `READ_ONLY` | Lists pull requests filtered by state, head, base, or branch. |
-| `pull_request_read` | `READ_ONLY` | Fetches pull request mergeability status and details. |
-| `update_pull_request` | `MUTATING` | Updates PR title, body, or state (`open`/`closed`). |
-| `update_pull_request_branch` | `MUTATING` | Merges base branch updates into the PR head branch. |
-| `merge_pull_request` | `MUTATING` | Merges a pull request into its base branch. |
-| `pull_request_review_write` | `MUTATING` | Submits a PR review (`APPROVE`, `REQUEST_CHANGES`, `COMMENT`). |
-| `add_comment_to_pending_review` | `MUTATING` | Adds a line-specific diff comment to a pending review. |
-| `add_reply_to_pull_request_comment` | `MUTATING` | Replies to an existing review comment thread. |
-| `search_issues` | `READ_ONLY` | Searches issues across GitHub repositories. |
-| `search_pull_requests` | `READ_ONLY` | Searches pull requests across GitHub repositories. |
+| `list_issues` | READ_ONLY | Lists issues by state/labels/assignee/creator. |
+| `issue_read` | READ_ONLY | Reads an issue's title, body, comments, state. |
+| `issue_write` | MUTATING | Creates or updates an issue. |
+| `sub_issue_write` | MUTATING | Attaches a sub-issue to a parent. |
+| `add_issue_comment` | MUTATING | Comments on an issue/PR. |
+| `list_pull_requests` | READ_ONLY | Lists PRs by state/head/base. |
+| `pull_request_read` | READ_ONLY | PR mergeability/details. |
+| `update_pull_request` | MUTATING | Updates PR title/body/state. |
+| `update_pull_request_branch` | MUTATING | Merges base updates into PR head. |
+| `merge_pull_request` | MUTATING | Merges a PR. |
+| `pull_request_review_write` | MUTATING | Submits a review (APPROVE/REQUEST_CHANGES/COMMENT). |
+| `add_comment_to_pending_review` | MUTATING | Line-specific diff comment on a pending review. |
+| `add_reply_to_pull_request_comment` | MUTATING | Replies to a review comment thread. |
+| `search_issues` | READ_ONLY | Searches issues. |
+| `search_pull_requests` | READ_ONLY | Searches PRs. |
 
----
+### GitHub extended & admin (`github_admin` — lazy loaded)
 
-### GitHub Extended & Admin (`github_admin` — Lazy Loaded)
-Enable via `load_toolset({ category: "github_admin" })`:
+Enable via `load_toolset({ category: "github_admin" })`.
 
-| Tool Name | Type | Description |
+| Tool | Type | Description |
 | :--- | :--- | :--- |
-| `get_commit` | `READ_ONLY` | Retrieves commit details by SHA. |
-| `search_commits` | `READ_ONLY` | Searches commit messages across GitHub. |
-| `get_label` | `READ_ONLY` | Fetches details for an issue label. |
-| `get_release` | `READ_ONLY` | Fetches release details by tag or published release. |
-| `get_tag` | `READ_ONLY` | Fetches git tag object details by SHA. |
-| `get_teams` | `READ_ONLY` | Lists teams in an organization. |
-| `get_team_members` | `READ_ONLY` | Lists members of an organization team. |
-| `list_commits` | `READ_ONLY` | Lists commits filtered by author, path, or date range. |
-| `list_releases` | `READ_ONLY` | Lists published releases for a repository. |
-| `list_tags` | `READ_ONLY` | Lists repository git tags. |
-| `list_issue_fields` | `READ_ONLY` | Lists repository issue labels and custom fields. |
-| `list_issue_types` | `READ_ONLY` | Lists organization issue types (`Bug`, `Feature`, `Task`). |
-| `list_repository_collaborators` | `READ_ONLY` | Lists collaborators and their permission levels. |
-| `search_users` | `READ_ONLY` | Searches GitHub users by query. |
-| `create_repository` | `MUTATING` | Creates a new GitHub repository. |
-| `fork_repository` | `MUTATING` | Forks a repository to the authenticated account. |
-| `run_secret_scanning` | `READ_ONLY` | Runs secret scanning alert checks on a repository. |
-| `request_copilot_review` | `MUTATING` | Requests an automated GitHub Copilot PR review. |
-| `assign_copilot_to_issue` | `MUTATING` | Assigns GitHub Copilot coding agent to solve an issue. |
+| `get_commit` | READ_ONLY | Commit details by SHA. |
+| `search_commits` | READ_ONLY | Searches commit messages. |
+| `get_label` | READ_ONLY | Issue label details. |
+| `get_release` | READ_ONLY | Release details. |
+| `get_tag` | READ_ONLY | Git tag object details. |
+| `get_teams` | READ_ONLY | Organization teams. |
+| `get_team_members` | READ_ONLY | Team members. |
+| `list_commits` | READ_ONLY | Commits by author/path/date. |
+| `list_releases` | READ_ONLY | Published releases. |
+| `list_tags` | READ_ONLY | Repository tags. |
+| `list_issue_fields` | READ_ONLY | Labels/custom fields. |
+| `list_issue_types` | READ_ONLY | Organization issue types. |
+| `list_repository_collaborators` | READ_ONLY | Collaborators + permissions. |
+| `search_users` | READ_ONLY | Searches GitHub users. |
+| `create_repository` | MUTATING | Creates a repository. |
+| `fork_repository` | MUTATING | Forks a repository. |
+| `run_secret_scanning` | READ_ONLY | Secret-scanning alerts. |
+| `request_copilot_review` | MUTATING | Requests a Copilot PR review. |
+| `assign_copilot_to_issue` | MUTATING | Assigns Copilot coding agent to an issue. |
 
----
+### Render cloud API (`render` — lazy loaded)
 
-### Render Cloud API (`render` — Lazy Loaded)
-Enable via `load_toolset({ category: "render" })`:
+Enable via `load_toolset({ category: "render" })`.
 
-| Tool Name | Type | Description |
+| Tool | Type | Description |
 | :--- | :--- | :--- |
-| `list_workspaces` | `READ_ONLY` | Lists available Render workspace accounts. |
-| `select_workspace` | `MUTATING` | Sets active Render workspace target for the session. |
-| `get_selected_workspace` | `READ_ONLY` | Displays currently selected Render workspace ID. |
-| `list_services` | `READ_ONLY` | Lists deployed services (web, static sites, background workers, cron). |
-| `get_service` | `READ_ONLY` | Fetches details and status for a service. |
-| `create_web_service` | `MUTATING` | Provisions a new Render web service from a GitHub repository. |
-| `create_static_site` | `MUTATING` | Provisions a new Render static site. |
-| `create_cron_job` | `MUTATING` | Provisions a scheduled cron job service. |
-| `restart_service` | `MUTATING` | Triggers service restart or clear-cache restart. |
-| `delete_service` | `MUTATING` | Deletes a Render service instance. |
-| `list_deploys` | `READ_ONLY` | Lists recent deployment history for a service. |
-| `get_deploy` | `READ_ONLY` | Fetches deployment status, build logs, and commit info. |
-| `trigger_deploy` | `MUTATING` | Triggers a new manual deploy. |
-| `cancel_deploy` | `MUTATING` | Cancels an in-progress deployment. |
-| `list_logs` | `READ_ONLY` | Retrieves runtime application logs with server-side filtering (`level`, `text`, `startTime`/`endTime`). |
-| `list_log_label_values` | `READ_ONLY` | Lists streaming log label values. |
-| `get_metrics` | `READ_ONLY` | Fetches CPU, memory, and bandwidth utilization metrics. |
-| `list_env_vars` | `READ_ONLY` | Lists environment variables for a service. |
-| `update_env_vars` | `MUTATING` | Sets or updates key-value environment variables. |
-| `delete_env_var` | `MUTATING` | Removes an environment variable from a service. |
-| `query_render_postgres` | `READ_ONLY` | Inspects status and database details for Render Managed Postgres. |
+| `list_workspaces` | READ_ONLY | Available Render workspaces. |
+| `select_workspace` | MUTATING | Sets the active workspace. |
+| `get_selected_workspace` | READ_ONLY | Currently selected workspace. |
+| `list_services` | READ_ONLY | Deployed services. |
+| `get_service` | READ_ONLY | Service details/status. |
+| `create_web_service` | MUTATING | Provisions a web service from GitHub. |
+| `create_static_site` | MUTATING | Provisions a static site. |
+| `create_cron_job` | MUTATING | Provisions a cron job service. |
+| `restart_service` | MUTATING | Restarts (optionally clearing cache). |
+| `delete_service` | MUTATING | Deletes a service. |
+| `list_deploys` | READ_ONLY | Deployment history. |
+| `get_deploy` | READ_ONLY | Deployment status, logs, commit info. |
+| `trigger_deploy` | MUTATING | Triggers a manual deploy. |
+| `cancel_deploy` | MUTATING | Cancels an in-progress deploy. |
+| `list_logs` | READ_ONLY | Runtime logs with filtering. |
+| `list_log_label_values` | READ_ONLY | Streaming log label values. |
+| `get_metrics` | READ_ONLY | CPU/memory/bandwidth metrics. |
+| `list_env_vars` | READ_ONLY | Service environment variables. |
+| `update_env_vars` | MUTATING | Sets/updates environment variables. |
+| `delete_env_var` | MUTATING | Removes an environment variable. |
+| `query_render_postgres` | READ_ONLY | Inspects a Render managed Postgres instance. |
 
 ---
 
-## ⚙️ Configuration & Environment
+## System runtimes (sandbox)
 
-Create a `.env` file in the root directory:
-
-```env
-# Server Authentication Key (Required for client header authorization)
-MCP_API_KEY=your_mcp_secret_key_here
-
-# Default GitHub Access Token (Fallback if x-github-token header omitted)
-GITHUB_PERSONAL_ACCESS_TOKEN=ghp_your_github_token_here
-
-# Default Render API Key (Fallback if x-render-token header omitted)
-RENDER_API_KEY=rnd_your_render_api_key_here
-
-# Enable All Tools by Default (Optional: set to 'true' to disable lazy loading)
-ENABLE_ALL_TOOLS=false
-
-# Category-specific Tool Flags (Disabled by default, set to 'true' to enable)
-ENABLE_GITHUB_ISSUES_PRS=false
-ENABLE_GITHUB_ADMIN=false
-ENABLE_RENDER=false
-
-# Sandbox & Local Git Tools Flag (Enabled by default, set to 'false' to disable)
-ENABLE_SANDBOX=true
-
-# HTTP Server Port
-PORT=3000
-```
-
-### System Runtimes (Sandbox)
-The Execution Sandbox utilizes installed system binaries on the host system or Docker container:
-
-| Language | Binary | Ubuntu / Debian Package |
+| Language | Binary | Debian/Ubuntu package |
 | :--- | :--- | :--- |
 | Git ops | `git` | `git` |
 | Node.js / TS | `node`, `npx` | `nodejs` |
@@ -222,102 +329,119 @@ The Execution Sandbox utilizes installed system binaries on the host system or D
 | Go | `go` | `golang-go` |
 | Java | `java`, `javac` | `default-jdk-headless` |
 | C / C++ | `gcc`, `g++` | `g++` |
+| Rust | `rustc` | `rustc` |
+| Ruby | `ruby` | `ruby` |
+| PHP | `php` | `php-cli` |
+| Sandbox isolation | `bwrap` | `bubblewrap` |
 
-The included **single-stage `Dockerfile`** installs all runtimes in one build layer, ensuring no missing OS dependencies when deploying to cloud platforms such as Render.
-
----
-
-## 📦 Getting Started
-
-### 1. Installation
-```bash
-# Clone repository
-git clone https://github.com/imanki-t/Krix.git
-cd Krix
-
-# Install dependencies
-npm install
-```
-
-### 2. Build & Run
-```bash
-# Build TypeScript
-npm run build
-
-# Start production server (default port 3000)
-npm start
-
-# Run development mode with hot reload
-npm run dev
-```
+The included two-stage `Dockerfile` installs all runtimes and `bubblewrap`, and runs
+Krix as a non-root user in the final image.
 
 ---
 
-## 🔌 MCP Client Integration
+## Connecting an MCP client
 
-### Streamable HTTP Endpoint (`/mcp`)
-Connect MCP clients (Antigravity, Claude Desktop, Cursor, or Custom SDKs) via Streamable HTTP:
+### OAuth (recommended — Claude, Gemini, ChatGPT, and other connector UIs)
+
+Point the client's "custom connector" / "add MCP server" flow at:
+
+```
+https://<your-domain>/mcp
+```
+
+The client will discover `/​.well-known/oauth-authorization-server`, register itself,
+and open the "Authorize access" screen, where you enter your `MCP_API_KEY` as the access
+key. See **Staying authenticated across redeploys** above to avoid repeating this after
+every deploy.
+
+### Direct API key (simple setups, scripts, clients without OAuth support)
+
+With `ALLOW_LEGACY_API_KEY=true` (the default), any client that lets you set custom
+headers can connect directly:
 
 ```json
 {
   "mcpServers": {
     "krix": {
-      "url": "http://localhost:3000/mcp",
+      "url": "https://<your-domain>/mcp",
       "headers": {
-        "x-api-key": "your_mcp_secret_key_here",
-        "x-github-token": "ghp_your_personal_github_token",
-        "x-render-token": "rnd_your_render_api_key"
+        "x-api-key": "your_mcp_api_key_here"
       }
     }
   }
 }
 ```
 
----
-
-## 🧠 Krix MCP Skill for AI Agents
-
-The repository includes a complete agentic workflow skill in [`skills/krix-mcp/SKILL.md`](skills/krix-mcp/SKILL.md) and detailed reference documentation under [`skills/krix-mcp/references/`](skills/krix-mcp/references/):
-
-- [`agentic-tools-guide.md`](skills/krix-mcp/references/agentic-tools-guide.md): 17 Agentic Remote GitHub tools
-- [`sandbox-tools-guide.md`](skills/krix-mcp/references/sandbox-tools-guide.md): 14 Sandbox execution and local Git CLI tools
-- [`workflows-and-best-practices.md`](skills/krix-mcp/references/workflows-and-best-practices.md): Multi-tool workflow patterns and safety directives
-- [`render-tools-guide.md`](skills/krix-mcp/references/render-tools-guide.md): 21 Render cloud infrastructure tools
-- [`github-extended-tools-guide.md`](skills/krix-mcp/references/github-extended-tools-guide.md): 32 Extended GitHub tools (Issues, PRs, Reviews, Teams, Admin)
-
-AI agents can import this skill to automatically direct and coordinate agentic coding, GitHub operations, surgical edits, sandbox execution, and Render cloud management using Krix MCP tools.
+`x-github-token` / `x-render-token` headers are also accepted here, but only if you set
+`ALLOW_CLIENT_CREDENTIAL_HEADERS=true` — otherwise Krix always uses the server-side
+`GITHUB_PERSONAL_ACCESS_TOKEN` / `RENDER_API_KEY`.
 
 ---
 
-## 🏗️ System Architecture Overview
+## Troubleshooting
+
+**The connector's "link account" screen shows a broken/placeholder logo.**
+Make sure `PUBLIC_BASE_URL` is set to your real, reachable HTTPS URL — that's what
+connectors fetch `/logo.png` from. Visit `https://<your-domain>/logo.png` directly in a
+browser to confirm it loads.
+
+**Sandbox tools (`sandbox_exec`, `git_clone`, ...) fail with a sandbox/isolation error.**
+Call `sandbox_status` and check `effectiveSandboxMode` and `sandboxError`. If it says
+bubblewrap/namespaces aren't permitted, that's expected on Render and similar hosts —
+confirm `ALLOW_UNSAFE_HOST_SANDBOX=true` (the shipped default) so Krix falls back to
+host-mode execution automatically. See **Sandbox isolation** above.
+
+**I have to re-authenticate every time I redeploy.**
+Set `MCP_REFRESH_TOKEN`. See **Staying authenticated across redeploys** above.
+
+**A tool call errors with `Unauthorized` / `401`.**
+Check `MCP_API_KEY` is set and matches what the client is sending, and that
+`ALLOW_LEGACY_API_KEY=true` if the client isn't using the OAuth flow.
+
+---
+
+## Krix MCP skill for AI agents
+
+The repository includes a complete agentic workflow skill in
+[`skills/krix-mcp/SKILL.md`](skills/krix-mcp/SKILL.md), with detailed references under
+[`skills/krix-mcp/references/`](skills/krix-mcp/references/):
+
+- [`agentic-tools-guide.md`](skills/krix-mcp/references/agentic-tools-guide.md) — core GitHub tools
+- [`sandbox-tools-guide.md`](skills/krix-mcp/references/sandbox-tools-guide.md) — sandbox + local Git
+- [`workflows-and-best-practices.md`](skills/krix-mcp/references/workflows-and-best-practices.md) — multi-tool patterns
+- [`render-tools-guide.md`](skills/krix-mcp/references/render-tools-guide.md) — Render cloud tools
+- [`github-extended-tools-guide.md`](skills/krix-mcp/references/github-extended-tools-guide.md) — extended GitHub tools
+
+---
+
+## Architecture
 
 ```
                          ┌─────────────────────────────────────────┐
-                         │               MCP Client                │
-                         │   (Antigravity / Claude / Cursor)       │
-                         └───────────────────┬─────────────────────┘
-                                             │ HTTP POST /mcp
+                         │               MCP Client                 │
+                         │   (Claude / Gemini / ChatGPT / Cursor)    │
+                         └───────────────────┬───────────────────────┘
+                                             │ HTTPS  (OAuth 2.1 or Bearer)
                                              ▼
                          ┌─────────────────────────────────────────┐
-                         │             Krix MCP Server             │
-                         │          (Express / SDK @ :3000)        │
-                         └─────┬─────────────────┬───────────┬─────┘
+                         │             Krix MCP Server               │
+                         │   Express + MCP SDK + OAuth endpoints     │
+                         └─────┬─────────────────┬───────────┬───────┘
                                │                 │           │
             ┌──────────────────▼──┐   ┌──────────▼─────┐  ┌──▼──────────────────┐
-            │ Core + Sandbox Tools│   │ Security Layer │  │ Dynamic Toolset     │
-            │ (Enabled by Default)│   │ & Trimmers     │  │ Categories          │
-            └─────────────────────┘   └────────────────┘  └─────────────────────┘
+            │ Core + Sandbox Tools │   │ Security Layer  │  │ Dynamic Toolset      │
+            │ (enabled by default) │   │ & rate limiting  │  │ categories           │
+            └──────────────────────┘   └──────────────────┘  └─────────────────────┘
                                                               │ load_toolset()
                                         ┌─────────────────────┼─────────────────────┐
                                         ▼                     ▼                     ▼
                                ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
-                               │github_issues_prs│   │     render      │   │   github_admin  │
-                               │   Workflows     │   │   Management    │   │  Extended Ops   │
+                               │github_issues_prs│   │     render      │   │  github_admin   │
                                └─────────────────┘   └─────────────────┘   └─────────────────┘
 ```
 
 ---
 
-## 📄 License
+## License
 
 MIT License © [imanki-t](https://github.com/imanki-t)

@@ -1,6 +1,6 @@
 {
   "name": "krix",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Production-grade Krix MCP Gateway",
   "main": "dist/index.js",
   "type": "module",
