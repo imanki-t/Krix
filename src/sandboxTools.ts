@@ -8,7 +8,7 @@ import os from 'node:os';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations,
-  sanitizeCommand, sanitizePath, sanitizeExistingPath, sanitizeWritablePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession
+  sanitizeCommand, sanitizePath, sanitizeExistingPath, sanitizeWritablePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar, getAuthKeyForSession, RESOURCE_LIMITS
 } from './security.js';
 
 interface ActiveProcess {
@@ -30,6 +30,67 @@ const EXEC_LIMITS = { maxBuffer: 4 * 1024 * 1024 };
 const EXITED_TTL_MS = 10 * 60 * 1000;
 const MAX_BACKGROUND_PROCESSES = 8;
 const MAX_BACKGROUND_LIFETIME_MS = 30 * 60 * 1000;
+
+// Memory safety net for small hosts: if the process RSS creeps up (e.g. many sessions
+// each holding onto output buffers), drop caches first, and if it's still climbing,
+// kill running background work and persistent shells rather than let the container OOM.
+const MEMORY_SOFT_LIMIT_BYTES = 360 * 1024 * 1024;
+const MEMORY_EMERGENCY_LIMIT_BYTES = 440 * 1024 * 1024;
+
+function enforceMemoryBudget(emergencyCleanup = false): void {
+  const rss = process.memoryUsage().rss;
+  if (rss <= MEMORY_SOFT_LIMIT_BYTES && !emergencyCleanup) return;
+  clearAllOutputCache();
+  if (rss >= MEMORY_EMERGENCY_LIMIT_BYTES || emergencyCleanup) {
+    for (const table of processTables.values()) {
+      for (const item of table.values()) {
+        if (item.status === 'running') { try { item.proc.kill('SIGKILL'); } catch {} }
+      }
+    }
+    for (const key of persistentShells.keys()) { try { persistentShells.get(key)?.proc.kill('SIGKILL'); } catch {} }
+  }
+}
+
+const memoryGuardTimer = setInterval(() => enforceMemoryBudget(), 30 * 1000);
+memoryGuardTimer.unref();
+
+// Global concurrency limiter: bounds how many sandbox commands can execute at once
+// across ALL sessions, with a small bounded wait queue rather than unlimited fan-out —
+// protects small hosts from many simultaneous heavy tool calls starving CPU/memory.
+let activeExecutions = 0;
+const executionWaiters: Array<() => void> = [];
+
+async function acquireExecutionSlot(): Promise<void> {
+  enforceMemoryBudget();
+  if (activeExecutions < RESOURCE_LIMITS.maxConcurrentExecutionsGlobal) {
+    activeExecutions++;
+    return;
+  }
+  if (executionWaiters.length >= RESOURCE_LIMITS.maxExecutionQueue) {
+    throw new Error('Sandbox execution capacity is temporarily full. Retry shortly.');
+  }
+  await new Promise<void>((resolve) => executionWaiters.push(resolve));
+  activeExecutions++;
+}
+
+function releaseExecutionSlot(): void {
+  activeExecutions = Math.max(0, activeExecutions - 1);
+  const next = executionWaiters.shift();
+  if (next) next();
+}
+
+async function withExecutionSlot<T>(fn: () => Promise<T>): Promise<T> {
+  await acquireExecutionSlot();
+  try { return await fn(); } finally { releaseExecutionSlot(); }
+}
+
+function totalRunningBackgroundProcesses(): number {
+  let count = 0;
+  for (const table of processTables.values()) {
+    for (const item of table.values()) if (item.status === 'running') count++;
+  }
+  return count;
+}
 
 const processTables = new Map<string, Map<number, ActiveProcess>>();
 function procTable(sessionId: string): Map<number, ActiveProcess> {
@@ -61,20 +122,54 @@ function trunc(s: string, cap: number = OUT_CAP): string {
   return clean.length > cap ? `${clean.slice(0, cap)}\n…[+${clean.length - cap} chars truncated]` : clean;
 }
 
+function clearAllOutputCache(): void {
+  for (const [sid, bucket] of outputCache) {
+    for (const id of [...bucket.keys()]) removeCachedOutput(sid, id);
+  }
+}
+
 interface CachedOutput { content: string; createdAt: number; }
 const outputCache = new Map<string, Map<string, CachedOutput>>();
 const OUTPUT_CACHE_TTL_MS = 15 * 60 * 1000;
 const OUTPUT_CACHE_MAX_PER_SESSION = 10;
+let outputCacheEntriesGlobal = 0;
+let outputCacheBytesGlobal = 0;
+
+function removeCachedOutput(sessionId: string, id: string): void {
+  const bucket = outputCache.get(sessionId);
+  const entry = bucket?.get(id);
+  if (!bucket || !entry) return;
+  bucket.delete(id);
+  outputCacheEntriesGlobal = Math.max(0, outputCacheEntriesGlobal - 1);
+  outputCacheBytesGlobal = Math.max(0, outputCacheBytesGlobal - Buffer.byteLength(entry.content));
+  if (bucket.size === 0) outputCache.delete(sessionId);
+}
 
 function cacheOutput(sessionId: string, content: string): string {
   let bucket = outputCache.get(sessionId);
   if (!bucket) { bucket = new Map(); outputCache.set(sessionId, bucket); }
-  if (bucket.size >= OUTPUT_CACHE_MAX_PER_SESSION) {
-    const oldest = [...bucket.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
-    if (oldest) bucket.delete(oldest[0]);
+  const bytes = Buffer.byteLength(content);
+  while (
+    bucket.size >= OUTPUT_CACHE_MAX_PER_SESSION ||
+    outputCacheEntriesGlobal >= RESOURCE_LIMITS.maxOutputCacheEntriesGlobal ||
+    outputCacheBytesGlobal + bytes > RESOURCE_LIMITS.maxOutputCacheBytesGlobal
+  ) {
+    let oldestSid: string | undefined;
+    let oldestId: string | undefined;
+    let oldestTime = Infinity;
+    for (const [sid, candidate] of outputCache) {
+      for (const [id, entry] of candidate) {
+        if (entry.createdAt < oldestTime) { oldestTime = entry.createdAt; oldestSid = sid; oldestId = id; }
+      }
+    }
+    if (!oldestSid || !oldestId) break;
+    removeCachedOutput(oldestSid, oldestId);
   }
+  if (bytes > RESOURCE_LIMITS.maxOutputCacheBytesGlobal) return '';
   const id = crypto.randomBytes(6).toString('hex');
   bucket.set(id, { content, createdAt: Date.now() });
+  outputCacheEntriesGlobal++;
+  outputCacheBytesGlobal += bytes;
   return id;
 }
 
@@ -85,10 +180,10 @@ function getCachedOutput(sessionId: string, id: string): string | undefined {
 const outputCachePruneTimer = setInterval(() => {
   const now = Date.now();
   for (const [sid, bucket] of outputCache) {
-    for (const [id, entry] of bucket) {
-      if (now - entry.createdAt > OUTPUT_CACHE_TTL_MS) bucket.delete(id);
+    for (const id of [...bucket.keys()]) {
+      const entry = bucket.get(id)!;
+      if (now - entry.createdAt > OUTPUT_CACHE_TTL_MS) removeCachedOutput(sid, id);
     }
-    if (bucket.size === 0) outputCache.delete(sid);
   }
 }, 5 * 60 * 1000);
 outputCachePruneTimer.unref();
@@ -242,21 +337,59 @@ async function run(cmd: string, cwd: string, timeout: number = 30000, sessionId?
   const resolved = await resolveMode();
   if (!resolved.mode) return { err: Object.assign(new Error(resolved.error), { code: 126 }), stdout: '', stderr: resolved.error || 'Sandbox unavailable.' };
   const env = sandboxEnv(sessionId);
-  return new Promise((resolve) => {
+  return withExecutionSlot(() => new Promise((resolve) => {
     if (resolved.mode === 'host') {
       exec(cmd, { cwd, timeout, env, maxBuffer: 4 * 1024 * 1024, shell: '/bin/bash' }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
       return;
     }
     const args = bwrapArgs(sessionId, cwd, cmd, network);
     execFile('bwrap', args, { cwd: '/', timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
-  });
+  }));
 }
 
 async function sandboxRoot(sessionId: string): Promise<string> {
   const dir = path.join(os.tmpdir(), `krix_sbx_${getAuthKeyForSession(sessionId)}`);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   await fs.mkdir(path.join(dir, '.home'), { recursive: true, mode: 0o700 });
+  // A symlinked sandbox root would let a prior/adjacent process redirect all sandbox I/O
+  // outside the intended tmp directory; refuse to treat it as trusted if so.
+  const stat = await fs.lstat(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Sandbox root is not a trusted directory.');
   return dir;
+}
+
+// No per-write byte cap prevents an agent from writing many files that individually pass
+// MAX_FILE_BYTES but collectively fill the container's disk. This tracks total sandbox
+// directory usage and rejects further growth past a fixed quota (does not walk symlinks).
+async function sandboxUsageBytes(root: string, maxBytes: number = RESOURCE_LIMITS.maxSandboxDirBytes): Promise<number> {
+  let total = 0;
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    let entries;
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      try {
+        const stat = await fs.lstat(full);
+        if (stat.isSymbolicLink()) continue;
+        if (stat.isDirectory()) stack.push(full);
+        else {
+          total += stat.size;
+          if (total > maxBytes) return total;
+        }
+      } catch {}
+    }
+  }
+  return total;
+}
+
+async function assertSandboxGrowth(sessionId: string, additionalBytes: number): Promise<void> {
+  const root = await sandboxRoot(sessionId);
+  const used = await sandboxUsageBytes(root);
+  if (used + Math.max(0, additionalBytes) > RESOURCE_LIMITS.maxSandboxDirBytes) {
+    throw new Error(`Sandbox disk quota would exceed ${Math.round(RESOURCE_LIMITS.maxSandboxDirBytes / 1024 / 1024)} MB. Remove files or call sandbox_reset.`);
+  }
 }
 
 async function workDir(sessionId: string): Promise<string> {
@@ -299,6 +432,9 @@ async function getShell(sessionId: string): Promise<PersistentShell> {
 
   const inFlight = shellCreation.get(key);
   if (inFlight) return inFlight;
+  if (persistentShells.size >= RESOURCE_LIMITS.maxPersistentShellsGlobal) {
+    throw new Error('Persistent shell capacity reached across active sessions. Close an idle session or use persistent:false.');
+  }
 
   const creation = (async () => {
     const cwd = await workDir(sessionId);
@@ -380,7 +516,8 @@ export async function destroySandbox(sessionId: string, options: { deleteContext
     deleteSessionContext(sessionId);
   }
   killShell(shellToKill);
-  outputCache.delete(sessionId);
+  const bucket = outputCache.get(sessionId);
+  if (bucket) for (const id of [...bucket.keys()]) removeCachedOutput(sessionId, id);
   const table = processTables.get(sessionId);
   if (table) {
     for (const [, item] of table) { try { item.proc.kill('SIGKILL'); } catch {} }
@@ -458,7 +595,11 @@ function runGit(args: string[], cwd: string, timeout: number, token?: string): P
     };
     if (token) {
       env.GIT_CONFIG_COUNT = '1';
-      env.GIT_CONFIG_KEY_0 = 'http.extraHeader';
+      // Scoped via the URL-specific config key (http.<url>.extraheader) rather than the
+      // global http.extraHeader, so the Authorization header is only ever attached to
+      // requests to https://github.com/ — not to any other host a git operation might
+      // talk to (e.g. a submodule or LFS remote on a different domain).
+      env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
       env.GIT_CONFIG_VALUE_0 = `Authorization: Bearer ${token}`;
     }
     const safeArgs = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=false', '-c', 'credential.helper=', '-c', 'protocol.ext.allow=never', '-c', 'protocol.file.allow=never', '-c', 'submodule.recurse=false', ...args];
@@ -472,7 +613,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   reg('sandbox_exec', {
     description: 'Run a shell command. By default runs in a persistent shell that keeps cd/export/venv state across calls (like a real terminal) — pass `persistent:false` for an isolated one-off exec instead. Pass `dir` to target any sandbox path (one-off cd for that call only). Pass `background:true` to run detached and track it via sandbox_ps (always isolated, unaffected by `persistent`).',
     inputSchema: {
-      command: z.string(),
+      command: z.string().max(RESOURCE_LIMITS.maxInputString),
       timeoutMs: z.number().optional(),
       dir: z.string().optional(),
       background: z.boolean().optional().default(false),
@@ -486,6 +627,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
 
       if (args.background) {
         if (procTable(sessionId).size >= MAX_BACKGROUND_PROCESSES) throw new Error(`Maximum of ${MAX_BACKGROUND_PROCESSES} background sandbox processes reached.`);
+        if (totalRunningBackgroundProcesses() >= RESOURCE_LIMITS.maxBackgroundProcessesGlobal) throw new Error('Background process capacity reached across active sessions. Stop an existing process or wait for one to finish.');
         const resolved = await resolveMode();
         if (!resolved.mode) throw new Error(resolved.error);
         let proc: ChildProcess;
@@ -526,7 +668,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     description: 'Run code: pass inline `code` (+ optional `lang`, default py) or an existing `filePath`. Langs: py,js,ts,sh,go,java,cpp,c,rust,ruby,php. Pass `dir` to run in any sandbox directory instead of the default workDir.',
     inputSchema: {
       lang: z.enum(['py', 'js', 'ts', 'sh', 'go', 'java', 'cpp', 'c', 'rust', 'ruby', 'php']).optional(),
-      code: z.string().optional(),
+      code: z.string().max(RESOURCE_LIMITS.maxInputString).optional(),
       filePath: z.string().optional(),
       args: z.array(z.string()).optional(),
       dir: z.string().optional()
@@ -579,11 +721,16 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
   }, async (args: any) => {
     try {
       const cwd = args.dir ? await resolveDir(sessionId, args.dir) : await sandboxRoot(sessionId);
+      // Installs can pull in an unbounded amount of disk (transitive deps, wheels, etc).
+      // We can't know the size ahead of time, so check quota before starting and again
+      // after — the post-check at least stops runaway growth from silently succeeding.
+      try { await assertSandboxGrowth(sessionId, 0); } catch (err) { return formatError(err); }
       const packages = args.packages.map((value: string) => { if (!/^[A-Za-z0-9@_./:+=-]{1,200}$/.test(value) || value.startsWith('-')) throw new Error(`Invalid package spec: ${value}`); return shellQuote(value); });
       const list = packages.join(' ');
       const cmd = args.manager === 'npm' ? `npm install --ignore-scripts ${list}` : `pip install --disable-pip-version-check --no-input --target=. ${list}`;
       const { err, stdout, stderr } = await run(cmd, cwd, 90000, sessionId, true);
       if (err) return execResponse(sessionId, err, stdout, stderr);
+      try { await assertSandboxGrowth(sessionId, 0); } catch (quotaErr: any) { return formatOptimizedResponse({ installed: args.packages, path: cwd, warning: quotaErr.message }); }
       return formatOptimizedResponse({ installed: args.packages, path: cwd });
     } catch (err) { return formatError(err); }
   });
@@ -677,7 +824,7 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
     inputSchema: {
       action: z.enum(['read', 'write', 'append', 'edit', 'delete']),
       path: z.string(),
-      content: z.string().optional(),
+      content: z.string().max(RESOURCE_LIMITS.maxInputString).optional(),
       old_str: z.string().optional().describe('Required for action:edit. Must match the file content in exactly one place.'),
       new_str: z.string().optional().describe('Required for action:edit. Replaces old_str; empty string deletes the matched text.'),
       dir: z.string().optional(),
@@ -728,7 +875,9 @@ export function registerSandboxTools(server: McpServer, sessionId: string, githu
       }
 
       if (args.content === undefined) return formatError('`content` is required for write/append.');
-      if (Buffer.byteLength(args.content, 'utf8') > MAX_FILE_BYTES) return formatError(`Content exceeds the ${MAX_FILE_BYTES} byte safety limit.`);
+      const incomingBytes = Buffer.byteLength(args.content, 'utf8');
+      if (incomingBytes > MAX_FILE_BYTES) return formatError(`Content exceeds the ${MAX_FILE_BYTES} byte safety limit.`);
+      try { await assertSandboxGrowth(sessionId, incomingBytes); } catch (err) { return formatError(err); }
       await fs.mkdir(path.dirname(abs), { recursive: true });
       if (args.action === 'append') await safeWriteText(abs, args.content, true);
       else await safeWriteText(abs, args.content);

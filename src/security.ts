@@ -3,6 +3,27 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
+// Resource ceilings tuned for small hosts (e.g. Render's free/starter tiers, ~512MB).
+// These are application-level guards against unbounded in-memory growth or runaway
+// concurrency from many/heavy tool calls — not a replacement for container/OS limits,
+// and intentionally generous for normal single-agent workloads.
+export const RESOURCE_LIMITS = {
+  maxAuthContexts: 64,
+  maxEnvVars: 128,
+  maxEnvBytes: 256 * 1024,
+  maxInputString: 2 * 1024 * 1024,
+  maxOutputCacheEntriesGlobal: 64,
+  maxOutputCacheBytesGlobal: 32 * 1024 * 1024,
+  maxBackgroundProcessesGlobal: 24,
+  maxPersistentShellsGlobal: 16,
+  maxConcurrentExecutionsGlobal: 4,
+  maxExecutionQueue: 8,
+  maxPushFiles: 100,
+  maxPushFileBytes: 4 * 1024 * 1024,
+  maxPushTotalBytes: 16 * 1024 * 1024,
+  maxSandboxDirBytes: 256 * 1024 * 1024,
+} as const;
+
 export enum PermissionLevel {
   READ_ONLY = 'READ_ONLY',
   MUTATING = 'MUTATING',
@@ -423,6 +444,44 @@ export function sanitizeOutput(data: any): any {
     return copy;
   }
   return data;
+}
+
+// Regex compilation check ahead of use. Matching itself should still go through
+// safeRegexTest() (VM-sandboxed, timeout-bounded) — this only rejects unsupported flags
+// and absurdly long patterns before they're ever compiled/tested.
+export function validateRegex(pattern: string, flags = 'i'): void {
+  if (pattern.length > 5000) throw new Error('Regex pattern is too long.');
+  if (!/^[dgimsuvy]*$/.test(flags)) throw new Error('Unsupported regex flags.');
+  new RegExp(pattern, flags);
+}
+
+// Session env vars (set via set_active_context) get forwarded into sandboxed command
+// environments. Reject dangerous names outright at the point they're set, rather than
+// relying solely on downstream filtering — belt-and-suspenders against interpreter/
+// dynamic-linker hijacking (LD_PRELOAD, PYTHONPATH, RUBYLIB, ...) and credential-helper
+// override (GIT_ASKPASS, GIT_SSH_COMMAND) vectors.
+const BLOCKED_ENV_NAMES = new Set([
+  'MCP_API_KEY', 'MCP_REFRESH_TOKEN', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_PAT', 'RENDER_API_KEY', 'RENDER_PAT',
+  'NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONHOME',
+  'RUBYLIB', 'PERL5LIB', 'BASH_ENV', 'ENV', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+  'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'PATH', 'HOME', 'TMPDIR'
+]);
+
+export function sanitizeSessionEnv(env: Record<string, string>): Record<string, string> {
+  const entries = Object.entries(env);
+  if (entries.length > RESOURCE_LIMITS.maxEnvVars) throw new Error(`Too many environment variables (max ${RESOURCE_LIMITS.maxEnvVars}).`);
+  let totalBytes = 0;
+  const out: Record<string, string> = {};
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid environment variable name '${key}'.`);
+    if (BLOCKED_ENV_NAMES.has(key.toUpperCase()) || /^(LD_|NODE_OPTIONS$|GIT_)/i.test(key)) throw new Error(`Environment variable '${key}' is not permitted.`);
+    if (typeof value !== 'string') throw new Error(`Environment variable '${key}' must be a string.`);
+    if (value.length > 8192) throw new Error(`Environment variable '${key}' is too large.`);
+    totalBytes += Buffer.byteLength(key, 'utf8') + Buffer.byteLength(value, 'utf8');
+    if (totalBytes > RESOURCE_LIMITS.maxEnvBytes) throw new Error(`Environment exceeds ${RESOURCE_LIMITS.maxEnvBytes} bytes total.`);
+    out[key] = value;
+  }
+  return out;
 }
 
 export function sanitizePath(inputPath: string, rootDir: string = process.cwd()): string {

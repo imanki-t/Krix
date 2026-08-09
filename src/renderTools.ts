@@ -1,27 +1,43 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import crypto from 'node:crypto';
 import { formatOptimizedResponse, formatError, getToolAnnotations, makeRegistrar } from './security.js';
 
 interface RenderSessionEntry { sessionId: string; lastActive: number; }
+// Keyed by a hash of the render token, not the raw token — avoids keeping plaintext
+// API keys resident in memory as Map keys for the lifetime of the process.
 const renderSessions = new Map<string, RenderSessionEntry>();
+const MAX_RENDER_SESSIONS = 8;
+const RENDER_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+
+function renderTokenKey(renderToken: string): string {
+  return crypto.createHash('sha256').update(renderToken).digest('hex');
+}
 
 const RENDER_SESSION_TTL_MS = 30 * 60 * 1000;
 const RENDER_SESSION_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 const renderSessionPruneTimer = setInterval(() => {
   const now = Date.now();
-  for (const [token, entry] of renderSessions) {
-    if (now - entry.lastActive > RENDER_SESSION_TTL_MS) renderSessions.delete(token);
+  for (const [key, entry] of renderSessions) {
+    if (now - entry.lastActive > RENDER_SESSION_TTL_MS) renderSessions.delete(key);
   }
 }, RENDER_SESSION_PRUNE_INTERVAL_MS);
 renderSessionPruneTimer.unref();
 
+async function readJsonCapped(response: Response): Promise<any> {
+  const text = await response.text();
+  if (Buffer.byteLength(text, 'utf8') > RENDER_RESPONSE_MAX_BYTES) throw new Error('Render API response exceeded the size limit.');
+  try { return JSON.parse(text); } catch { throw new Error(`Render API returned a non-JSON response (status ${response.status}).`); }
+}
+
 async function getRenderSession(renderToken: string): Promise<string> {
-  const cached = renderSessions.get(renderToken);
+  const key = renderTokenKey(renderToken);
+  const cached = renderSessions.get(key);
   if (cached && Date.now() - cached.lastActive <= RENDER_SESSION_TTL_MS) {
     cached.lastActive = Date.now();
     return cached.sessionId;
   }
-  if (cached) renderSessions.delete(renderToken);
+  if (cached) renderSessions.delete(key);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
@@ -36,27 +52,50 @@ async function getRenderSession(renderToken: string): Promise<string> {
       })
     });
     clearTimeout(timeoutId);
+    if (!response.ok) throw new Error(`Render API rejected the connection (status ${response.status}). Check RENDER_API_KEY.`);
     const sessionId = response.headers.get('mcp-session-id');
     if (!sessionId) throw new Error('Render MCP missing session header.');
-    renderSessions.set(renderToken, { sessionId, lastActive: Date.now() });
+
+    // Bound the number of distinct Render tokens cached at once (LRU by lastActive) so
+    // a gateway used with many different tokens can't grow this map without limit.
+    if (renderSessions.size >= MAX_RENDER_SESSIONS && !renderSessions.has(key)) {
+      let oldestKey: string | undefined; let oldestTime = Infinity;
+      for (const [k, entry] of renderSessions) if (entry.lastActive < oldestTime) { oldestTime = entry.lastActive; oldestKey = k; }
+      if (oldestKey) renderSessions.delete(oldestKey);
+    }
+    renderSessions.set(key, { sessionId, lastActive: Date.now() });
     return sessionId;
   } catch (err) { clearTimeout(timeoutId); throw err; }
 }
 
 async function callRenderTool(toolName: string, args: any, renderToken: string | undefined) {
   if (!renderToken) return formatError(new Error('Render API key missing.'));
+  const key = renderTokenKey(renderToken);
   try {
     const sessionId = await getRenderSession(renderToken);
-    const res = await fetch('https://mcp.render.com/mcp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${renderToken}`, 'Mcp-Session-Id': sessionId },
-      body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { name: toolName, arguments: args }, id: `r-${Date.now()}` })
-    });
-    const data: any = await res.json();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    let res: Response;
+    try {
+      res = await fetch('https://mcp.render.com/mcp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${renderToken}`, 'Mcp-Session-Id': sessionId },
+        signal: controller.signal,
+        body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { name: toolName, arguments: args }, id: `r-${Date.now()}` })
+      });
+    } finally { clearTimeout(timeoutId); }
+    if (res.status === 401 || res.status === 403) {
+      // Cached session/token is no longer valid — drop it so the next call re-initializes
+      // instead of repeatedly failing against a stale session.
+      renderSessions.delete(key);
+      return formatError(new Error(`Render API rejected the request (status ${res.status}). The API key may be invalid or revoked.`));
+    }
+    if (!res.ok) return formatError(new Error(`Render API request failed (status ${res.status}).`));
+    const data: any = await readJsonCapped(res);
     if (data?.error) return formatError(new Error(data.error.message || JSON.stringify(data.error)));
     return formatOptimizedResponse(data?.result || data);
   } catch (err: any) {
-    renderSessions.delete(renderToken);
+    renderSessions.delete(key);
     return formatError(err);
   }
 }

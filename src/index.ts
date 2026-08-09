@@ -53,8 +53,22 @@ function tagCategory(registry: Record<string, any>, categoryOf: Record<string, T
   for (const name of Object.keys(registry)) categoryOf[name] = TOOL_CATEGORY[name] || fallbackCategory;
 }
 
+function serverIcons(): Array<{ src: string; mimeType: string; sizes: string[] }> | undefined {
+  const base = process.env.PUBLIC_BASE_URL?.replace(/\/$/, '');
+  if (!base) return undefined;
+  const logo = process.env.APP_LOGO_URL?.trim() || `${base}/logo.png`;
+  const mimeType = /\.svg(?:\?.*)?$/i.test(logo) ? 'image/svg+xml' : /\.jpe?g(?:\?.*)?$/i.test(logo) ? 'image/jpeg' : 'image/png';
+  return [{ src: logo, mimeType, sizes: ['320x317'] }];
+}
+
 function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
-  const server = new McpServer({ name: 'krix', version: '2.1.0' }, { capabilities: { tools: { listChanged: true } } });
+  // `icons` is SEP-973 (MCP spec 2026-07-28): connectors that support it (e.g. Gemini's
+  // "Custom apps for Spark", newer Claude/ChatGPT builds) read this straight from the
+  // initialize response to render the server's icon — this is the fix for the broken/
+  // placeholder logo on connector "link account" and app-list screens. It requires
+  // @modelcontextprotocol/sdk >= 1.27.0; the HTTP-served /logo.png and root-page <link
+  // rel="icon"> remain as fallbacks for clients that instead probe those directly.
+  const server = new McpServer({ name: 'krix', version: '2.1.0', icons: serverIcons() }, { capabilities: { tools: { listChanged: true } } });
   const octokit = new Octokit({ auth: githubToken || undefined });
   const registry: Record<string, any> = {};
   const categoryOf: Record<string, ToolCategory> = {};
@@ -199,7 +213,7 @@ app.get('/readyz', (_req, res) => {
   const ready = !!MCP_API_KEY && (!isProduction || process.env.PUBLIC_BASE_URL?.startsWith('https://'));
   res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not_ready' });
 });
-app.get('/', (_req, res) => { res.type('html').send('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Krix</title><link rel="icon" href="/logo.png" type="image/png"></head><body style="margin:0;background:#f4f4f2;color:#111;font-family:system-ui;display:grid;place-items:center;min-height:100vh"><main style="background:white;border:1px solid #ddd;border-radius:24px;padding:32px;box-shadow:0 20px 60px #0001"><img src="/logo.png" width="56" height="56" alt="Krix"><h1>Krix Gateway</h1><p style="color:#666">Secure MCP gateway.</p></main></body></html>'); });
+app.get('/', (_req, res) => { res.type('html').send('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Krix</title><link rel="icon" href="/logo.png" type="image/png"><link rel="apple-touch-icon" href="/logo.png"><meta property="og:image" content="/logo.png"><meta property="og:title" content="Krix"></head><body style="margin:0;background:#f4f4f2;color:#111;font-family:system-ui;display:grid;place-items:center;min-height:100vh"><main style="background:white;border:1px solid #ddd;border-radius:24px;padding:32px;box-shadow:0 20px 60px #0001"><img src="/logo.png" width="56" height="56" alt="Krix"><h1>Krix Gateway</h1><p style="color:#666">Secure MCP gateway.</p></main></body></html>'); });
 
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
