@@ -64,7 +64,7 @@ function configuredBaseUrl(): string | undefined {
   }
 }
 
-function baseUrl(req: Request): string {
+export function baseUrl(req: Request): string {
   const configured = configuredBaseUrl();
   if (configured) return configured;
   const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
