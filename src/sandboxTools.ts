@@ -599,8 +599,17 @@ function runGit(args: string[], cwd: string, timeout: number, token?: string): P
       // global http.extraHeader, so the Authorization header is only ever attached to
       // requests to https://github.com/ — not to any other host a git operation might
       // talk to (e.g. a submodule or LFS remote on a different domain).
+      //
+      // Basic auth, not Bearer: GitHub's git-over-HTTPS endpoint does not accept
+      // `Authorization: Bearer <token>` for classic personal access tokens — only some
+      // GitHub App/installation tokens support Bearer there. Sending Bearer for a normal
+      // PAT silently degraded to an unauthenticated request, which — combined with
+      // GIT_TERMINAL_PROMPT=0 and GIT_ASKPASS=/bin/false below — surfaced as "could not
+      // read Username for 'https://github.com'" instead of a real auth error.
+      // `x-access-token` as the Basic-auth username is the scheme GitHub documents and
+      // accepts uniformly for PATs, fine-grained PATs, and GitHub App tokens alike.
       env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
-      env.GIT_CONFIG_VALUE_0 = `Authorization: Bearer ${token}`;
+      env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
     }
     const safeArgs = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=false', '-c', 'credential.helper=', '-c', 'protocol.ext.allow=never', '-c', 'protocol.file.allow=never', '-c', 'submodule.recurse=false', ...args];
     execFile('git', safeArgs, { cwd, env, timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
