@@ -9,7 +9,7 @@ import { Octokit } from '@octokit/rest';
 import { registerGitHubTools } from './githubTools.js';
 import { registerRenderTools } from './renderTools.js';
 import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
-import { oauthAuthorize, oauthAuthorizePost, oauthToken, oauthRegister, oauthRevoke, oauthMetadata, protectedResourceMetadata, resolveOAuthAccessToken } from './oauth.js';
+import { oauthAuthorize, oauthAuthorizePost, oauthToken, oauthRegister, oauthRevoke, oauthMetadata, protectedResourceMetadata, resolveOAuthAccessToken, baseUrl } from './oauth.js';
 import { TOOL_CATEGORY, ToolCategory, getSessionContext, registerSessionAuth, consumeRateLimit, timingSafeEqualText } from './security.js';
 
 dotenv.config();
