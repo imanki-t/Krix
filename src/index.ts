@@ -205,7 +205,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
     if (transport.sessionId) { void destroySandbox(transport.sessionId); transports.delete(transport.sessionId); }
   };
 
-  const masterServer = createMasterServer(githubToken, renderToken, newSessionId);
+  const masterServer = createMasterServer(githubToken, renderToken, newSessionId, req);
   try { await masterServer.connect(transport); await transport.handleRequest(req, res, req.body); }
   catch (error) { console.error(`[${rid}] MCP request error`, error); if (!res.headersSent) jsonRpcError(res, 500, 'Internal server error.', req.body?.id); }
 });
