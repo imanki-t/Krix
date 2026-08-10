@@ -53,22 +53,24 @@ function tagCategory(registry: Record<string, any>, categoryOf: Record<string, T
   for (const name of Object.keys(registry)) categoryOf[name] = TOOL_CATEGORY[name] || fallbackCategory;
 }
 
-function serverIcons(): Array<{ src: string; mimeType: string; sizes: string[] }> | undefined {
-  const base = process.env.PUBLIC_BASE_URL?.replace(/\/$/, '');
-  if (!base) return undefined;
+function serverIcons(req: Request): Array<{ src: string; mimeType: string; sizes: string[] }> {
+  // Prefer the configured PUBLIC_BASE_URL, but don't require it — fall back to the
+  // request's own origin (same derivation oauth.ts's logo_uri already uses) so the icon
+  // still resolves on a bare deploy that hasn't set PUBLIC_BASE_URL.
+  const base = process.env.PUBLIC_BASE_URL?.replace(/\/$/, '') || baseUrl(req);
   const logo = process.env.APP_LOGO_URL?.trim() || `${base}/logo.png`;
   const mimeType = /\.svg(?:\?.*)?$/i.test(logo) ? 'image/svg+xml' : /\.jpe?g(?:\?.*)?$/i.test(logo) ? 'image/jpeg' : 'image/png';
   return [{ src: logo, mimeType, sizes: ['320x317'] }];
 }
 
-function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
+function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string, req: Request) {
   // `icons` is SEP-973 (MCP spec 2026-07-28): connectors that support it (e.g. Gemini's
   // "Custom apps for Spark", newer Claude/ChatGPT builds) read this straight from the
   // initialize response to render the server's icon — this is the fix for the broken/
   // placeholder logo on connector "link account" and app-list screens. It requires
   // @modelcontextprotocol/sdk >= 1.27.0; the HTTP-served /logo.png and root-page <link
   // rel="icon"> remain as fallbacks for clients that instead probe those directly.
-  const server = new McpServer({ name: 'krix', version: '2.1.0', icons: serverIcons() }, { capabilities: { tools: { listChanged: true } } });
+  const server = new McpServer({ name: 'krix', version: '2.1.0', icons: serverIcons(req) }, { capabilities: { tools: { listChanged: true } } });
   const octokit = new Octokit({ auth: githubToken || undefined });
   const registry: Record<string, any> = {};
   const categoryOf: Record<string, ToolCategory> = {};
