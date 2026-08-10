@@ -1014,14 +1014,21 @@ export function registerGitHubTools(server: McpServer, octokit: Octokit, session
   });
 
   reg('delete_file', {
-    description: 'Delete file.',
-    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), path: z.string(), message: z.string(), sha: z.string(), branch: z.string() },
+    description: 'Delete file. `sha` is optional — if omitted, the current blob SHA is looked up automatically from path/branch (no other tool exposes a blob SHA to pass in manually).',
+    inputSchema: { owner: z.string().optional(), repo: z.string().optional(), path: z.string(), message: z.string(), sha: z.string().optional(), branch: z.string().optional() },
     annotations: getToolAnnotations('delete_file')
   }, async (args: any) => {
     const { owner, repo, path, message, sha, branch } = args;
     try {
       const target = resolveRepo(owner, repo, sessionId);
-      await octokit.repos.deleteFile({ owner: target.owner, repo: target.repo, path, message, sha, branch });
+      const activeBranch = branch || getSessionContext(sessionId).branch || 'main';
+      let activeSha = sha;
+      if (!activeSha) {
+        const existing = await octokit.repos.getContent({ owner: target.owner, repo: target.repo, path, ref: activeBranch });
+        if (Array.isArray(existing.data) || !('sha' in existing.data)) throw new Error(`Target is not a file: ${path}`);
+        activeSha = existing.data.sha;
+      }
+      await octokit.repos.deleteFile({ owner: target.owner, repo: target.repo, path, message, sha: activeSha, branch: activeBranch });
       return formatOptimizedResponse(`Deleted ${path}`);
     } catch (err) { return handleGitHubError(err); }
   });
