@@ -1,39 +1,75 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">
   <defs>
-    <linearGradient id="facetAlpha" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#ffffff" />
-      <stop offset="50%" stop-color="#f4f4f5" />
-      <stop offset="100%" stop-color="#a1a1aa" />
+    <!-- Studio Background Canvas -->
+    <radialGradient id="bg-glow" cx="50%" cy="50%" r="75%">
+      <stop offset="0%" stop-color="#141416"/>
+      <stop offset="100%" stop-color="#030304"/>
+    </radialGradient>
+
+    <!-- Premium Monochrome Metallic Gradients -->
+    <linearGradient id="grad-platinum" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="50%" stop-color="#F4F4F5"/>
+      <stop offset="100%" stop-color="#A1A1AA"/>
     </linearGradient>
-    <linearGradient id="facetBeta" x1="100%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#e4e4e7" />
-      <stop offset="60%" stop-color="#71717a" />
-      <stop offset="100%" stop-color="#27272a" />
+
+    <linearGradient id="grad-silver" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#E4E4E7"/>
+      <stop offset="50%" stop-color="#71717A"/>
+      <stop offset="100%" stop-color="#27272A"/>
     </linearGradient>
-    <linearGradient id="facetGamma" x1="50%" y1="100%" x2="50%" y2="0%">
-      <stop offset="0%" stop-color="#ffffff" />
-      <stop offset="60%" stop-color="#d4d4d8" />
-      <stop offset="100%" stop-color="#52525b" />
+
+    <linearGradient id="grad-graphite" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#A1A1AA"/>
+      <stop offset="60%" stop-color="#3F3F46"/>
+      <stop offset="100%" stop-color="#18181B"/>
     </linearGradient>
-    <filter id="coreGlow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="4" result="blur" />
-      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+
+    <linearGradient id="grad-obsidian" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#52525B"/>
+      <stop offset="100%" stop-color="#09090B"/>
+    </linearGradient>
+
+    <!-- Subtle Depth Shadow -->
+    <filter id="elevation" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity="0.7"/>
     </filter>
   </defs>
 
-  <rect width="512" height="512" rx="112" fill="#000000" />
-  <rect x="8" y="8" width="496" height="496" rx="104" fill="none" stroke="#222225" stroke-width="4" />
+  <!-- Background Canvas -->
+  <rect width="500" height="500" rx="40" fill="url(#bg-glow)"/>
 
-  <g transform="translate(256, 266)">
-    <path d="M 0 -170 L 60 -65 L -40 -35 L -75 -100 C -60 -150 -30 -170 0 -170 Z" fill="url(#facetAlpha)" />
-    <path d="M 60 -65 L 140 -40 C 170 -10 160 35 125 55 L 25 15 Z" fill="url(#facetBeta)" />
-    <path d="M 125 55 L 25 105 L 10 0 L 75 -40 C 115 -30 145 10 125 55 Z" fill="url(#facetGamma)" />
-    <path d="M 25 105 L -55 150 C -95 170 -130 140 -135 100 L -65 15 Z" fill="url(#facetAlpha)" />
-    <path d="M -135 100 L -85 -10 L 30 0 L -15 75 C -55 100 -105 110 -135 100 Z" fill="url(#facetBeta)" />
-    <path d="M -85 -10 L -85 -110 C -75 -155 -30 -170 0 -170 L -40 -65 Z" fill="url(#facetGamma)" />
+  <!-- Minimalist Square Matrix -->
+  <g filter="url(#elevation)">
+    
+    <!-- Central Rotated Diamond Core (4 Deconstructed Curved Square Tiles) -->
+    <g transform="translate(250, 250) rotate(45)">
+      <!-- Top-Left Core Quadrant -->
+      <rect x="-70" y="-70" width="65" height="65" rx="16" fill="url(#grad-platinum)"/>
+      <!-- Top-Right Core Quadrant -->
+      <rect x="5" y="-70" width="65" height="65" rx="16" fill="url(#grad-silver)"/>
+      <!-- Bottom-Right Core Quadrant -->
+      <rect x="5" y="5" width="65" height="65" rx="16" fill="url(#grad-graphite)"/>
+      <!-- Bottom-Left Core Quadrant -->
+      <rect x="-70" y="5" width="65" height="65" rx="16" fill="url(#grad-obsidian)"/>
 
-    <polygon points="0,-40 35,20 -35,20" fill="#000000" stroke="#27272a" stroke-width="3" />
-    <circle cx="0" cy="0" r="12" fill="#ffffff" filter="url(#coreGlow)" />
-    <circle cx="0" cy="0" r="5" fill="#000000" />
+      <!-- Focal Core Accent (Floating Minimal Inset) -->
+      <rect x="-22" y="-22" width="44" height="44" rx="12" fill="#FFFFFF"/>
+      <rect x="-14" y="-14" width="28" height="28" rx="8" fill="#0A0A0C"/>
+    </g>
+
+    <!-- 4 Satellite Quadrant Squares -->
+    <!-- Top-Left Satellite -->
+    <rect x="105" y="105" width="70" height="70" rx="20" fill="url(#grad-platinum)"/>
+    
+    <!-- Top-Right Satellite -->
+    <rect x="325" y="105" width="70" height="70" rx="20" fill="url(#grad-silver)"/>
+    
+    <!-- Bottom-Right Satellite -->
+    <rect x="325" y="325" width="70" height="70" rx="20" fill="url(#grad-platinum)"/>
+    
+    <!-- Bottom-Left Satellite -->
+    <rect x="105" y="325" width="70" height="70" rx="20" fill="url(#grad-graphite)"/>
+
   </g>
 </svg>
