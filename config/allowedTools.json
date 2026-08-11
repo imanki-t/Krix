@@ -1,0 +1,33 @@
+{
+  "policy": {
+    "defaultCategoryStatus": {
+      "core": true,
+      "github_issues_prs": false,
+      "github_admin": false,
+      "render": false,
+      "sandbox": false
+    },
+    "allowDynamicToolsetLoading": true
+  },
+  "tools": {
+    "set_active_context": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Sets global context" },
+    "get_me": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Gets profile" },
+    "get_file_contents": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Reads file" },
+    "str_replace_editor": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Replaces text in file" },
+    "create_or_update_file": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Creates or updates file" },
+    "delete_file": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Deletes file" },
+    "grep": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Searches regex pattern" },
+    "view_file_outline": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Extracts AST outline" },
+    "git_tree": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Lists file tree" },
+    "patch_contents": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Patches line ranges" },
+    "list_branches": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Lists branches" },
+    "create_branch": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Creates branch" },
+    "delete_branch": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Deletes branch" },
+    "push_files": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Batch pushes files" },
+    "create_pull_request": { "enabled": true, "category": "core", "permission": "MUTATING", "description": "Opens PR" },
+    "search_code": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Searches code" },
+    "search_repositories": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Searches repos" },
+    "sandbox_status": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Inspects sandbox" },
+    "load_toolset": { "enabled": true, "category": "core", "permission": "READ_ONLY", "description": "Loads toolset category" }
+  }
+}

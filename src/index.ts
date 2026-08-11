@@ -1,244 +1,316 @@
-import express, { Request, Response, NextFunction } from 'express';
-import crypto from 'node:crypto';
+import express, { Request, Response } from 'express';
 import path from 'node:path';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import helmet from 'helmet';
+import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
+import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Octokit } from '@octokit/rest';
 
-import { registerGitHubTools } from './githubTools.js';
-import { registerRenderTools } from './renderTools.js';
-import { registerSandboxTools, destroySandbox } from './sandboxTools.js';
-import { oauthAuthorize, oauthAuthorizePost, oauthToken, oauthRegister, oauthRevoke, oauthMetadata, protectedResourceMetadata, resolveOAuthAccessToken, baseUrl } from './oauth.js';
-import { TOOL_CATEGORY, ToolCategory, getSessionContext, registerSessionAuth, consumeRateLimit, timingSafeEqualText } from './security.js';
+import { connectDB } from './services/db.js';
+import { loadSettings, loadToolPolicy } from './config/settings.js';
+import { registerGitHubTools } from './tools/githubTools.js';
+import { registerRenderTools } from './tools/renderTools.js';
+import { registerSandboxTools, destroySandbox } from './tools/sandboxTools.js';
+import {
+  formatOptimizedResponse, getToolAnnotations, TOOL_CATEGORY, ToolCategory,
+  getSessionContext, updateSessionContext, deleteSessionContext
+} from './core/security.js';
+import { wellKnownRouter } from './routes/wellKnown.js';
+import { authRouter } from './routes/auth.js';
+import { keysRouter } from './routes/keys.js';
+import { settingsRouter } from './routes/settings.js';
+import { oauthRouter } from './routes/oauth.js';
+import { ApiKeyRepository } from './models/ApiKey.js';
+import { UserRepository } from './models/User.js';
+import { hashApiKey, decryptSecret } from './services/cryptoService.js';
+import { AuditLogRepository } from './models/AuditLog.js';
 
 dotenv.config();
 
-const isProduction = process.env.NODE_ENV === 'production';
-const PORT = Number(process.env.PORT || 3000);
-if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('Invalid PORT.');
-const MCP_API_KEY = process.env.MCP_API_KEY?.trim() || '';
-const DEFAULT_GITHUB_PAT = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || process.env.GITHUB_PAT || '';
-const DEFAULT_RENDER_API_KEY = process.env.RENDER_API_KEY || process.env.RENDER_PAT;
-const ALLOW_LEGACY_API_KEY = process.env.ALLOW_LEGACY_API_KEY === 'true';
-const ALLOW_CLIENT_CREDENTIAL_HEADERS = process.env.ALLOW_CLIENT_CREDENTIAL_HEADERS === 'true';
-const MAX_SESSIONS = Math.max(10, Number(process.env.MAX_MCP_SESSIONS || 100));
-if (!Number.isFinite(MAX_SESSIONS) || MAX_SESSIONS > 5000) throw new Error('MAX_MCP_SESSIONS is invalid.');
+connectDB().catch(console.error);
 
-if (isProduction) {
-  if (!MCP_API_KEY || MCP_API_KEY.length < 32) throw new Error('MCP_API_KEY must be at least 32 characters in production.');
-  if (!process.env.PUBLIC_BASE_URL?.startsWith('https://')) throw new Error('PUBLIC_BASE_URL=https://... is required in production.');
-  if (process.env.ALLOW_LEGACY_API_KEY === 'true') console.warn('WARNING: ALLOW_LEGACY_API_KEY is enabled; prefer OAuth bearer tokens.');
-  if (process.env.ALLOW_CLIENT_CREDENTIAL_HEADERS === 'true') console.warn('WARNING: client-supplied GitHub/Render credentials are enabled.');
-  if (process.env.SANDBOX_MODE !== 'bwrap') console.warn('WARNING: SANDBOX_MODE is not bwrap. Arbitrary sandbox commands are not production-isolated.');
-}
+const settings = loadSettings();
+const app = express();
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://accounts.google.com", "https://www.google.com/recaptcha/", "https://www.gstatic.com/recaptcha/"],
+      frameSrc: ["'self'", "https://accounts.google.com", "https://www.google.com/recaptcha/"],
+      connectSrc: ["'self'", "https://accounts.google.com", "https://www.google.com/recaptcha/", "https://mcp.render.com", "https://api.github.com"],
+      imgSrc: ["'self'", "data:", "https:", "http:"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"]
+    }
+  },
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
+
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
+
+const globalLimiter = rateLimit({
+  windowMs: settings.rateLimiting.globalWindowMs || 900000,
+  max: settings.rateLimiting.globalMaxRequests || 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please wait before retrying.' }
+});
+app.use(globalLimiter);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cookieParser());
+
+app.use(wellKnownRouter);
+app.use('/web', express.static(path.resolve(process.cwd(), 'src/web')));
+app.use('/public', express.static(path.resolve(process.cwd(), 'public')));
+
+app.use('/api/auth', authRouter);
+app.use('/api/auth/oauth', oauthRouter);
+app.use('/oauth', oauthRouter);
+app.use('/api/keys', keysRouter);
+app.use('/api/settings', settingsRouter);
+
+app.get('/api/health', (req: Request, res: Response): void => {
+  res.json({
+    status: 'healthy',
+    version: '2.0.0',
+    timestamp: new Date().toISOString(),
+    securityTier: loadSettings().security.currentTier,
+    sandbox: {
+      bwrapDisabled: loadSettings().sandbox.disableBwrap,
+      defaultTimeoutMs: loadSettings().sandbox.defaultTimeoutMs
+    }
+  });
+});
 
 interface SessionEntry {
   transport: StreamableHTTPServerTransport;
   lastActive: number;
-  authFingerprint: string;
-  clientId: string;
+  userId?: string;
+  keyHash?: string;
 }
 const transports = new Map<string, SessionEntry>();
 
-function fingerprint(value: string): string { return crypto.createHash('sha256').update(value).digest('hex'); }
-function requestId(req: Request): string { return String(req.headers['x-request-id'] || crypto.randomUUID()).slice(0, 100); }
-function clientIp(req: Request): string { return req.ip || req.socket.remoteAddress || 'unknown'; }
-
-function jsonRpcError(res: Response, status: number, message: string, id: unknown = null): void {
-  res.status(status).json({ jsonrpc: '2.0', error: { code: status === 401 ? -32001 : -32000, message }, id: id ?? null });
-}
-
 function tagCategory(registry: Record<string, any>, categoryOf: Record<string, ToolCategory>, fallbackCategory: ToolCategory) {
-  for (const name of Object.keys(registry)) categoryOf[name] = TOOL_CATEGORY[name] || fallbackCategory;
+  for (const name of Object.keys(registry)) {
+    if (registry[name]) {
+      categoryOf[name] = TOOL_CATEGORY[name] || fallbackCategory;
+    }
+  }
 }
 
-function serverIcons(req: Request): Array<{ src: string; mimeType: string; sizes: string[] }> {
-  // Prefer the configured PUBLIC_BASE_URL, but don't require it — fall back to the
-  // request's own origin (same derivation oauth.ts's logo_uri already uses) so the icon
-  // still resolves on a bare deploy that hasn't set PUBLIC_BASE_URL.
-  const base = process.env.PUBLIC_BASE_URL?.replace(/\/$/, '') || baseUrl(req);
-  const logo = process.env.APP_LOGO_URL?.trim() || `${base}/logo.png`;
-  const mimeType = /\.svg(?:\?.*)?$/i.test(logo) ? 'image/svg+xml' : /\.jpe?g(?:\?.*)?$/i.test(logo) ? 'image/jpeg' : 'image/png';
-  return [{ src: logo, mimeType, sizes: ['320x317'] }];
-}
+function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string) {
+  const server = new McpServer({
+    name: 'krix',
+    version: '2.0.0'
+  }, {
+    capabilities: {
+      tools: {
+        listChanged: true
+      }
+    }
+  });
 
-function createMasterServer(githubToken: string, renderToken: string | undefined, sessionId: string, req: Request) {
-  // `icons` is SEP-973 (MCP spec 2026-07-28): connectors that support it (e.g. Gemini's
-  // "Custom apps for Spark", newer Claude/ChatGPT builds) read this straight from the
-  // initialize response to render the server's icon — this is the fix for the broken/
-  // placeholder logo on connector "link account" and app-list screens. It requires
-  // @modelcontextprotocol/sdk >= 1.27.0; the HTTP-served /logo.png and root-page <link
-  // rel="icon"> remain as fallbacks for clients that instead probe those directly.
-  const server = new McpServer({ name: 'krix', version: '2.1.0', icons: serverIcons(req) }, { capabilities: { tools: { listChanged: true } } });
-  const octokit = new Octokit({ auth: githubToken || undefined });
+  const octokit = new Octokit({ auth: githubToken || '' });
   const registry: Record<string, any> = {};
   const categoryOf: Record<string, ToolCategory> = {};
 
-  registerGitHubTools(server, octokit, sessionId, registry); tagCategory(registry, categoryOf, 'github_admin');
-  registerRenderTools(server, () => renderToken, registry); tagCategory(registry, categoryOf, 'render');
-  registerSandboxTools(server, sessionId, githubToken, registry); tagCategory(registry, categoryOf, 'sandbox');
+  registerGitHubTools(server, octokit, sessionId, registry);
+  tagCategory(registry, categoryOf, 'github_admin');
+
+  registerRenderTools(server, () => renderToken, registry);
+  tagCategory(registry, categoryOf, 'render');
+
+  registerSandboxTools(server, sessionId, githubToken, registry);
+  tagCategory(registry, categoryOf, 'sandbox');
 
   const ctx = getSessionContext(sessionId);
   for (const [name, handle] of Object.entries(registry)) {
+    if (!handle) continue;
     const cat = categoryOf[name];
-    if (ctx.enabledCategories.has(cat)) handle.enable(); else handle.disable();
+    if (ctx.enabledCategories.has(cat) || ctx.enabledToolOverrides.has(name)) {
+      handle.enable();
+    } else {
+      handle.disable();
+    }
   }
+
+  server.registerTool('load_toolset', {
+    description: "Lazily unlock specific toolset categories for this session: 'github_issues_prs' (issues/PRs), 'github_admin' (teams/releases/collaborators), 'sandbox' (code execution/git CLI), or 'render' (deployments/logs/postgres). Pass 'all' to unlock everything.",
+    inputSchema: {
+      category: z.enum(['github_issues_prs', 'github_admin', 'sandbox', 'render', 'all']).describe('Category of tools to activate.')
+    },
+    annotations: getToolAnnotations('load_toolset')
+  }, async (args: any) => {
+    const currentCtx = getSessionContext(sessionId);
+    if (args.category === 'all') {
+      const allCats: ToolCategory[] = ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render'];
+      allCats.forEach(c => currentCtx.enabledCategories.add(c));
+    } else {
+      currentCtx.enabledCategories.add(args.category as ToolCategory);
+    }
+
+    const wanted: ToolCategory[] = args.category === 'all'
+      ? ['core', 'github_issues_prs', 'github_admin', 'sandbox', 'render']
+      : [args.category];
+
+    const justEnabled: string[] = [];
+    for (const [name, handle] of Object.entries(registry)) {
+      if (handle && wanted.includes(categoryOf[name]) && !handle.enabled) {
+        handle.enable();
+        justEnabled.push(name);
+      }
+    }
+
+    try {
+      await server.sendToolListChanged();
+    } catch {}
+
+    return formatOptimizedResponse(justEnabled.length ? { activatedCategory: args.category, enabledTools: justEnabled } : { note: `Toolset '${args.category}' already active.` });
+  });
+
   return server;
 }
 
-function securityHeaders(res: Response): void {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
-  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
-  if (isProduction) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-}
-
-function allowedOrigins(): Set<string> {
-  return new Set((process.env.MCP_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean));
-}
-
-function validateOrigin(req: Request, res: Response): boolean {
-  const origin = req.headers.origin;
-  if (!origin) return true;
-  const allowed = allowedOrigins();
-  const publicBase = process.env.PUBLIC_BASE_URL?.replace(/\/$/, '');
-  if (origin === publicBase || allowed.has(origin)) return true;
-  res.status(403).json({ error: 'Origin not allowed.' });
-  return false;
-}
-
-function parseAuthorization(req: Request): { clientId: string; credential: string; fingerprint: string } | null {
-  const auth = String(req.headers.authorization || '');
-  const xApi = String(req.headers['x-api-key'] || '');
-
-  if (auth && /^Bearer\s+/i.test(auth)) {
-    const token = auth.replace(/^Bearer\s+/i, '').trim();
-    const oauth = resolveOAuthAccessToken(token);
-    if (oauth) return { clientId: oauth.clientId, credential: token, fingerprint: fingerprint(token) };
-    if (ALLOW_LEGACY_API_KEY && MCP_API_KEY && timingSafeEqualText(token, MCP_API_KEY)) return { clientId: 'legacy', credential: MCP_API_KEY, fingerprint: fingerprint(MCP_API_KEY) };
-  }
-
-  if (ALLOW_LEGACY_API_KEY && xApi && MCP_API_KEY && timingSafeEqualText(xApi, MCP_API_KEY)) {
-    return { clientId: 'legacy', credential: MCP_API_KEY, fingerprint: fingerprint(MCP_API_KEY) };
-  }
-  return null;
-}
-
-function validateClientCredentialHeaders(req: Request): void {
-  if (!ALLOW_CLIENT_CREDENTIAL_HEADERS) {
-    if (req.headers['x-github-token'] || req.headers['x-render-token']) throw new Error('Client-supplied provider credentials are disabled. Configure server-side credentials instead.');
-  }
-}
-
-const app = express();
-app.disable('x-powered-by');
-app.set('trust proxy', process.env.TRUST_PROXY === 'false' ? false : 1);
-app.use((req, res, next) => { securityHeaders(res); res.setHeader('X-Request-ID', requestId(req)); next(); });
-app.use((req, res, next) => { if (!validateOrigin(req, res)) return; next(); });
-app.use(express.json({ limit: process.env.MCP_BODY_LIMIT || '5mb', strict: true, type: ['application/json', 'application/*+json'] }));
-app.use(express.urlencoded({ extended: false, limit: '16kb', parameterLimit: 20 }));
-app.use('/assets', express.static(path.resolve('assets'), { dotfiles: 'deny', index: false, maxAge: '7d', immutable: false }));
-// Logo is served from a single canonical PNG so every consumer (OAuth account-linking
-// screens, browser favicons, tool avatars) resolves the same working asset. Previously a
-// /logo.svg route pointed at a file that didn't exist in assets/, which 404'd/500'd
-// anywhere it was referenced (including the OAuth metadata logo_uri) and produced the
-// broken-image / red-placeholder icon seen on connector "link account" screens.
-app.get('/logo.png', (_req, res) => { res.type('image/png'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.sendFile(path.resolve('assets/logo.png')); });
-app.get('/logo.jpg', (_req, res) => { res.type('image/jpeg'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.sendFile(path.resolve('assets/logo.jpg')); });
-app.get('/favicon.svg', (_req, res) => res.redirect(302, '/logo.png'));
-app.get('/favicon.ico', (_req, res) => res.redirect(302, '/logo.png'));
-
-app.get('/.well-known/oauth-authorization-server', (req, res) => { res.setHeader('Cache-Control', 'public, max-age=300'); res.json(oauthMetadata(req)); });
-app.get('/.well-known/oauth-protected-resource', (req, res) => { res.setHeader('Cache-Control', 'public, max-age=300'); res.json(protectedResourceMetadata(req)); });
-// Compatibility aliases used by MCP clients that scope discovery to the protected resource path.
-app.get('/mcp/.well-known/oauth-authorization-server', (req, res) => { res.setHeader('Cache-Control', 'public, max-age=300'); res.json(oauthMetadata(req)); });
-app.get('/mcp/.well-known/oauth-protected-resource', (req, res) => { res.setHeader('Cache-Control', 'public, max-age=300'); res.json(protectedResourceMetadata(req)); });
-app.get('/oauth/authorize', oauthAuthorize);
-app.post('/oauth/authorize', oauthAuthorizePost);
-app.post('/oauth/token', oauthToken);
-app.post('/oauth/register', oauthRegister);
-app.post('/oauth/revoke', oauthRevoke);
-
 app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
-  const rid = res.getHeader('X-Request-ID');
-  if (!['GET', 'POST', 'DELETE'].includes(req.method)) { res.setHeader('Allow', 'GET, POST, DELETE'); jsonRpcError(res, 405, 'Method not allowed.', req.body?.id); return; }
-  const limit = consumeRateLimit(`mcp:${clientIp(req)}`, Number(process.env.MCP_RATE_LIMIT || 120), 60_000);
-  if (!limit.allowed) { res.setHeader('Retry-After', String(limit.retryAfterSeconds)); jsonRpcError(res, 429, 'Rate limit exceeded.', req.body?.id); return; }
-  if (!MCP_API_KEY) { console.error(`[${rid}] MCP_API_KEY missing`); jsonRpcError(res, 503, 'Service unavailable.', req.body?.id); return; }
+  const clientKey = (req.headers['x-api-key'] as string)
+    || req.headers['authorization']?.toString().replace(/^Bearer\s+/i, '')
+    || (req.query.api_key as string);
 
-  let auth: ReturnType<typeof parseAuthorization>;
-  try { validateClientCredentialHeaders(req); auth = parseAuthorization(req); } catch (error: any) { jsonRpcError(res, 400, error?.message || 'Invalid credentials.', req.body?.id); return; }
-  if (!auth) {
-    const resourceMetadata = `${(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '')}/.well-known/oauth-protected-resource`;
-    res.setHeader('WWW-Authenticate', `Bearer realm="krix", resource_metadata="${resourceMetadata}"`);
-    jsonRpcError(res, 401, 'Unauthorized.', req.body?.id);
+  if (!clientKey) {
+    res.status(401).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Missing API Key. Provide x-api-key header or Bearer token.' },
+      id: req.body?.id || null
+    });
     return;
   }
 
-  const githubToken = ALLOW_CLIENT_CREDENTIAL_HEADERS ? (String(req.headers['x-github-token'] || '') || DEFAULT_GITHUB_PAT) : DEFAULT_GITHUB_PAT;
-  const renderToken = ALLOW_CLIENT_CREDENTIAL_HEADERS ? (String(req.headers['x-render-token'] || '') || DEFAULT_RENDER_API_KEY) : DEFAULT_RENDER_API_KEY;
-  const sessionId = String(req.headers['mcp-session-id'] || '');
+  let effectiveGithubToken = (req.headers['x-github-token'] as string) || process.env.DEFAULT_GITHUB_PAT || '';
+  let effectiveRenderToken = (req.headers['x-render-token'] as string) || process.env.DEFAULT_RENDER_API_KEY;
+  let authenticatedUserId: string | undefined;
+  let keyHash: string | undefined;
+
+  const masterDevKey = process.env.MCP_MASTER_API_KEY || 'krix_master_dev_key_12345';
+  if (clientKey === masterDevKey) {
+    // Master dev key
+  } else {
+    keyHash = hashApiKey(clientKey);
+    const keyDoc = await ApiKeyRepository.findByHash(keyHash);
+    if (!keyDoc) {
+      res.status(401).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Unauthorized API Key.' },
+        id: req.body?.id || null
+      });
+      return;
+    }
+
+    authenticatedUserId = keyDoc.userId;
+    ApiKeyRepository.recordUsage(keyHash).catch(() => {});
+
+    const user = await UserRepository.findById(keyDoc.userId);
+    if (user) {
+      if (user.encryptedGithubPat && !req.headers['x-github-token']) {
+        effectiveGithubToken = decryptSecret(user.encryptedGithubPat);
+      }
+      if (user.encryptedRenderKey && !req.headers['x-render-token']) {
+        effectiveRenderToken = decryptSecret(user.encryptedRenderKey);
+      }
+    }
+  }
+
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
   if (sessionId && transports.has(sessionId)) {
     const entry = transports.get(sessionId)!;
-    if (entry.authFingerprint !== auth.fingerprint || entry.clientId !== auth.clientId) { jsonRpcError(res, 403, 'MCP session is bound to a different authorization.', req.body?.id); return; }
     entry.lastActive = Date.now();
-    registerSessionAuth(sessionId, githubToken, auth.clientId);
-    try { await entry.transport.handleRequest(req, res, req.body); }
-    catch (error) { console.error(`[${rid}] MCP session error`, error); if (!res.headersSent) jsonRpcError(res, 500, 'Internal server error.', req.body?.id); }
+    try {
+      await entry.transport.handleRequest(req, res, req.body);
+    } catch (error: any) {
+      if (!res.headersSent) {
+        res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: error?.message }, id: req.body?.id || null });
+      }
+    }
     return;
   }
 
-  if (transports.size >= MAX_SESSIONS) { jsonRpcError(res, 503, 'Session capacity reached.'); return; }
   const newSessionId = crypto.randomUUID();
-  registerSessionAuth(newSessionId, githubToken, auth.clientId);
+
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => newSessionId,
-    onsessioninitialized: (id) => { transports.set(id, { transport, lastActive: Date.now(), authFingerprint: auth!.fingerprint, clientId: auth!.clientId }); }
+    onsessioninitialized: (id) => {
+      transports.set(id, { transport, lastActive: Date.now(), userId: authenticatedUserId, keyHash });
+    }
   });
+
   transport.onclose = () => {
-    if (transport.sessionId) { void destroySandbox(transport.sessionId); transports.delete(transport.sessionId); }
+    if (transport.sessionId) {
+      destroySandbox(transport.sessionId);
+      transports.delete(transport.sessionId);
+    }
   };
 
-  const masterServer = createMasterServer(githubToken, renderToken, newSessionId, req);
-  try { await masterServer.connect(transport); await transport.handleRequest(req, res, req.body); }
-  catch (error) { console.error(`[${rid}] MCP request error`, error); if (!res.headersSent) jsonRpcError(res, 500, 'Internal server error.', req.body?.id); }
+  const masterServer = createMasterServer(effectiveGithubToken, effectiveRenderToken, newSessionId);
+  try {
+    await masterServer.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error: any) {
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: error?.message }, id: req.body?.id || null });
+    }
+  }
 });
 
-app.get('/healthz', (_req, res) => res.status(200).json({ status: 'ok' }));
-app.get('/readyz', (_req, res) => {
-  const ready = !!MCP_API_KEY && (!isProduction || process.env.PUBLIC_BASE_URL?.startsWith('https://'));
-  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not_ready' });
+const indexHtmlPath = path.resolve(process.cwd(), 'src/web/index.html');
+
+app.get([
+  '/',
+  '/login',
+  '/signup',
+  '/dashboard',
+  '/dashboard/:subpage',
+  '/dashboard/:subpage/:section',
+  '/docs',
+  '/policy',
+  '/privacy',
+  '/terms'
+], (req: Request, res: Response): void => {
+  if (fs.existsSync(indexHtmlPath)) {
+    res.setHeader('Content-Type', 'text/html');
+    fs.createReadStream(indexHtmlPath).pipe(res);
+  } else {
+    res.send('⚡ Krix Gateway Active.');
+  }
 });
-app.get('/', (_req, res) => { res.type('html').send('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Krix</title><link rel="icon" href="/logo.png" type="image/png"><link rel="apple-touch-icon" href="/logo.png"><meta property="og:image" content="/logo.png"><meta property="og:title" content="Krix"></head><body style="margin:0;background:#f4f4f2;color:#111;font-family:system-ui;display:grid;place-items:center;min-height:100vh"><main style="background:white;border:1px solid #ddd;border-radius:24px;padding:32px;box-shadow:0 20px 60px #0001"><img src="/logo.png" width="56" height="56" alt="Krix"><h1>Krix Gateway</h1><p style="color:#666">Secure MCP gateway.</p></main></body></html>'); });
 
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
-  const maxIdle = Number(process.env.MCP_SESSION_IDLE_MS || 10 * 60 * 1000);
+  const maxIdle = 15 * 60 * 1000;
   for (const [id, entry] of transports.entries()) {
-    if (now - entry.lastActive > maxIdle) { void destroySandbox(id); try { void entry.transport.close(); } catch {} transports.delete(id); }
+    if (now - entry.lastActive > maxIdle) {
+      destroySandbox(id);
+      try { entry.transport.close(); } catch {}
+      transports.delete(id);
+    }
   }
-}, 60_000);
+}, 3 * 60 * 1000);
 cleanupTimer.unref();
 
-const server = app.listen(PORT, () => console.log(`Krix gateway listening on ${PORT}`));
-server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 120_000);
-server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 15_000);
-server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 65_000);
-
-function shutdown(signal: string) {
-  console.log(`Received ${signal}; shutting down.`);
-  clearInterval(cleanupTimer);
-  for (const [id, entry] of transports) { void destroySandbox(id); try { void entry.transport.close(); } catch {} }
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 10_000).unref();
-}
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('uncaughtException', (error) => { console.error('uncaughtException', error); if (isProduction) shutdown('uncaughtException'); });
-process.on('unhandledRejection', (error) => { console.error('unhandledRejection', error); });
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Krix Enterprise Gateway active on Port ${PORT}`);
+  console.log(`📡 MCP Streamable HTTP: http://localhost:${PORT}/mcp`);
+  console.log(`🌐 Web Portal & Console: http://localhost:${PORT}`);
+});

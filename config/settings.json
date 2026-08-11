@@ -1,0 +1,30 @@
+{
+  "security": {
+    "currentTier": "STANDARD",
+    "enforceTotpForMutating": false,
+    "sanitizeOutputs": true,
+    "blockUnknownIps": false
+  },
+  "rateLimiting": {
+    "globalWindowMs": 900000,
+    "globalMaxRequests": 1000,
+    "authWindowMs": 900000,
+    "authMaxRequests": 20,
+    "defaultKeyRateLimitPerMin": 60
+  },
+  "sandbox": {
+    "disableBwrap": true,
+    "defaultTimeoutMs": 30000,
+    "maxMemoryMB": 512,
+    "allowedManagers": ["npm", "pip"]
+  },
+  "email": {
+    "alertsEnabled": true,
+    "alertOnNewIpLogin": true,
+    "alertOnApiKeyCreation": true
+  },
+  "quotas": {
+    "maxKeysPerUser": 3,
+    "defaultMaxMemoryPerSessionMB": 512
+  }
+}

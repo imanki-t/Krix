@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="facetAlpha" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="50%" stop-color="#f4f4f5" />
+      <stop offset="100%" stop-color="#a1a1aa" />
+    </linearGradient>
+    <linearGradient id="facetBeta" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#e4e4e7" />
+      <stop offset="60%" stop-color="#71717a" />
+      <stop offset="100%" stop-color="#27272a" />
+    </linearGradient>
+    <linearGradient id="facetGamma" x1="50%" y1="100%" x2="50%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="60%" stop-color="#d4d4d8" />
+      <stop offset="100%" stop-color="#52525b" />
+    </linearGradient>
+    <filter id="coreGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="#000000" />
+  <rect x="8" y="8" width="496" height="496" rx="104" fill="none" stroke="#222225" stroke-width="4" />
+
+  <g transform="translate(256, 266)">
+    <path d="M 0 -170 L 60 -65 L -40 -35 L -75 -100 C -60 -150 -30 -170 0 -170 Z" fill="url(#facetAlpha)" />
+    <path d="M 60 -65 L 140 -40 C 170 -10 160 35 125 55 L 25 15 Z" fill="url(#facetBeta)" />
+    <path d="M 125 55 L 25 105 L 10 0 L 75 -40 C 115 -30 145 10 125 55 Z" fill="url(#facetGamma)" />
+    <path d="M 25 105 L -55 150 C -95 170 -130 140 -135 100 L -65 15 Z" fill="url(#facetAlpha)" />
+    <path d="M -135 100 L -85 -10 L 30 0 L -15 75 C -55 100 -105 110 -135 100 Z" fill="url(#facetBeta)" />
+    <path d="M -85 -10 L -85 -110 C -75 -155 -30 -170 0 -170 L -40 -65 Z" fill="url(#facetGamma)" />
+
+    <polygon points="0,-40 35,20 -35,20" fill="#000000" stroke="#27272a" stroke-width="3" />
+    <circle cx="0" cy="0" r="12" fill="#ffffff" filter="url(#coreGlow)" />
+    <circle cx="0" cy="0" r="5" fill="#000000" />
+  </g>
+</svg>
