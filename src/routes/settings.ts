@@ -41,7 +41,7 @@ settingsRouter.post('/tier', async (req: Request, res: Response): Promise<void> 
 
     res.json({ message: `Security tier set to ${tier}.`, securityTier: tier });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to update security tier.' });
+    res.status(500).json({ error: 'Failed to update security tier.' });
   }
 });
 
@@ -72,7 +72,7 @@ settingsRouter.post('/integrations', async (req: Request, res: Response): Promis
       hasRenderKey: Boolean(updates.encryptedRenderKey || user.encryptedRenderKey)
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to update integrations.' });
+    res.status(500).json({ error: 'Failed to update integrations.' });
   }
 });
 
@@ -82,6 +82,6 @@ settingsRouter.get('/audit-logs', async (req: Request, res: Response): Promise<v
     const logs = await AuditLogRepository.listByUser(user._id || user.id, 50);
     res.json({ logs });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to fetch audit logs.' });
+    res.status(500).json({ error: 'Failed to fetch audit logs.' });
   }
 });

@@ -1,6 +1,16 @@
 import { google } from 'googleapis';
 import { loadSettings } from '../config/settings.js';
 
+function escapeHtml(str: string): string {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
 interface SendMailParams {
   to: string;
   subject: string;
@@ -37,8 +47,16 @@ export const sendSecurityEmail = async ({ to, subject, htmlContent }: SendMailPa
   }
 
   try {
+    // Validate email address to prevent header injection
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!emailRegex.test(to) || to.includes('\n') || to.includes('\r')) {
+      console.error(`[Email] Invalid recipient address rejected: ${to.replace(/[\n\r]/g, '')}`);  
+      return false;
+    }
+    // Sanitize subject to prevent header injection
+    const sanitizedSubject = subject.replace(/[\n\r]/g, ' ');
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const utf8Subject = `=?utf-8?B?${Buffer.from(subject).toString('base64')}?=`;
+    const utf8Subject = `=?utf-8?B?${Buffer.from(sanitizedSubject).toString('base64')}?=`;
     const messageParts = [
       `From: Krix Security Engine <${gmailUser}>`,
       `To: <${to}>`,
@@ -125,12 +143,12 @@ export async function sendNewIpLoginAlert({
     body: `
       <h2 style="margin-top: 0; font-size: 18px; color: #ffffff;">Unfamiliar Sign-in Detected</h2>
       <p style="color: #a1a1aa; font-size: 14px; line-height: 1.6;">
-        Hello ${name || 'Developer'},<br><br>
+        Hello ${escapeHtml(name || 'Developer')},<br><br>
         Your Krix Enterprise account was just accessed from a new IP address:
       </p>
       <div style="background: #09090b; border: 1px solid #27272a; border-radius: 8px; padding: 16px; margin: 20px 0; font-size: 13px; font-family: monospace;">
-        <div><strong>IP Address:</strong> ${ipAddress}</div>
-        <div><strong>Device / User-Agent:</strong> ${userAgent}</div>
+        <div><strong>IP Address:</strong> ${escapeHtml(ipAddress)}</div>
+        <div><strong>Device / User-Agent:</strong> ${escapeHtml(userAgent)}</div>
         <div><strong>Timestamp:</strong> ${timestamp.toUTCString()}</div>
       </div>
       <p style="color: #a1a1aa; font-size: 14px;">
@@ -168,9 +186,9 @@ export async function sendApiKeyCreatedAlert({
         A new Model Context Protocol API Key was issued for your account:
       </p>
       <div style="background: #09090b; border: 1px solid #27272a; border-radius: 8px; padding: 16px; margin: 20px 0; font-size: 13px; font-family: monospace;">
-        <div><strong>Key Name:</strong> ${keyName}</div>
-        <div><strong>Prefix:</strong> <code>${keyPrefix}...</code></div>
-        <div><strong>Issued By IP:</strong> ${ipAddress}</div>
+        <div><strong>Key Name:</strong> ${escapeHtml(keyName)}</div>
+        <div><strong>Prefix:</strong> <code>${escapeHtml(keyPrefix)}...</code></div>
+        <div><strong>Issued By IP:</strong> ${escapeHtml(ipAddress)}</div>
       </div>
     `
   });

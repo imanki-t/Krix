@@ -10,7 +10,7 @@ export interface IAuditLog extends Document {
   createdAt: Date;
 }
 
-const AuditLogSchema = new Schema<IApiKey>({
+const AuditLogSchema = new Schema<IAuditLog>({
   userId: { type: String, index: true },
   action: { type: String, required: true },
   ipAddress: { type: String, required: true },

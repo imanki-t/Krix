@@ -17,7 +17,12 @@ export function showToast(message, type = 'info') {
   const toast = document.createElement('div');
   toast.className = 'toast';
   const icon = type === 'error' ? '❌' : type === 'success' ? '✅' : '⚡';
-  toast.innerHTML = `<span>${icon}</span><span>${message}</span>`;
+  const iconSpan = document.createElement('span');
+  iconSpan.textContent = icon;
+  const msgSpan = document.createElement('span');
+  msgSpan.textContent = message;
+  toast.appendChild(iconSpan);
+  toast.appendChild(msgSpan);
   container.appendChild(toast);
   setTimeout(() => {
     toast.style.opacity = '0';

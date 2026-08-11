@@ -7,7 +7,29 @@ import { loadSettings } from '../config/settings.js';
 
 export const oauthRouter = Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'krix_jwt_super_secret_signing_key_at_least_32_chars!';
+import rateLimit from 'express-rate-limit';
+
+const oauthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  message: { error: 'Too many OAuth requests. Please try again later.' }
+});
+oauthRouter.use(oauthLimiter);
+
+function escapeHtml(str: string): string {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('[FATAL] JWT_SECRET environment variable is required for OAuth module.');
+}
 
 interface DynamicClient {
   clientId: string;
@@ -42,6 +64,20 @@ const registeredClients = new Map<string, DynamicClient>();
 const authCodes = new Map<string, AuthCodeEntry>();
 const refreshFamilies = new Map<string, RefreshTokenFamily>();
 
+// Cleanup expired auth codes every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, entry] of authCodes.entries()) {
+    if (now > entry.expiresAt) authCodes.delete(code);
+  }
+  for (const [id, fam] of refreshFamilies.entries()) {
+    if (now > fam.expiresAt) refreshFamilies.delete(id);
+  }
+  // Limit total entries to prevent memory exhaustion
+  if (authCodes.size > 10000) authCodes.clear();
+  if (refreshFamilies.size > 50000) refreshFamilies.clear();
+}, 5 * 60 * 1000).unref();
+
 registeredClients.set('claude_desktop', {
   clientId: 'claude_desktop',
   clientName: 'Claude Desktop App',
@@ -57,8 +93,8 @@ registeredClients.set('cursor_ide', {
 });
 
 function verifyPKCE(verifier: string, challenge: string, method: string): boolean {
-  if (method === 'plain') {
-    return verifier === challenge;
+  if (method !== 'S256') {
+    return false;
   }
   if (method === 'S256') {
     const hash = crypto.createHash('sha256').update(verifier).digest('base64url');
@@ -114,6 +150,10 @@ oauthRouter.get('/authorize', async (req: Request, res: Response): Promise<void>
     res.status(400).send('Unknown client_id.');
     return;
   }
+  if (client && redirect_uri && !client.redirectUris.includes(redirect_uri)) {
+    res.status(400).send('Invalid redirect_uri for this client.');
+    return;
+  }
 
   const token = req.cookies?.krix_access_token;
   let user: any = null;
@@ -148,23 +188,23 @@ oauthRouter.get('/authorize', async (req: Request, res: Response): Promise<void>
         <div style="text-align:center;margin-bottom:24px;">
           <img src="/logo.svg" alt="Krix" style="width:48px;height:48px;margin-bottom:12px;" />
           <h2 style="font-size:22px;font-weight:700;">Authorize AI Client</h2>
-          <p style="font-size:13.5px;color:#a1a1aa;margin-top:4px;"><strong>${client?.clientName || client_id || 'AI Agent'}</strong> is requesting access to Krix</p>
+          <p style="font-size:13.5px;color:#a1a1aa;margin-top:4px;"><strong>${escapeHtml(client?.clientName || client_id || 'AI Agent')}</strong> is requesting access to Krix</p>
         </div>
 
         <div style="background:#111113;border:1px solid #1f1f23;padding:16px;border-radius:10px;margin-bottom:24px;font-size:13px;">
           <div style="color:#71717a;margin-bottom:6px;">Connecting as:</div>
-          <div style="font-weight:600;color:#ffffff;">${user.email}</div>
+          <div style="font-weight:600;color:#ffffff;">${escapeHtml(user.email)}</div>
           <div style="margin-top:12px;color:#71717a;">Requested Scopes:</div>
-          <div style="color:#34d399;font-family:monospace;font-size:12px;margin-top:4px;">${scope || 'mcp:full (GitHub, Render, Sandbox)'}</div>
+          <div style="color:#34d399;font-family:monospace;font-size:12px;margin-top:4px;">${escapeHtml(scope || 'mcp:full (GitHub, Render, Sandbox)')}</div>
         </div>
 
         <form method="POST" action="/api/auth/oauth/consent">
-          <input type="hidden" name="client_id" value="${client_id || ''}" />
-          <input type="hidden" name="redirect_uri" value="${redirect_uri || ''}" />
-          <input type="hidden" name="scope" value="${scope || 'mcp:full'}" />
-          <input type="hidden" name="state" value="${state || ''}" />
-          <input type="hidden" name="code_challenge" value="${code_challenge || ''}" />
-          <input type="hidden" name="code_challenge_method" value="${code_challenge_method || 'S256'}" />
+          <input type="hidden" name="client_id" value="${escapeHtml(client_id || '')}" />
+          <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri || '')}" />
+          <input type="hidden" name="scope" value="${escapeHtml(scope || 'mcp:full')}" />
+          <input type="hidden" name="state" value="${escapeHtml(state || '')}" />
+          <input type="hidden" name="code_challenge" value="${escapeHtml(code_challenge || '')}" />
+          <input type="hidden" name="code_challenge_method" value="${escapeHtml(code_challenge_method || 'S256')}" />
 
           <div style="display:flex;gap:12px;">
             <button type="submit" name="decision" value="deny" class="btn btn-secondary" style="flex:1;">Cancel</button>
@@ -182,7 +222,12 @@ oauthRouter.post('/consent', async (req: Request, res: Response): Promise<void> 
 
   if (decision !== 'allow') {
     if (redirect_uri) {
-      res.redirect(`${redirect_uri}?error=access_denied&state=${encodeURIComponent(state || '')}`);
+      const registeredClient = registeredClients.get(client_id);
+      if (registeredClient && registeredClient.redirectUris.includes(redirect_uri)) {
+        res.redirect(`${redirect_uri}?error=access_denied&state=${encodeURIComponent(state || '')}`);
+      } else {
+        res.status(400).send('Access Denied. Invalid redirect URI.');
+      }
     } else {
       res.send('Access Denied.');
     }
@@ -192,6 +237,12 @@ oauthRouter.post('/consent', async (req: Request, res: Response): Promise<void> 
   const token = req.cookies?.krix_access_token;
   if (!token) {
     res.status(401).send('Session expired. Please sign in again.');
+    return;
+  }
+
+  const client = registeredClients.get(client_id);
+  if (client && redirect_uri && !client.redirectUris.includes(redirect_uri)) {
+    res.status(400).send('Invalid redirect_uri.');
     return;
   }
 
@@ -214,7 +265,7 @@ oauthRouter.post('/consent', async (req: Request, res: Response): Promise<void> 
     const delimiter = targetRedirect.includes('?') ? '&' : '?';
     res.redirect(`${targetRedirect}${delimiter}code=${encodeURIComponent(authCode)}&state=${encodeURIComponent(state || '')}`);
   } catch (err: any) {
-    res.status(500).send('Authorization error: ' + err.message);
+    res.status(500).send('Authorization failed. Please try again.');
   }
 });
 

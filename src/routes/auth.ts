@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import speakeasy from 'speakeasy';
 import qrcode from 'qrcode';
 import axios from 'axios';
+import crypto from 'node:crypto';
 import { OAuth2Client } from 'google-auth-library';
 import rateLimit from 'express-rate-limit';
 
@@ -23,7 +24,11 @@ const authLimiter = rateLimit({
 });
 authRouter.use(authLimiter);
 
-const JWT_SECRET = process.env.JWT_SECRET || 'krix_jwt_super_secret_signing_key_at_least_32_chars!';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('[FATAL] JWT_SECRET environment variable is required. Server cannot start securely without it.');
+  process.exit(1);
+}
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 function getIp(req: Request): string {
@@ -34,15 +39,15 @@ function getIp(req: Request): string {
 
 function generateToken(user: any): string {
   return jwt.sign(
-    { userId: user._id || user.id, email: user.email, securityTier: user.securityTier },
+    { userId: user._id || user.id, email: user.email, securityTier: user.securityTier, type: 'access' },
     JWT_SECRET,
-    { expiresIn: '15m' }
+    { expiresIn: '15m', issuer: 'krix', audience: 'krix-api' }
   );
 }
 
 function generateRefreshToken(user: any): string {
   return jwt.sign(
-    { userId: user._id || user.id, tokenVersion: '1' },
+    { userId: user._id || user.id, type: 'refresh', jti: crypto.randomUUID() },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -56,12 +61,14 @@ async function verifyRecaptcha(token: string | undefined): Promise<boolean> {
 
   try {
     const res = await axios.post(
-      `https://www.google.com/recaptcha/api/siteverify?secret=${secretKey}&response=${token}`
+      'https://www.google.com/recaptcha/api/siteverify',
+      new URLSearchParams({ secret: secretKey, response: token }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
     return res.data.success && (res.data.score === undefined || res.data.score >= 0.5);
   } catch (err) {
-    console.error('[reCAPTCHA] Verification error:', err);
-    return true;
+    console.error('[reCAPTCHA] Verification error:', (err as Error).message);
+    return false;
   }
 }
 
@@ -75,7 +82,7 @@ export const requireAuth = async (req: Request, res: Response, next: any): Promi
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as any;
+    const payload = jwt.verify(token, JWT_SECRET, { issuer: 'krix', audience: 'krix-api' }) as any;
     const user = await UserRepository.findById(payload.userId);
     if (!user) {
       res.status(401).json({ error: 'User account not found.' });
@@ -96,6 +103,17 @@ authRouter.post('/register', async (req: Request, res: Response): Promise<void> 
       return;
     }
 
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!emailRegex.test(email) || email.length > 254) {
+      res.status(400).json({ error: 'Invalid email address format.' });
+      return;
+    }
+
+    if (name.length > 100 || name.length < 1) {
+      res.status(400).json({ error: 'Name must be between 1 and 100 characters.' });
+      return;
+    }
+
     if (!(await verifyRecaptcha(recaptchaToken))) {
       res.status(403).json({ error: 'reCAPTCHA verification failed. Bot traffic intercepted.' });
       return;
@@ -104,6 +122,14 @@ authRouter.post('/register', async (req: Request, res: Response): Promise<void> 
     const existing = await UserRepository.findByEmail(email);
     if (existing) {
       res.status(409).json({ error: 'An account with this email address already exists.' });
+      return;
+    }
+
+    const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{10,128}$/;
+    if (!passwordRegex.test(password)) {
+      res.status(400).json({
+        error: 'Password must be 10-128 characters with at least one uppercase, one lowercase, one digit, and one special character.'
+      });
       return;
     }
 
@@ -127,8 +153,9 @@ authRouter.post('/register', async (req: Request, res: Response): Promise<void> 
     const accessToken = generateToken(user);
     const refreshToken = generateRefreshToken(user);
 
-    res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 15 * 60 * 1000 });
-    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 7 * 86400 * 1000 });
+    const secureCookie = process.env.NODE_ENV === 'production';
+    res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 15 * 60 * 1000, path: '/' });
+    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
 
     res.status(201).json({
       message: 'Account registered successfully.',
@@ -136,7 +163,7 @@ authRouter.post('/register', async (req: Request, res: Response): Promise<void> 
       accessToken
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Registration failed.' });
+    res.status(500).json({ error: 'Registration failed. Please try again.' });
   }
 });
 
@@ -214,8 +241,9 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
     const accessToken = generateToken(user);
     const refreshToken = generateRefreshToken(user);
 
-    res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 15 * 60 * 1000 });
-    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 7 * 86400 * 1000 });
+    const secureCookie = process.env.NODE_ENV === 'production';
+    res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 15 * 60 * 1000, path: '/' });
+    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
 
     res.json({
       message: 'Authenticated successfully.',
@@ -223,7 +251,7 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
       accessToken
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Login failed.' });
+    res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
@@ -280,8 +308,9 @@ authRouter.post('/google', async (req: Request, res: Response): Promise<void> =>
     const accessToken = generateToken(user);
     const refreshToken = generateRefreshToken(user);
 
-    res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 15 * 60 * 1000 });
-    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 7 * 86400 * 1000 });
+    const secureCookie = process.env.NODE_ENV === 'production';
+    res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 15 * 60 * 1000, path: '/' });
+    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
 
     res.json({
       message: 'Google Sign-In successful.',
@@ -289,7 +318,7 @@ authRouter.post('/google', async (req: Request, res: Response): Promise<void> =>
       accessToken
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Google authentication failed.' });
+    res.status(500).json({ error: 'Google authentication failed. Please try again.' });
   }
 });
 
@@ -323,7 +352,7 @@ authRouter.post('/2fa/setup', requireAuth, async (req: Request, res: Response): 
       qrCodeDataUrl
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || '2FA setup failed.' });
+    res.status(500).json({ error: '2FA setup failed. Please try again.' });
   }
 });
 
@@ -352,7 +381,7 @@ authRouter.post('/2fa/verify', requireAuth, async (req: Request, res: Response):
     await UserRepository.updateById(user._id || user.id, { isTotpEnabled: true });
     res.json({ message: 'Two-factor authentication enabled successfully.' });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || '2FA verification failed.' });
+    res.status(500).json({ error: '2FA verification failed. Please try again.' });
   }
 });
 
@@ -381,12 +410,13 @@ authRouter.post('/2fa/disable', requireAuth, async (req: Request, res: Response)
     await UserRepository.updateById(user._id || user.id, { isTotpEnabled: false, totpSecret: undefined });
     res.json({ message: 'Two-factor authentication disabled.' });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || '2FA disable failed.' });
+    res.status(500).json({ error: '2FA disable failed. Please try again.' });
   }
 });
 
 authRouter.post('/logout', (req: Request, res: Response): void => {
-  res.clearCookie('krix_access_token');
-  res.clearCookie('krix_refresh_token');
+  const secureCookie = process.env.NODE_ENV === 'production';
+  res.clearCookie('krix_access_token', { httpOnly: true, secure: secureCookie, sameSite: 'strict', path: '/' });
+  res.clearCookie('krix_refresh_token', { httpOnly: true, secure: secureCookie, sameSite: 'strict', path: '/api/auth' });
   res.json({ message: 'Logged out successfully.' });
 });

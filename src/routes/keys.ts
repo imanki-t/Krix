@@ -27,7 +27,7 @@ keysRouter.get('/', async (req: Request, res: Response): Promise<void> => {
       }))
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to list API keys.' });
+    res.status(500).json({ error: 'Failed to list API keys.' });
   }
 });
 
@@ -86,7 +86,7 @@ keysRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       }
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to create API key.' });
+    res.status(500).json({ error: 'Failed to create API key.' });
   }
 });
 
@@ -108,6 +108,6 @@ keysRouter.delete('/:id', async (req: Request, res: Response): Promise<void> => 
 
     res.json({ message: 'API key revoked successfully.' });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to delete API key.' });
+    res.status(500).json({ error: 'Failed to delete API key.' });
   }
 });

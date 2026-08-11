@@ -173,7 +173,11 @@ export function registerSandboxTools(
         }
       }
 
-      const extraArgs = (input.args || []).map(a => `"${a.replace(/"/g, '\\"')}"`).join(' ');
+      const extraArgs = (input.args || []).map(a => {
+        // Sanitize shell metacharacters in arguments
+        const sanitized = a.replace(/[`$\\"!#&|;(){}\[\]<>\n\r]/g, '');
+        return `"${sanitized}"`;
+      }).join(' ');
       const fullCmd = extraArgs ? `${runCmd} ${extraArgs}` : runCmd;
 
       const result = await runCommand(fullCmd, sandboxDir, timeout, sessionId);
@@ -336,10 +340,12 @@ export function registerSandboxTools(
       const cmd = `git clone --depth 50 ${branchFlag} "${cloneUrl}" ${destDir}`.trim();
 
       const result = await runCommand(cmd, sandboxDir, 45000, sessionId);
+      // Redact any token from output
+      const cleanOutput = (result.stdout || result.stderr).replace(/x-access-token:[^@]+@/g, 'x-access-token:[REDACTED]@');
       return formatOptimizedResponse({
         repoUrl: input.repoUrl,
         success: result.exitCode === 0,
-        output: result.stdout || result.stderr
+        output: cleanOutput
       });
     } catch (err: any) {
       return formatError(err);
@@ -359,7 +365,9 @@ export function registerSandboxTools(
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
       const flag = input.create ? '-b' : '';
-      const cmd = `git checkout ${flag} "${input.branch}"`.trim();
+      const safeBranch = input.branch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
+      if (!safeBranch) throw new Error('Invalid branch name.');
+      const cmd = `git checkout ${flag} "${safeBranch}"`.trim();
 
       const result = await runCommand(cmd, cwd, 10000, sessionId);
       return formatOptimizedResponse({
@@ -384,8 +392,8 @@ export function registerSandboxTools(
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
-      const remote = input.remote || 'origin';
-      const branch = input.branch || '';
+      const remote = (input.remote || 'origin').replace(/[^a-zA-Z0-9_.\-]/g, '');
+      const branch = (input.branch || '').replace(/[^a-zA-Z0-9_.\-\/]/g, '');
       const cmd = `git pull ${remote} ${branch}`.trim();
 
       const result = await runCommand(cmd, cwd, 20000, sessionId);
@@ -428,7 +436,8 @@ export function registerSandboxTools(
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
-      const flag = input.staged ? '--cached' : (input.commit || '');
+      const safeCommit = (input.commit || '').replace(/[^a-fA-F0-9]/g, '');
+      const flag = input.staged ? '--cached' : safeCommit;
       const result = await runCommand(`git diff ${flag}`, cwd, 10000, sessionId);
       return formatOptimizedResponse({
         diff: result.stdout.slice(0, 5000),
@@ -456,7 +465,8 @@ export function registerSandboxTools(
       const addRes = await runCommand('git add -A', cwd, 10000, sessionId);
       if (addRes.exitCode !== 0) return formatError(new Error(`git add failed: ${addRes.stderr}`));
 
-      const commitCmd = `git commit -m "${input.message.replace(/"/g, '\\"')}"`;
+      const safeMessage = input.message.replace(/[`$\\"!#&|;(){}\[\]<>\n\r]/g, '').slice(0, 200);
+      const commitCmd = `git commit -m "${safeMessage}"`;
       const commitRes = await runCommand(commitCmd, cwd, 10000, sessionId);
       if (commitRes.exitCode !== 0) return formatError(new Error(`git commit failed: ${commitRes.stderr}`));
 

@@ -10,7 +10,7 @@ function getEncryptionKey(): Buffer {
     }
     return crypto.createHash('sha256').update(envKey).digest();
   }
-  return crypto.createHash('sha256').update('krix_default_dev_encryption_secret_key_32_bytes!').digest();
+  throw new Error('[FATAL] ENCRYPTION_KEY environment variable is required. Cannot encrypt/decrypt without it.');
 }
 
 export function encryptSecret(plainText: string): string {
@@ -47,7 +47,8 @@ export function decryptSecret(encryptedPayload: string): string {
 }
 
 export function hashApiKey(apiKey: string): string {
-  return crypto.createHash('sha256').update(apiKey).digest('hex');
+  const salt = process.env.API_KEY_HASH_SALT || 'krix-api-key-hash-salt';
+  return crypto.createHmac('sha256', salt).update(apiKey).digest('hex');
 }
 
 export function generateRawApiKey(): { rawKey: string; keyPrefix: string; keyHash: string } {

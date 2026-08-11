@@ -242,16 +242,18 @@ export const TOOL_CATEGORY: Record<string, ToolCategory> = {
 };
 
 export function sanitizePath(inputPath: string, allowedRoot?: string): string {
-  if (!inputPath) throw new Error("Path parameter cannot be empty.");
+  if (!inputPath) throw new Error('Path parameter cannot be empty.');
+  if (inputPath.includes('\0')) throw new Error('Null byte in path rejected.');
   const normalized = path.normalize(inputPath);
-  if (normalized.includes('..') && (normalized.startsWith('../') || normalized.startsWith('..\\'))) {
-    throw new Error(`Path traversal attempt blocked: '${inputPath}'`);
+  // Block all path traversal regardless of position
+  if (normalized.includes('..')) {
+    throw new Error('Path traversal attempt blocked.');
   }
   if (allowedRoot) {
     const resolvedRoot = path.resolve(allowedRoot);
     const resolvedTarget = path.resolve(allowedRoot, normalized);
-    if (!resolvedTarget.startsWith(resolvedRoot)) {
-      throw new Error(`Access denied: path '${inputPath}' escapes sandbox directory '${allowedRoot}'`);
+    if (!resolvedTarget.startsWith(resolvedRoot + path.sep) && resolvedTarget !== resolvedRoot) {
+      throw new Error('Access denied: path escapes sandbox directory.');
     }
     return resolvedTarget;
   }
@@ -267,7 +269,16 @@ export function sanitizeCommand(command: string, tier: SecurityTier = SecurityTi
     /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
     /\bdd\s+if=.*?of=\/dev\/(null|zero|sda|hda|nvme)\b/i,
     />\s*\/dev\/(sda|hda|nvme)/i,
-    /\bmkfs(\.\w+)?\s+\/dev\//i
+    /\bmkfs(\.\w+)?\s+\/dev\//i,
+    /\beval\s+/i,
+    /`[^`]*`/,
+    /\$\([^)]*\)/,
+    /\bexec\s+/i,
+    /\/proc\/self\//i,
+    /\/etc\/(passwd|shadow|sudoers)/i,
+    /\bchattr\b/i,
+    /\bnsenter\b/i,
+    /\bunshare\b/i
   ];
 
   for (const pat of standardPatterns) {

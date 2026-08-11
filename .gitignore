@@ -7,7 +7,47 @@ node_modules/
 # Environment variables
 .env
 .env.local
+.env.*.local
+.env.production
+.env.staging
 
 # Logs
 *.log
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage and testing
+coverage/
+.nyc_output/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE files
+.idea/
+.vscode/
+*.sublime-*
+
+# Security sensitive
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+heapdump-*
+core
+core.*
+
+# Sandbox temp files
+/tmp/krix-sandboxes/
