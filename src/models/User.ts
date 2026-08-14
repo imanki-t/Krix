@@ -14,6 +14,8 @@ export interface IUser extends Document {
   encryptedGithubPat?: string;
   encryptedRenderKey?: string;
   knownIps: string[];
+  failedLoginAttempts: number;
+  lockoutUntil?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -37,7 +39,9 @@ const UserSchema = new Schema<IUser>({
   pendingTotpSecret: { type: String },
   encryptedGithubPat: { type: String },
   encryptedRenderKey: { type: String },
-  knownIps: { type: [String], default: [] }
+  knownIps: { type: [String], default: [] },
+  failedLoginAttempts: { type: Number, default: 0 },
+  lockoutUntil: { type: Date, default: null }
 }, {
   timestamps: true
 });

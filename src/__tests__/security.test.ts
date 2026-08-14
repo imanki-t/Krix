@@ -1,6 +1,11 @@
 import { sanitizeCommand, sanitizePath, sanitizeOutput, getToolAnnotations } from '../core/security.js';
-import { encryptSecret, decryptSecret, hashApiKey, generateRawApiKey } from '../services/cryptoService.js';
+import {
+  encryptSecret, decryptSecret, hashApiKey, generateRawApiKey,
+  hashPassword, verifyPassword, hashToken, generateOpaqueRefreshToken
+} from '../services/cryptoService.js';
+import { RefreshTokenRepository } from '../models/RefreshToken.js';
 import { SecurityTier } from '../config/settings.js';
+import bcrypt from 'bcryptjs';
 
 let passed = 0;
 let failed = 0;
@@ -172,6 +177,63 @@ async function runTests() {
   assert(readAnn.readOnlyHint === true && readAnn.destructiveHint === false, 'get_file_contents is marked read-only');
   const mutAnn = getToolAnnotations('create_or_update_file');
   assert(mutAnn.readOnlyHint === false && mutAnn.destructiveHint === true, 'create_or_update_file is marked destructive');
+
+  // Test 8: Mathematical One-Way Password Hashing & Scrypt KDF
+  console.log('\n8. Testing Mathematical One-Way Password Transformation & Verification:');
+  const plainPassword = 'SuperSecret!Password@2026';
+  const hashedScrypt = await hashPassword(plainPassword);
+  assert(hashedScrypt.startsWith('$scrypt$v=1$'), 'Password hash uses modern memory-hard Scrypt format');
+  assert(!hashedScrypt.includes(plainPassword), 'Plaintext password is not stored');
+
+  const verifyValid = await verifyPassword(plainPassword, hashedScrypt);
+  assert(verifyValid.valid === true && verifyValid.needsUpgrade === false, 'Scrypt password correctly verifies with secret pepper');
+
+  const verifyInvalid = await verifyPassword('WrongPassword123!', hashedScrypt);
+  assert(verifyInvalid.valid === false, 'Invalid password rejected by one-way mathematical verification');
+
+  // Test 9: Legacy Bcrypt Backward Compatibility & Upgrade Detection
+  console.log('\n9. Testing Legacy Bcrypt Compatibility & Automatic Upgrade:');
+  const legacyBcryptHash = await bcrypt.hash('LegacyPass#2026', 10);
+  const verifyLegacy = await verifyPassword('LegacyPass#2026', legacyBcryptHash);
+  assert(verifyLegacy.valid === true && verifyLegacy.needsUpgrade === true, 'Legacy bcrypt hash successfully verified and flagged for upgrade');
+
+  // Test 10: One-Way Opaque Token Hashing & Rotation Breach Detection
+  console.log('\n10. Testing One-Way Token Hashing & Rotation Breach Detection:');
+  const { rawToken, tokenHash, familyId } = generateOpaqueRefreshToken();
+  assert(rawToken.startsWith('krix_rt_'), 'Opaque refresh token starts with krix_rt_');
+  assert(hashToken(rawToken) === tokenHash, 'One-way token hash matches deterministic HMAC');
+
+  // Store in repository
+  const createdToken = await RefreshTokenRepository.create({
+    tokenHash,
+    userId: 'user-test-123',
+    familyId,
+    expiresAt: new Date(Date.now() + 7 * 86400 * 1000)
+  });
+  assert(Boolean(createdToken), 'Opaque token stored via one-way hash');
+
+  // Lookup by hash
+  const found = await RefreshTokenRepository.findByHash(hashToken(rawToken));
+  assert(found && found.userId === 'user-test-123', 'Token found via one-way hash lookup');
+
+  // Rotate token
+  const { rawToken: rawToken2, tokenHash: tokenHash2 } = generateOpaqueRefreshToken();
+  await RefreshTokenRepository.revokeByHash(tokenHash, tokenHash2);
+  await RefreshTokenRepository.create({
+    tokenHash: tokenHash2,
+    userId: 'user-test-123',
+    familyId,
+    expiresAt: new Date(Date.now() + 7 * 86400 * 1000)
+  });
+
+  // Old token is now revoked
+  const oldDoc = await RefreshTokenRepository.findByHash(tokenHash);
+  assert(oldDoc.revoked === true, 'Old refresh token marked revoked upon rotation');
+
+  // Simulate token reuse breach: revoke entire family
+  await RefreshTokenRepository.revokeFamily(familyId);
+  const nextDoc = await RefreshTokenRepository.findByHash(tokenHash2);
+  assert(nextDoc.revoked === true, 'Entire token family revoked upon reuse anomaly detection');
 
   console.log(`\n======================================================`);
   console.log(`RESULTS: ${passed} PASSED, ${failed} FAILED`);

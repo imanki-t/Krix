@@ -2,7 +2,13 @@ import { Router, Request, Response } from 'express';
 import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { UserRepository } from '../models/User.js';
-import { generateRawApiKey } from '../services/cryptoService.js';
+import { RefreshTokenRepository } from '../models/RefreshToken.js';
+import { AuditLogRepository } from '../models/AuditLog.js';
+import {
+  generateRawApiKey,
+  hashToken,
+  generateOpaqueRefreshToken
+} from '../services/cryptoService.js';
 import { loadSettings } from '../config/settings.js';
 
 export const oauthRouter = Router();
@@ -349,22 +355,28 @@ oauthRouter.post('/token', async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    const familyId = crypto.randomUUID();
-    const newRefreshToken = `krix_rt_${crypto.randomBytes(32).toString('base64url')}`;
+    const { rawToken: newRefreshToken, tokenHash, familyId } = generateOpaqueRefreshToken();
     const accessToken = jwt.sign(
-      { userId: user._id || user.id, email: user.email, scope: entry.scope, familyId },
+      { userId: user._id || user.id, email: user.email, scope: entry.scope, familyId, type: 'access' },
       JWT_SECRET,
-      { expiresIn: '15m' }
+      { expiresIn: '15m', issuer: 'krix', audience: 'krix-api' }
     );
 
-    refreshFamilies.set(familyId, {
-      familyId,
+    await RefreshTokenRepository.create({
+      tokenHash,
       userId: user._id || user.id,
       clientId: entry.clientId,
-      scope: entry.scope,
-      activeToken: newRefreshToken,
-      usedTokens: new Set(),
-      expiresAt: Date.now() + 30 * 86400 * 1000
+      familyId,
+      scopes: entry.scope.split(' '),
+      expiresAt: new Date(Date.now() + 30 * 86400 * 1000)
+    });
+
+    await AuditLogRepository.record({
+      userId: user._id || user.id,
+      action: 'OAUTH_TOKEN_ISSUED',
+      ipAddress: req.ip || '127.0.0.1',
+      userAgent: req.headers['user-agent'],
+      status: 'SUCCESS'
     });
 
     res.json({
@@ -383,43 +395,54 @@ oauthRouter.post('/token', async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    let matchedFamily: RefreshTokenFamily | undefined;
-    for (const fam of refreshFamilies.values()) {
-      if (fam.activeToken === refresh_token || fam.usedTokens.has(refresh_token)) {
-        matchedFamily = fam;
-        break;
-      }
-    }
+    const incomingHash = hashToken(refresh_token);
+    const oldDoc = await RefreshTokenRepository.findByHash(incomingHash);
 
-    if (!matchedFamily) {
-      res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown refresh token.' });
+    if (!oldDoc) {
+      res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown or invalid refresh token.' });
       return;
     }
 
-    if (matchedFamily.usedTokens.has(refresh_token)) {
-      refreshFamilies.delete(matchedFamily.familyId);
+    if (oldDoc.revoked) {
+      // Refresh token reuse detected: revoke family and emit security audit event
+      await RefreshTokenRepository.revokeFamily(oldDoc.familyId);
+      await AuditLogRepository.record({
+        userId: oldDoc.userId,
+        action: 'OAUTH_REFRESH_TOKEN_REUSE_BREACH',
+        ipAddress: req.ip || '127.0.0.1',
+        userAgent: req.headers['user-agent'],
+        status: 'FAILURE'
+      });
       res.status(400).json({
         error: 'invalid_grant',
-        error_description: 'Refresh token reuse detected. Revoked all tokens in family for security.'
+        error_description: 'Refresh token reuse detected. All sessions in this token family have been revoked.'
       });
       return;
     }
 
-    if (Date.now() > matchedFamily.expiresAt) {
-      refreshFamilies.delete(matchedFamily.familyId);
-      res.status(400).json({ error: 'invalid_grant', error_description: 'Refresh token expired.' });
+    if (new Date() > new Date(oldDoc.expiresAt)) {
+      await RefreshTokenRepository.revokeByHash(oldDoc.tokenHash);
+      res.status(400).json({ error: 'invalid_grant', error_description: 'Refresh token has expired.' });
       return;
     }
 
-    matchedFamily.usedTokens.add(refresh_token);
-    const nextRefreshToken = `krix_rt_${crypto.randomBytes(32).toString('base64url')}`;
-    matchedFamily.activeToken = nextRefreshToken;
+    const { rawToken: nextRefreshToken, tokenHash: nextHash } = generateOpaqueRefreshToken();
+    await RefreshTokenRepository.revokeByHash(oldDoc.tokenHash, nextHash);
+    await RefreshTokenRepository.create({
+      tokenHash: nextHash,
+      userId: oldDoc.userId,
+      clientId: oldDoc.clientId,
+      familyId: oldDoc.familyId,
+      scopes: oldDoc.scopes,
+      expiresAt: new Date(Date.now() + 30 * 86400 * 1000)
+    });
 
-    const user = await UserRepository.findById(matchedFamily.userId);
+    const user = await UserRepository.findById(oldDoc.userId);
+    const scopeStr = (oldDoc.scopes || []).join(' ') || 'mcp:full';
     const accessToken = jwt.sign(
-      { userId: matchedFamily.userId, email: user?.email, scope: matchedFamily.scope, familyId: matchedFamily.familyId },
+      { userId: oldDoc.userId, email: user?.email, scope: scopeStr, familyId: oldDoc.familyId, type: 'access' },
       JWT_SECRET,
-      { expiresIn: '15m' }
+      { expiresIn: '15m', issuer: 'krix', audience: 'krix-api' }
     );
 
     res.json({
@@ -427,7 +450,7 @@ oauthRouter.post('/token', async (req: Request, res: Response): Promise<void> =>
       token_type: 'Bearer',
       expires_in: 900,
       refresh_token: nextRefreshToken,
-      scope: matchedFamily.scope
+      scope: scopeStr
     });
     return;
   }
@@ -435,15 +458,53 @@ oauthRouter.post('/token', async (req: Request, res: Response): Promise<void> =>
   res.status(400).json({ error: 'unsupported_grant_type', error_description: `Grant type '${grant_type}' is not supported.` });
 });
 
-oauthRouter.post('/revoke', (req: Request, res: Response): void => {
-  const { token } = req.body;
-  if (token) {
-    for (const [id, fam] of refreshFamilies.entries()) {
-      if (fam.activeToken === token || fam.usedTokens.has(token)) {
-        refreshFamilies.delete(id);
-        break;
+// RFC 7662 OAuth 2.0 Token Introspection
+oauthRouter.post('/introspect', async (req: Request, res: Response): Promise<void> => {
+  const { token, token_type_hint } = req.body;
+  if (!token) {
+    res.json({ active: false });
+    return;
+  }
+
+  try {
+    if (token.startsWith('krix_rt_')) {
+      const incomingHash = hashToken(token);
+      const doc = await RefreshTokenRepository.findByHash(incomingHash);
+      if (!doc || doc.revoked || new Date() > new Date(doc.expiresAt)) {
+        res.json({ active: false });
+        return;
       }
+      res.json({
+        active: true,
+        scope: (doc.scopes || []).join(' '),
+        client_id: doc.clientId,
+        sub: doc.userId,
+        exp: Math.floor(new Date(doc.expiresAt).getTime() / 1000),
+        token_type: 'refresh_token'
+      });
+      return;
     }
+
+    // Access token JWT verification
+    const payload = jwt.verify(token, JWT_SECRET, { issuer: 'krix', audience: 'krix-api' }) as any;
+    res.json({
+      active: true,
+      scope: payload.scope || 'mcp:full',
+      sub: payload.userId,
+      exp: payload.exp,
+      token_type: 'access_token'
+    });
+  } catch {
+    res.json({ active: false });
+  }
+});
+
+// RFC 7009 OAuth 2.0 Token Revocation
+oauthRouter.post('/revoke', async (req: Request, res: Response): Promise<void> => {
+  const { token } = req.body;
+  if (token && token.startsWith('krix_rt_')) {
+    const incomingHash = hashToken(token);
+    await RefreshTokenRepository.revokeByHash(incomingHash);
   }
   res.status(200).json({ status: 'revoked' });
 });

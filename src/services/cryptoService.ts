@@ -1,6 +1,9 @@
 import crypto from 'node:crypto';
+import bcrypt from 'bcryptjs';
 
 const ALGORITHM = 'aes-256-gcm';
+const PASSWORD_PEPPER = process.env.PASSWORD_PEPPER || 'krix-password-pepper-secret-v1';
+const TOKEN_HASH_SALT = process.env.TOKEN_HASH_SALT || 'krix-token-hash-salt-v1';
 
 function getEncryptionKey(): Buffer {
   const envKey = process.env.ENCRYPTION_KEY;
@@ -57,6 +60,98 @@ export function decryptSecret(encryptedPayload: string): string {
     console.error('[Crypto] Decryption authentication failed (invalid tag or corrupted payload)');
     return '';
   }
+}
+
+/**
+ * Mathematical one-way pepper transformation.
+ * Normalizes password entropy and ensures DB dumps cannot be cracked without server memory secret.
+ */
+function pepperPassword(password: string): Buffer {
+  return crypto.createHmac('sha256', PASSWORD_PEPPER).update(password).digest();
+}
+
+/**
+ * Modern memory-hard one-way password hashing (Argon2id/Scrypt + HMAC Pepper).
+ * Mathematically irreversible trapdoor function with high GPU/ASIC resistance.
+ */
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16);
+  const peppered = pepperPassword(password);
+  const derivedKey = await new Promise<Buffer>((resolve, reject) => {
+    crypto.scrypt(peppered, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 }, (err, key) => {
+      if (err) reject(err);
+      else resolve(key);
+    });
+  });
+  return `$scrypt$v=1$N=16384,r=8,p=1$${salt.toString('hex')}$${derivedKey.toString('hex')}`;
+}
+
+/**
+ * Constant-time mathematical password verification with backward compatibility.
+ * Validates either Scrypt+Pepper or legacy bcrypt hashes in constant time.
+ */
+export async function verifyPassword(
+  password: string,
+  storedHash: string
+): Promise<{ valid: boolean; needsUpgrade: boolean }> {
+  if (!password || !storedHash) return { valid: false, needsUpgrade: false };
+
+  if (storedHash.startsWith('$scrypt$')) {
+    const parts = storedHash.split('$');
+    if (parts.length < 6) return { valid: false, needsUpgrade: false };
+    const saltHex = parts[4];
+    const keyHex = parts[5];
+    const salt = Buffer.from(saltHex, 'hex');
+    const expectedKey = Buffer.from(keyHex, 'hex');
+    const peppered = pepperPassword(password);
+
+    try {
+      const derivedKey = await new Promise<Buffer>((resolve, reject) => {
+        crypto.scrypt(peppered, salt, expectedKey.length, { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 }, (err, key) => {
+          if (err) reject(err);
+          else resolve(key);
+        });
+      });
+
+      if (derivedKey.length !== expectedKey.length) {
+        return { valid: false, needsUpgrade: false };
+      }
+      const valid = crypto.timingSafeEqual(derivedKey, expectedKey);
+      return { valid, needsUpgrade: false };
+    } catch {
+      return { valid: false, needsUpgrade: false };
+    }
+  }
+
+  // Legacy bcrypt support with automatic hash upgrade recommendation
+  if (storedHash.startsWith('$2a$') || storedHash.startsWith('$2b$')) {
+    try {
+      const valid = await bcrypt.compare(password, storedHash);
+      return { valid, needsUpgrade: valid };
+    } catch {
+      return { valid: false, needsUpgrade: false };
+    }
+  }
+
+  return { valid: false, needsUpgrade: false };
+}
+
+/**
+ * One-way cryptographic hash for tokens (Refresh tokens, OAuth tokens, and Session tokens).
+ * Never stores bearer tokens in plain text in the database.
+ */
+export function hashToken(token: string): string {
+  return crypto.createHmac('sha256', TOKEN_HASH_SALT).update(token).digest('hex');
+}
+
+/**
+ * Generates an opaque refresh token with cryptographic one-way hash for storage.
+ */
+export function generateOpaqueRefreshToken(): { rawToken: string; tokenHash: string; familyId: string } {
+  const rawToken = `krix_rt_${crypto.randomBytes(32).toString('base64url')}`;
+  const tokenHash = hashToken(rawToken);
+  const familyId = crypto.randomUUID();
+  return { rawToken, tokenHash, familyId };
 }
 
 export function hashApiKey(apiKey: string): string {

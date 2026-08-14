@@ -99,6 +99,16 @@ export const requireAuth = async (req: Request, res: Response, next: any): Promi
   }
 };
 
+import {
+  encryptSecret,
+  decryptSecret,
+  hashPassword,
+  verifyPassword,
+  hashToken,
+  generateOpaqueRefreshToken
+} from '../services/cryptoService.js';
+import { RefreshTokenRepository } from '../models/RefreshToken.js';
+
 authRouter.post('/register', async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password, name, recaptchaToken } = req.body;
@@ -137,12 +147,15 @@ authRouter.post('/register', async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const passwordHash = await bcrypt.hash(password, 12);
+    // Mathematical one-way memory-hard password transformation (Scrypt + Pepper)
+    const passwordHash = await hashPassword(password);
     const ip = getIp(req);
     const user = await UserRepository.create({
       email,
       passwordHash,
       name,
+      failedLoginAttempts: 0,
+      lockoutUntil: null,
       knownIps: [ip]
     });
 
@@ -155,11 +168,17 @@ authRouter.post('/register', async (req: Request, res: Response): Promise<void> 
     });
 
     const accessToken = generateToken(user);
-    const refreshToken = generateRefreshToken(user);
+    const { rawToken, tokenHash, familyId } = generateOpaqueRefreshToken();
+    await RefreshTokenRepository.create({
+      tokenHash,
+      userId: user._id || user.id,
+      familyId,
+      expiresAt: new Date(Date.now() + 7 * 86400 * 1000)
+    });
 
     const secureCookie = process.env.NODE_ENV === 'production';
     res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 15 * 60 * 1000, path: '/' });
-    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
+    res.cookie('krix_refresh_token', rawToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
 
     res.status(201).json({
       message: 'Account registered successfully.',
@@ -185,12 +204,38 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
     }
 
     const user = await UserRepository.findByEmail(email);
-    // Constant-time dummy compare to prevent email enumeration timing side-channels
-    const DUMMY_HASH = '$2a$12$e8ukB.c3bYl8vL8XjYl8ve8ukB.c3bYl8vL8XjYl8ve8ukB.c3bY';
-    const hashToCompare = user?.passwordHash || DUMMY_HASH;
-    const match = await bcrypt.compare(password, hashToCompare);
 
-    if (!user || !user.passwordHash || !match) {
+    // Account lockout enforcement
+    if (user && user.lockoutUntil && new Date(user.lockoutUntil) > new Date()) {
+      const minutesRemaining = Math.ceil((new Date(user.lockoutUntil).getTime() - Date.now()) / 60000);
+      res.status(429).json({
+        error: `Account is temporarily locked due to consecutive failed attempts. Please try again in ${minutesRemaining} minutes.`
+      });
+      return;
+    }
+
+    // Constant-time dummy compare to prevent email enumeration timing side-channels
+    const DUMMY_HASH = '$scrypt$v=1$N=16384,r=8,p=1$e8ukB.c3bYl8vL8XjYl8ve8ukB.c3bYl8vL8XjYl8ve8ukB.c3bY$0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const hashToCompare = user?.passwordHash || DUMMY_HASH;
+    const { valid, needsUpgrade } = await verifyPassword(password, hashToCompare);
+
+    if (!user || !user.passwordHash || !valid) {
+      if (user) {
+        const attempts = (user.failedLoginAttempts || 0) + 1;
+        const updates: Partial<any> = { failedLoginAttempts: attempts };
+        if (attempts >= 5) {
+          updates.lockoutUntil = new Date(Date.now() + 15 * 60 * 1000);
+          await AuditLogRepository.record({
+            userId: user._id || user.id,
+            action: 'USER_ACCOUNT_LOCKED',
+            ipAddress: getIp(req),
+            userAgent: req.headers['user-agent'],
+            status: 'FAILURE'
+          });
+        }
+        await UserRepository.updateById(user._id || user.id, updates);
+      }
+
       await AuditLogRepository.record({
         userId: user?._id || user?.id,
         action: 'USER_LOGIN_FAILED',
@@ -201,6 +246,13 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
       res.status(401).json({ error: 'Invalid email or password.' });
       return;
     }
+
+    // Reset failed attempts and upgrade legacy password hash if needed
+    const userUpdates: Partial<any> = { failedLoginAttempts: 0, lockoutUntil: null };
+    if (needsUpgrade) {
+      userUpdates.passwordHash = await hashPassword(password);
+    }
+    await UserRepository.updateById(user._id || user.id, userUpdates);
 
     if (user.isTotpEnabled && user.totpSecret) {
       if (!totpToken) {
@@ -249,11 +301,17 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
     });
 
     const accessToken = generateToken(user);
-    const refreshToken = generateRefreshToken(user);
+    const { rawToken, tokenHash, familyId } = generateOpaqueRefreshToken();
+    await RefreshTokenRepository.create({
+      tokenHash,
+      userId: user._id || user.id,
+      familyId,
+      expiresAt: new Date(Date.now() + 7 * 86400 * 1000)
+    });
 
     const secureCookie = process.env.NODE_ENV === 'production';
     res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 15 * 60 * 1000, path: '/' });
-    res.cookie('krix_refresh_token', refreshToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
+    res.cookie('krix_refresh_token', rawToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
 
     res.json({
       message: 'Authenticated successfully.',
@@ -267,34 +325,89 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
 
 authRouter.post('/refresh', async (req: Request, res: Response): Promise<void> => {
   try {
-    const refreshToken = req.cookies?.krix_refresh_token || req.body?.refreshToken;
-    if (!refreshToken) {
+    const rawRefreshToken = req.cookies?.krix_refresh_token || req.body?.refreshToken;
+    if (!rawRefreshToken) {
       res.status(401).json({ error: 'Refresh token required.' });
       return;
     }
 
-    const payload = jwt.verify(refreshToken, JWT_SECRET) as any;
-    if (payload.type !== 'refresh') {
-      res.status(401).json({ error: 'Invalid refresh token payload.' });
+    // Support both opaque hashed tokens and legacy JWT refresh tokens
+    let userId: string | null = null;
+    let familyId: string | null = null;
+    let oldTokenDoc: any = null;
+
+    if (rawRefreshToken.startsWith('krix_rt_')) {
+      const incomingHash = hashToken(rawRefreshToken);
+      oldTokenDoc = await RefreshTokenRepository.findByHash(incomingHash);
+
+      if (!oldTokenDoc) {
+        res.status(401).json({ error: 'Invalid refresh token.' });
+        return;
+      }
+
+      if (oldTokenDoc.revoked) {
+        // Token reuse breach detected: revoke entire family immediately
+        await RefreshTokenRepository.revokeFamily(oldTokenDoc.familyId);
+        await AuditLogRepository.record({
+          userId: oldTokenDoc.userId,
+          action: 'REFRESH_TOKEN_REUSE_BREACH_DETECTED',
+          ipAddress: getIp(req),
+          userAgent: req.headers['user-agent'],
+          status: 'FAILURE'
+        });
+        res.status(401).json({ error: 'Token reuse anomaly detected. All active sessions invalidated for security.' });
+        return;
+      }
+
+      if (new Date() > new Date(oldTokenDoc.expiresAt)) {
+        res.status(401).json({ error: 'Expired refresh token.' });
+        return;
+      }
+
+      userId = oldTokenDoc.userId;
+      familyId = oldTokenDoc.familyId;
+    } else {
+      // Legacy JWT fallback
+      const payload = jwt.verify(rawRefreshToken, JWT_SECRET) as any;
+      if (payload.type !== 'refresh') {
+        res.status(401).json({ error: 'Invalid refresh token payload.' });
+        return;
+      }
+      userId = payload.userId;
+    }
+
+    if (!userId) {
+      res.status(401).json({ error: 'Invalid refresh token.' });
       return;
     }
 
-    const user = await UserRepository.findById(payload.userId);
+    const user = await UserRepository.findById(userId);
     if (!user) {
       res.status(401).json({ error: 'User account not found.' });
       return;
     }
 
     const accessToken = generateToken(user);
-    const newRefreshToken = generateRefreshToken(user);
+    const { rawToken: newRawToken, tokenHash: newHash, familyId: newFamily } = generateOpaqueRefreshToken();
+
+    if (oldTokenDoc) {
+      await RefreshTokenRepository.revokeByHash(oldTokenDoc.tokenHash, newHash);
+    }
+    await RefreshTokenRepository.create({
+      tokenHash: newHash,
+      userId: user._id || user.id,
+      familyId: familyId || newFamily,
+      expiresAt: new Date(Date.now() + 7 * 86400 * 1000)
+    });
 
     const secureCookie = process.env.NODE_ENV === 'production';
     res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 15 * 60 * 1000, path: '/' });
-    res.cookie('krix_refresh_token', newRefreshToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
+    res.cookie('krix_refresh_token', newRawToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
 
     res.json({
-      message: 'Token refreshed successfully.',
-      accessToken
+      message: 'Token refreshed and rotated successfully.',
+      accessToken,
+      refreshToken: newRawToken
     });
   } catch (err) {
     res.status(401).json({ error: 'Invalid or expired refresh token.' });
