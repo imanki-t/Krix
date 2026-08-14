@@ -28,7 +28,7 @@ wellKnownRouter.get('/favicon.png', serveAsset('favicon.png', 'image/png'));
 wellKnownRouter.get('/apple-touch-icon.png', serveAsset('apple-touch-icon.png', 'image/png'));
 
 wellKnownRouter.get('/assets/:file', (req: Request, res: Response): void => {
-  const safeFile = path.basename(req.params.file);
+  const safeFile = path.basename(String(req.params.file));
   const filePath = path.join(publicDir, safeFile);
   if (fs.existsSync(filePath)) {
     const ext = path.extname(safeFile).toLowerCase();
@@ -43,7 +43,11 @@ wellKnownRouter.get('/assets/:file', (req: Request, res: Response): void => {
     res.setHeader('Content-Type', mimeMap[ext] || 'application/octet-stream');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    fs.createReadStream(filePath).pipe(res);
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(500).send('Error reading asset');
+    });
+    stream.pipe(res);
   } else {
     res.status(404).send('Not Found');
   }

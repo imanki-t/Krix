@@ -30,7 +30,6 @@ settingsRouter.post('/tier', async (req: Request, res: Response): Promise<void> 
     }
 
     await UserRepository.updateById(user._id || user.id, { securityTier: tier });
-    saveSettings({ security: { ...loadSettings().security, currentTier: tier } });
 
     await AuditLogRepository.record({
       userId: user._id || user.id,
@@ -52,10 +51,20 @@ settingsRouter.post('/integrations', async (req: Request, res: Response): Promis
     const updates: any = {};
 
     if (githubPat !== undefined) {
-      updates.encryptedGithubPat = githubPat ? encryptSecret(githubPat.trim()) : '';
+      const cleanPat = typeof githubPat === 'string' ? githubPat.trim() : '';
+      if (cleanPat && !cleanPat.startsWith('ghp_') && !cleanPat.startsWith('github_pat_') && !cleanPat.startsWith('gho_')) {
+        res.status(400).json({ error: 'Invalid GitHub token format. Must start with ghp_, github_pat_, or gho_.' });
+        return;
+      }
+      updates.encryptedGithubPat = cleanPat ? encryptSecret(cleanPat) : '';
     }
     if (renderKey !== undefined) {
-      updates.encryptedRenderKey = renderKey ? encryptSecret(renderKey.trim()) : '';
+      const cleanKey = typeof renderKey === 'string' ? renderKey.trim() : '';
+      if (cleanKey && !cleanKey.startsWith('rnd_')) {
+        res.status(400).json({ error: 'Invalid Render API key format. Must start with rnd_.' });
+        return;
+      }
+      updates.encryptedRenderKey = cleanKey ? encryptSecret(cleanKey) : '';
     }
 
     await UserRepository.updateById(user._id || user.id, updates);

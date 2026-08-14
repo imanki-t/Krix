@@ -10,20 +10,28 @@ function getEncryptionKey(): Buffer {
     }
     return crypto.createHash('sha256').update(envKey).digest();
   }
-  throw new Error('[FATAL] ENCRYPTION_KEY environment variable is required. Cannot encrypt/decrypt without it.');
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('[FATAL] ENCRYPTION_KEY environment variable is required in production.');
+  }
+  return crypto.createHash('sha256').update('krix-dev-fallback-encryption-key').digest();
 }
 
 export function encryptSecret(plainText: string): string {
   if (!plainText) return '';
-  const iv = crypto.randomBytes(12);
-  const key = getEncryptionKey();
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
-  
-  let encrypted = cipher.update(plainText, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  const authTag = cipher.getAuthTag().toString('hex');
+  try {
+    const iv = crypto.randomBytes(12);
+    const key = getEncryptionKey();
+    const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+    
+    let encrypted = cipher.update(plainText, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
 
-  return `${iv.toString('hex')}:${authTag}:${encrypted}`;
+    return `${iv.toString('hex')}:${authTag}:${encrypted}`;
+  } catch (err) {
+    console.error('[Crypto] Encryption error:', err);
+    return '';
+  }
 }
 
 export function decryptSecret(encryptedPayload: string): string {
@@ -33,17 +41,22 @@ export function decryptSecret(encryptedPayload: string): string {
     return encryptedPayload;
   }
 
-  const [ivHex, authTagHex, encryptedText] = parts;
-  const iv = Buffer.from(ivHex, 'hex');
-  const authTag = Buffer.from(authTagHex, 'hex');
-  const key = getEncryptionKey();
+  try {
+    const [ivHex, authTagHex, encryptedText] = parts;
+    const iv = Buffer.from(ivHex, 'hex');
+    const authTag = Buffer.from(authTagHex, 'hex');
+    const key = getEncryptionKey();
 
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
-  decipher.setAuthTag(authTag);
+    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+    decipher.setAuthTag(authTag);
 
-  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  return decrypted;
+    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (err) {
+    console.error('[Crypto] Decryption authentication failed (invalid tag or corrupted payload)');
+    return '';
+  }
 }
 
 export function hashApiKey(apiKey: string): string {

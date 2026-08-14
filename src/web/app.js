@@ -94,6 +94,16 @@ export async function render() {
   attachViewListeners();
 }
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
 function renderNavbar() {
   const isAuth = Boolean(state.user);
   return `
@@ -111,7 +121,7 @@ function renderNavbar() {
         ${isAuth ? `
           <a href="/dashboard" onclick="event.preventDefault(); window.krix.nav('/dashboard')" class="nav-link">Console</a>
           <div class="user-menu" style="display:flex;align-items:center;gap:12px;">
-            <span style="font-size:13px;color:#a1a1aa;">${state.user.email}</span>
+            <span style="font-size:13px;color:#a1a1aa;">${escapeHtml(state.user.email)}</span>
             <button class="btn btn-secondary btn-sm" onclick="window.krix.logout()">Sign Out</button>
           </div>
         ` : `
@@ -313,11 +323,11 @@ function renderDashboardKeys() {
         </div>
         ${(state.keys || []).map(k => `
           <div style="padding:16px 20px;border-bottom:1px solid #1f1f23;font-size:13.5px;display:grid;grid-template-columns:2fr 1.5fr 1fr 1fr 80px;align-items:center;">
-            <div style="font-weight:600;color:#ffffff;">${k.name}</div>
-            <div><code>${k.keyPrefix}...</code></div>
-            <div>${k.rateLimitPerMin} req/min</div>
-            <div>${k.totalRequests || 0}</div>
-            <div><button class="btn btn-secondary btn-sm" style="color:#ef4444;" onclick="window.krix.deleteKey('${k.id}')">Revoke</button></div>
+            <div style="font-weight:600;color:#ffffff;">${escapeHtml(k.name)}</div>
+            <div><code>${escapeHtml(k.keyPrefix)}...</code></div>
+            <div>${escapeHtml(String(k.rateLimitPerMin))} req/min</div>
+            <div>${escapeHtml(String(k.totalRequests || 0))}</div>
+            <div><button class="btn btn-secondary btn-sm" style="color:#ef4444;" onclick="window.krix.deleteKey('${escapeHtml(k.id)}')">Revoke</button></div>
           </div>
         `).join('')}
       </div>

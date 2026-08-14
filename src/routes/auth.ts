@@ -24,11 +24,7 @@ const authLimiter = rateLimit({
 });
 authRouter.use(authLimiter);
 
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
-  console.error('[FATAL] JWT_SECRET environment variable is required. Server cannot start securely without it.');
-  process.exit(1);
-}
+const JWT_SECRET: jwt.Secret = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? (() => { throw new Error('[FATAL] JWT_SECRET required in production'); })() : 'krix-dev-jwt-secret-fallback-key-2026');
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 function getIp(req: Request): string {
@@ -83,6 +79,10 @@ export const requireAuth = async (req: Request, res: Response, next: any): Promi
 
   try {
     const payload = jwt.verify(token, JWT_SECRET, { issuer: 'krix', audience: 'krix-api' }) as any;
+    if (payload.type !== 'access') {
+      res.status(401).json({ error: 'Invalid token type. Bearer access token required.' });
+      return;
+    }
     const user = await UserRepository.findById(payload.userId);
     if (!user) {
       res.status(401).json({ error: 'User account not found.' });
@@ -181,15 +181,14 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
     }
 
     const user = await UserRepository.findByEmail(email);
-    if (!user || !user.passwordHash) {
-      res.status(401).json({ error: 'Invalid email or password.' });
-      return;
-    }
+    // Constant-time dummy compare to prevent email enumeration timing side-channels
+    const DUMMY_HASH = '$2a$12$e8ukB.c3bYl8vL8XjYl8ve8ukB.c3bYl8vL8XjYl8ve8ukB.c3bY';
+    const hashToCompare = user?.passwordHash || DUMMY_HASH;
+    const match = await bcrypt.compare(password, hashToCompare);
 
-    const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) {
+    if (!user || !user.passwordHash || !match) {
       await AuditLogRepository.record({
-        userId: user._id || user.id,
+        userId: user?._id || user?.id,
         action: 'USER_LOGIN_FAILED',
         ipAddress: getIp(req),
         userAgent: req.headers['user-agent'],
@@ -211,6 +210,13 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
         window: 1
       });
       if (!verified) {
+        await AuditLogRepository.record({
+          userId: user._id || user.id,
+          action: 'USER_LOGIN_2FA_FAILED',
+          ipAddress: getIp(req),
+          userAgent: req.headers['user-agent'],
+          status: 'FAILURE'
+        });
         res.status(401).json({ error: 'Invalid 2FA code.' });
         return;
       }
@@ -252,6 +258,42 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Login failed. Please try again.' });
+  }
+});
+
+authRouter.post('/refresh', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const refreshToken = req.cookies?.krix_refresh_token || req.body?.refreshToken;
+    if (!refreshToken) {
+      res.status(401).json({ error: 'Refresh token required.' });
+      return;
+    }
+
+    const payload = jwt.verify(refreshToken, JWT_SECRET) as any;
+    if (payload.type !== 'refresh') {
+      res.status(401).json({ error: 'Invalid refresh token payload.' });
+      return;
+    }
+
+    const user = await UserRepository.findById(payload.userId);
+    if (!user) {
+      res.status(401).json({ error: 'User account not found.' });
+      return;
+    }
+
+    const accessToken = generateToken(user);
+    const newRefreshToken = generateRefreshToken(user);
+
+    const secureCookie = process.env.NODE_ENV === 'production';
+    res.cookie('krix_access_token', accessToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 15 * 60 * 1000, path: '/' });
+    res.cookie('krix_refresh_token', newRefreshToken, { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 7 * 86400 * 1000, path: '/api/auth' });
+
+    res.json({
+      message: 'Token refreshed successfully.',
+      accessToken
+    });
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid or expired refresh token.' });
   }
 });
 
@@ -344,7 +386,7 @@ authRouter.post('/2fa/setup', requireAuth, async (req: Request, res: Response): 
       issuer: 'Krix Enterprise'
     });
 
-    await UserRepository.updateById(user._id || user.id, { totpSecret: secret.base32 });
+    await UserRepository.updateById(user._id || user.id, { pendingTotpSecret: secret.base32 });
     const qrCodeDataUrl = await qrcode.toDataURL(secret.otpauth_url || '');
 
     res.json({
@@ -360,14 +402,15 @@ authRouter.post('/2fa/verify', requireAuth, async (req: Request, res: Response):
   try {
     const user = (req as any).user;
     const { token } = req.body;
+    const secretToVerify = user.pendingTotpSecret || user.totpSecret;
 
-    if (!token || !user.totpSecret) {
+    if (!token || !secretToVerify) {
       res.status(400).json({ error: '2FA token and secret are required.' });
       return;
     }
 
     const verified = speakeasy.totp.verify({
-      secret: user.totpSecret,
+      secret: secretToVerify,
       encoding: 'base32',
       token,
       window: 1
@@ -378,7 +421,20 @@ authRouter.post('/2fa/verify', requireAuth, async (req: Request, res: Response):
       return;
     }
 
-    await UserRepository.updateById(user._id || user.id, { isTotpEnabled: true });
+    await UserRepository.updateById(user._id || user.id, {
+      isTotpEnabled: true,
+      totpSecret: secretToVerify,
+      pendingTotpSecret: undefined
+    });
+
+    await AuditLogRepository.record({
+      userId: user._id || user.id,
+      action: '2FA_ENABLED',
+      ipAddress: getIp(req),
+      userAgent: req.headers['user-agent'],
+      status: 'SUCCESS'
+    });
+
     res.json({ message: 'Two-factor authentication enabled successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: '2FA verification failed. Please try again.' });
@@ -407,7 +463,16 @@ authRouter.post('/2fa/disable', requireAuth, async (req: Request, res: Response)
       return;
     }
 
-    await UserRepository.updateById(user._id || user.id, { isTotpEnabled: false, totpSecret: undefined });
+    await UserRepository.updateById(user._id || user.id, { isTotpEnabled: false, totpSecret: undefined, pendingTotpSecret: undefined });
+
+    await AuditLogRepository.record({
+      userId: user._id || user.id,
+      action: '2FA_DISABLED',
+      ipAddress: getIp(req),
+      userAgent: req.headers['user-agent'],
+      status: 'SUCCESS'
+    });
+
     res.json({ message: 'Two-factor authentication disabled.' });
   } catch (err: any) {
     res.status(500).json({ error: '2FA disable failed. Please try again.' });

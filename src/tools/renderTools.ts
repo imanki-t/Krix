@@ -37,7 +37,12 @@ async function getRenderSession(renderToken: string): Promise<string> {
       signal: controller.signal
     });
 
-    const initData = await response.json();
+    if (!response.ok) {
+      const errText = await response.text().catch(() => 'Network error');
+      throw new Error(`Render API returned HTTP ${response.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const initData: any = await response.json();
     const sessionId = response.headers.get('mcp-session-id') || initData.result?.sessionId || 'default';
     renderSessions.set(renderToken, { sessionId, lastActive: Date.now() });
     return sessionId;
@@ -71,7 +76,12 @@ async function callRemoteRenderTool(renderToken: string, toolName: string, args:
       signal: controller.signal
     });
 
-    const data = await response.json();
+    if (!response.ok) {
+      const errText = await response.text().catch(() => 'Network error');
+      throw new Error(`Render API responded with HTTP ${response.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const data: any = await response.json();
     if (data.error) {
       throw new Error(data.error.message || `Render API error code ${data.error.code}`);
     }
@@ -378,8 +388,20 @@ export function registerRenderTools(
     annotations: getToolAnnotations('query_render_postgres')
   }, async (input) => {
     try {
-      if (!/^\s*SELECT\b/i.test(input.query)) {
+      const trimmed = input.query.trim();
+      if (!/^\s*SELECT\b/i.test(trimmed)) {
         throw new Error("Only read-only SELECT queries are permitted on Render PostgreSQL databases.");
+      }
+      const dangerousPatterns = [
+        /;/,
+        /--/,
+        /\/\*/,
+        /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE|CREATE|REPLACE|INTO\s+OUTFILE)\b/i
+      ];
+      for (const pat of dangerousPatterns) {
+        if (pat.test(trimmed)) {
+          throw new Error("Dangerous SQL pattern or mutating operation blocked.");
+        }
       }
       const res = await callRemoteRenderTool(requireRenderToken(), 'query_render_postgres', input);
       return formatOptimizedResponse(res);

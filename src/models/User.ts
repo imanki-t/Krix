@@ -10,6 +10,7 @@ export interface IUser extends Document {
   securityTier: SecurityTier;
   isTotpEnabled: boolean;
   totpSecret?: string;
+  pendingTotpSecret?: string;
   encryptedGithubPat?: string;
   encryptedRenderKey?: string;
   knownIps: string[];
@@ -26,6 +27,7 @@ const UserSchema = new Schema<IUser>({
   securityTier: { type: String, enum: Object.values(SecurityTier), default: SecurityTier.STANDARD },
   isTotpEnabled: { type: Boolean, default: false },
   totpSecret: { type: String },
+  pendingTotpSecret: { type: String },
   encryptedGithubPat: { type: String },
   encryptedRenderKey: { type: String },
   knownIps: { type: [String], default: [] }

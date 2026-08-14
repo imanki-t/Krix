@@ -251,7 +251,9 @@ export function sanitizePath(inputPath: string, allowedRoot?: string): string {
   }
   if (allowedRoot) {
     const resolvedRoot = path.resolve(allowedRoot);
-    const resolvedTarget = path.resolve(allowedRoot, normalized);
+    const resolvedTarget = path.isAbsolute(normalized)
+      ? path.resolve(normalized)
+      : path.resolve(allowedRoot, normalized);
     if (!resolvedTarget.startsWith(resolvedRoot + path.sep) && resolvedTarget !== resolvedRoot) {
       throw new Error('Access denied: path escapes sandbox directory.');
     }
@@ -265,20 +267,21 @@ export function sanitizeCommand(command: string, tier: SecurityTier = SecurityTi
   const trimmed = command.trim();
 
   const standardPatterns = [
-    /\brm\s+-[rf]{1,2}\s+(\/|~|\$HOME)\b/i,
+    /\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+(\/|~|\$HOME|\$\{HOME\})(\s|$)/i,
     /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
-    /\bdd\s+if=.*?of=\/dev\/(null|zero|sda|hda|nvme)\b/i,
-    />\s*\/dev\/(sda|hda|nvme)/i,
+    /\bdd\s+if=.*?of=\/dev\/(null|zero|sda|hda|nvme|vda)\b/i,
+    />\s*\/dev\/(sda|hda|nvme|vda)/i,
     /\bmkfs(\.\w+)?\s+\/dev\//i,
     /\beval\s+/i,
     /`[^`]*`/,
     /\$\([^)]*\)/,
     /\bexec\s+/i,
     /\/proc\/self\//i,
-    /\/etc\/(passwd|shadow|sudoers)/i,
+    /\/etc\/(passwd|shadow|sudoers|master\.passwd)/i,
     /\bchattr\b/i,
     /\bnsenter\b/i,
-    /\bunshare\b/i
+    /\bunshare\b/i,
+    /\b(base64|xxd)\s+(-d|--decode)\s*\|\s*(ba)?sh\b/i
   ];
 
   for (const pat of standardPatterns) {
@@ -356,10 +359,12 @@ export function formatError(err: any): { content: Array<{ type: 'text'; text: st
 
 export function getToolAnnotations(toolName: string) {
   const perm = TOOL_PERMISSIONS[toolName] || PermissionLevel.READ_ONLY;
+  const isReadOnly = perm === PermissionLevel.READ_ONLY;
   return {
-    readOnly: perm === PermissionLevel.READ_ONLY,
-    destructive: perm === PermissionLevel.MUTATING || perm === PermissionLevel.ADMIN,
-    category: TOOL_CATEGORY[toolName] || 'core'
+    readOnlyHint: isReadOnly,
+    destructiveHint: !isReadOnly,
+    idempotentHint: isReadOnly,
+    openWorldHint: true
   };
 }
 

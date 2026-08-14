@@ -169,7 +169,7 @@ export function registerGitHubTools(
       }
 
       const original = Buffer.from(res.data.content, 'base64').toString('utf-8');
-      const count = (original.match(new RegExp(escapeRegExp(input.old_str), 'g')) || []).length;
+      const count = original.split(input.old_str).length - 1;
 
       if (count === 0) {
         let bestDistance = Infinity;
@@ -534,7 +534,7 @@ export function registerGitHubTools(
       const parentCommit = await octokit.rest.git.getCommit({ owner, repo, commit_sha: parentSha });
       const baseTreeSha = parentCommit.data.tree.sha;
 
-      const treeItems = await Promise.all(input.files.map(async (f) => {
+      const treeItems = await Promise.all(input.files.map(async (f: { path: string; content: string }) => {
         const blobRes = await octokit.rest.git.createBlob({
           owner, repo,
           content: Buffer.from(f.content, 'utf-8').toString('base64'),

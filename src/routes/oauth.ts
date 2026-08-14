@@ -26,10 +26,7 @@ function escapeHtml(str: string): string {
     .replace(/'/g, '&#x27;');
 }
 
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
-  throw new Error('[FATAL] JWT_SECRET environment variable is required for OAuth module.');
-}
+const JWT_SECRET: jwt.Secret = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? (() => { throw new Error('[FATAL] JWT_SECRET required for OAuth in production'); })() : 'krix-dev-jwt-secret-fallback-key-2026');
 
 interface DynamicClient {
   clientId: string;
@@ -78,6 +75,33 @@ setInterval(() => {
   if (refreshFamilies.size > 50000) refreshFamilies.clear();
 }, 5 * 60 * 1000).unref();
 
+const DEFAULT_ALLOWED_REDIRECTS = [
+  'http://localhost:3000/oauth/callback',
+  'http://127.0.0.1:3000/oauth/callback',
+  'claude://oauth/callback',
+  'vscode://cursor/oauth/callback'
+];
+
+function isRedirectAllowed(clientId: string | undefined, redirectUri: string): boolean {
+  if (!redirectUri) return false;
+  try {
+    const parsed = new URL(redirectUri);
+    if (!['http:', 'https:', 'claude:', 'vscode:'].includes(parsed.protocol)) {
+      return false;
+    }
+  } catch {
+    if (!redirectUri.startsWith('claude://') && !redirectUri.startsWith('vscode://')) {
+      return false;
+    }
+  }
+
+  if (clientId && registeredClients.has(clientId)) {
+    return registeredClients.get(clientId)!.redirectUris.includes(redirectUri);
+  }
+
+  return DEFAULT_ALLOWED_REDIRECTS.includes(redirectUri);
+}
+
 registeredClients.set('claude_desktop', {
   clientId: 'claude_desktop',
   clientName: 'Claude Desktop App',
@@ -111,15 +135,28 @@ oauthRouter.post('/register', (req: Request, res: Response): void => {
       return;
     }
 
+    // Limit registered dynamic clients
+    if (registeredClients.size > 5000) {
+      const firstKey = registeredClients.keys().next().value;
+      if (firstKey && firstKey !== 'claude_desktop' && firstKey !== 'cursor_ide') {
+        registeredClients.delete(firstKey);
+      }
+    }
+
     const clientId = `krix_client_${crypto.randomBytes(16).toString('hex')}`;
     const clientSecret = `krix_secret_${crypto.randomBytes(32).toString('hex')}`;
     const client: DynamicClient = {
       clientId,
       clientSecret,
-      clientName: client_name || 'Dynamic MCP Client',
-      redirectUris: redirect_uris,
+      clientName: client_name ? escapeHtml(client_name) : 'Dynamic MCP Client',
+      redirectUris: redirect_uris.filter(u => typeof u === 'string' && isRedirectAllowed(undefined, u)),
       createdAt: Date.now()
     };
+
+    if (client.redirectUris.length === 0) {
+      res.status(400).json({ error: 'invalid_client_metadata', error_description: 'Valid http/https/claude/vscode redirect_uris required.' });
+      return;
+    }
 
     registeredClients.set(clientId, client);
 
@@ -150,8 +187,8 @@ oauthRouter.get('/authorize', async (req: Request, res: Response): Promise<void>
     res.status(400).send('Unknown client_id.');
     return;
   }
-  if (client && redirect_uri && !client.redirectUris.includes(redirect_uri)) {
-    res.status(400).send('Invalid redirect_uri for this client.');
+  if (!redirect_uri || !isRedirectAllowed(client_id, redirect_uri)) {
+    res.status(400).send('Invalid or unauthorized redirect_uri.');
     return;
   }
 
@@ -220,14 +257,14 @@ oauthRouter.get('/authorize', async (req: Request, res: Response): Promise<void>
 oauthRouter.post('/consent', async (req: Request, res: Response): Promise<void> => {
   const { decision, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method } = req.body;
 
+  if (!isRedirectAllowed(client_id, redirect_uri)) {
+    res.status(400).send('Invalid or unauthorized redirect_uri.');
+    return;
+  }
+
   if (decision !== 'allow') {
     if (redirect_uri) {
-      const registeredClient = registeredClients.get(client_id);
-      if (registeredClient && registeredClient.redirectUris.includes(redirect_uri)) {
-        res.redirect(`${redirect_uri}?error=access_denied&state=${encodeURIComponent(state || '')}`);
-      } else {
-        res.status(400).send('Access Denied. Invalid redirect URI.');
-      }
+      res.redirect(`${redirect_uri}?error=access_denied&state=${encodeURIComponent(state || '')}`);
     } else {
       res.send('Access Denied.');
     }
@@ -237,12 +274,6 @@ oauthRouter.post('/consent', async (req: Request, res: Response): Promise<void> 
   const token = req.cookies?.krix_access_token;
   if (!token) {
     res.status(401).send('Session expired. Please sign in again.');
-    return;
-  }
-
-  const client = registeredClients.get(client_id);
-  if (client && redirect_uri && !client.redirectUris.includes(redirect_uri)) {
-    res.status(400).send('Invalid redirect_uri.');
     return;
   }
 

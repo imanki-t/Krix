@@ -50,8 +50,13 @@ export function destroySandbox(sessionId: string): void {
   if (table) {
     for (const [pid, ap] of table.entries()) {
       try {
-        process.kill(pid, 'SIGKILL');
-      } catch {}
+        // Try killing process group first, fallback to individual PID
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {}
+      }
     }
     table.clear();
     processTables.delete(sessionId);
@@ -173,7 +178,7 @@ export function registerSandboxTools(
         }
       }
 
-      const extraArgs = (input.args || []).map(a => {
+      const extraArgs = (input.args || []).map((a: string) => {
         // Sanitize shell metacharacters in arguments
         const sanitized = a.replace(/[`$\\"!#&|;(){}\[\]<>\n\r]/g, '');
         return `"${sanitized}"`;
@@ -237,7 +242,15 @@ export function registerSandboxTools(
   }, async (input) => {
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
-      const safePackages = input.packages.map(p => p.replace(/[^a-zA-Z0-9@_./~-]/g, '')).join(' ');
+      const invalidFlag = input.packages.find((p: string) => p.trim().startsWith('-'));
+      if (invalidFlag) {
+        throw new Error(`Invalid package name: '${invalidFlag}'. Package names cannot start with '-' or '--'.`);
+      }
+
+      const safePackages = input.packages.map((p: string) => p.replace(/[^a-zA-Z0-9@_./~-]/g, '')).filter(Boolean).join(' ');
+      if (!safePackages) {
+        throw new Error('No valid package names provided.');
+      }
 
       let cmd: string;
       if (input.manager === 'npm') {
@@ -329,18 +342,31 @@ export function registerSandboxTools(
   }, async (input) => {
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
-      let cloneUrl = input.repoUrl;
+      if (!input.repoUrl || !input.repoUrl.startsWith('http')) {
+        throw new Error("Invalid repository URL. Only HTTP/HTTPS URLs are allowed.");
+      }
+      if (input.repoUrl.trim().startsWith('-')) {
+        throw new Error("Invalid repository URL.");
+      }
 
+      let cloneUrl = input.repoUrl;
       if (githubToken && !cloneUrl.includes('@')) {
         cloneUrl = cloneUrl.replace('https://', `https://x-access-token:${githubToken}@`);
       }
 
-      const branchFlag = input.branch ? `-b "${input.branch}"` : '';
-      const destDir = input.directoryName || '';
+      let branchFlag = '';
+      if (input.branch) {
+        const safeBranch = input.branch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
+        if (safeBranch.startsWith('-')) throw new Error("Invalid branch name.");
+        branchFlag = `-b "${safeBranch}"`;
+      }
+
+      const destDir = input.directoryName ? path.basename(input.directoryName).replace(/[^a-zA-Z0-9_.\-]/g, '') : '';
+      if (destDir.startsWith('-')) throw new Error("Invalid destination directory name.");
+
       const cmd = `git clone --depth 50 ${branchFlag} "${cloneUrl}" ${destDir}`.trim();
 
       const result = await runCommand(cmd, sandboxDir, 45000, sessionId);
-      // Redact any token from output
       const cleanOutput = (result.stdout || result.stderr).replace(/x-access-token:[^@]+@/g, 'x-access-token:[REDACTED]@');
       return formatOptimizedResponse({
         repoUrl: input.repoUrl,
@@ -366,7 +392,7 @@ export function registerSandboxTools(
       const cwd = sanitizePath(input.repoPath, sandboxDir);
       const flag = input.create ? '-b' : '';
       const safeBranch = input.branch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
-      if (!safeBranch) throw new Error('Invalid branch name.');
+      if (!safeBranch || safeBranch.startsWith('-')) throw new Error('Invalid branch name.');
       const cmd = `git checkout ${flag} "${safeBranch}"`.trim();
 
       const result = await runCommand(cmd, cwd, 10000, sessionId);
@@ -393,7 +419,9 @@ export function registerSandboxTools(
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
       const remote = (input.remote || 'origin').replace(/[^a-zA-Z0-9_.\-]/g, '');
+      if (remote.startsWith('-')) throw new Error('Invalid remote name.');
       const branch = (input.branch || '').replace(/[^a-zA-Z0-9_.\-\/]/g, '');
+      if (branch.startsWith('-')) throw new Error('Invalid branch name.');
       const cmd = `git pull ${remote} ${branch}`.trim();
 
       const result = await runCommand(cmd, cwd, 20000, sessionId);
@@ -460,14 +488,19 @@ export function registerSandboxTools(
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
-      const branch = input.branch || 'HEAD';
+      const rawBranch = input.branch || 'HEAD';
+      const branch = rawBranch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
+      if (branch.startsWith('-')) throw new Error('Invalid branch name.');
 
       const addRes = await runCommand('git add -A', cwd, 10000, sessionId);
       if (addRes.exitCode !== 0) return formatError(new Error(`git add failed: ${addRes.stderr}`));
 
-      const safeMessage = input.message.replace(/[`$\\"!#&|;(){}\[\]<>\n\r]/g, '').slice(0, 200);
-      const commitCmd = `git commit -m "${safeMessage}"`;
-      const commitRes = await runCommand(commitCmd, cwd, 10000, sessionId);
+      // Write commit message to temp file to eliminate shell quoting vulnerabilities
+      const msgFile = path.join(sandboxDir, `.commit_msg_${Date.now()}`);
+      await fs.writeFile(msgFile, input.message, 'utf-8');
+      const commitRes = await runCommand(`git commit -F "${msgFile}"`, cwd, 10000, sessionId);
+      await fs.unlink(msgFile).catch(() => {});
+
       if (commitRes.exitCode !== 0) return formatError(new Error(`git commit failed: ${commitRes.stderr}`));
 
       const pushRes = await runCommand(`git push origin ${branch}`, cwd, 25000, sessionId);

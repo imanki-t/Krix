@@ -211,17 +211,16 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   let keyHash: string | undefined;
 
   const masterDevKey = process.env.MCP_MASTER_API_KEY;
-  if (!masterDevKey) {
-    res.status(500).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Server misconfiguration: MCP_MASTER_API_KEY not set.' },
-      id: req.body?.id || null
-    });
-    return;
+  let isMasterAuth = false;
+  if (masterDevKey) {
+    const clientBuf = Buffer.from(clientKey);
+    const masterBuf = Buffer.from(masterDevKey);
+    if (clientBuf.length === masterBuf.length && crypto.timingSafeEqual(clientBuf, masterBuf)) {
+      isMasterAuth = true;
+    }
   }
-  if (masterDevKey && clientKey.length === masterDevKey.length && crypto.timingSafeEqual(Buffer.from(clientKey), Buffer.from(masterDevKey))) {
-    // Master dev key
-  } else {
+
+  if (!isMasterAuth) {
     keyHash = hashApiKey(clientKey);
     const keyDoc = await ApiKeyRepository.findByHash(keyHash);
     if (!keyDoc) {

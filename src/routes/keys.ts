@@ -44,11 +44,13 @@ keysRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { name, rateLimitPerMin, maxMemoryMB } = req.body;
-    if (!name) {
-      res.status(400).json({ error: 'API Key name is required.' });
+    const { rateLimitPerMin, maxMemoryMB } = req.body;
+    const rawName = typeof req.body.name === 'string' ? req.body.name.trim() : '';
+    if (!rawName || rawName.length > 100) {
+      res.status(400).json({ error: 'API Key name must be between 1 and 100 characters.' });
       return;
     }
+    const name = rawName;
 
     const { rawKey, keyPrefix, keyHash } = generateRawApiKey();
     const doc = await ApiKeyRepository.create({
@@ -56,8 +58,8 @@ keysRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       name,
       keyPrefix,
       keyHash,
-      rateLimitPerMin: rateLimitPerMin || settings.rateLimiting.defaultKeyRateLimitPerMin || 60,
-      maxMemoryMB: maxMemoryMB || settings.sandbox.maxMemoryMB || 512
+      rateLimitPerMin: Math.min(Math.max(1, Number(rateLimitPerMin) || settings.rateLimiting.defaultKeyRateLimitPerMin || 60), 1000),
+      maxMemoryMB: Math.min(Math.max(128, Number(maxMemoryMB) || settings.sandbox.maxMemoryMB || 512), 4096)
     });
 
     await AuditLogRepository.record({
@@ -93,7 +95,8 @@ keysRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 keysRouter.delete('/:id', async (req: Request, res: Response): Promise<void> => {
   try {
     const user = (req as any).user;
-    const deleted = await ApiKeyRepository.delete(user._id || user.id, req.params.id);
+    const keyId = String(req.params.id);
+    const deleted = await ApiKeyRepository.delete(user._id || user.id, keyId);
     if (!deleted) {
       res.status(404).json({ error: 'API key not found.' });
       return;
@@ -103,7 +106,7 @@ keysRouter.delete('/:id', async (req: Request, res: Response): Promise<void> => 
       userId: user._id || user.id,
       action: 'API_KEY_DELETED',
       ipAddress: req.ip || '127.0.0.1',
-      details: { keyId: req.params.id }
+      details: { keyId }
     });
 
     res.json({ message: 'API key revoked successfully.' });
