@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: krix-mcp-gateway
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: oregon
+    branch: live
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BASE_URL
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: API_KEY_HASH_SALT
+        generateValue: true
+      - key: PASSWORD_PEPPER
+        generateValue: true
+      - key: TOKEN_HASH_SALT
+        generateValue: true
+      - key: MONGODB_URI
+        sync: false
