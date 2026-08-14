@@ -3,6 +3,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { loadSettings, loadToolPolicy, SecurityTier, isToolGloballyAllowed } from '../config/settings.js';
 
+export { SecurityTier };
+
 export enum PermissionLevel {
   READ_ONLY = 'READ_ONLY',
   MUTATING = 'MUTATING',
@@ -281,7 +283,9 @@ export function sanitizeCommand(command: string, tier: SecurityTier = SecurityTi
     /\bchattr\b/i,
     /\bnsenter\b/i,
     /\bunshare\b/i,
-    /\b(base64|xxd)\s+(-d|--decode)\s*\|\s*(ba)?sh\b/i
+    /\b(base64|xxd)\s+(-d|--decode)\s*\|\s*(ba)?sh\b/i,
+    // Cloud metadata SSRF blocking (AWS, GCP, Azure, Alibaba, encoded IP variations)
+    /(?:https?:\/\/|\b)(?:169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|0251\.0\.0\.0251|0xa9fea9fe|2852039166)\b/i
   ];
 
   for (const pat of standardPatterns) {
@@ -298,7 +302,9 @@ export function sanitizeCommand(command: string, tier: SecurityTier = SecurityTi
       /\bkill\s+-9\s+1\b/i,
       /\bshutdown\b/i,
       /\breboot\b/i,
-      /\binit\s+[06]\b/i
+      /\binit\s+[06]\b/i,
+      // Block internal network egress (localhost, RFC1918 ranges) under STRICT/FORTRESS tiers
+      /\b(curl|wget|nc|netcat|telnet|nmap|socat)\s+.*?(?:https?:\/\/|\b)(?:127\.0\.0\.1|localhost|0\.0\.0\.0|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b/i
     ];
     for (const pat of strictPatterns) {
       if (pat.test(trimmed)) {

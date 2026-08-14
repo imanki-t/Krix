@@ -183,12 +183,16 @@ oauthRouter.get('/authorize', async (req: Request, res: Response): Promise<void>
   }
 
   const client = registeredClients.get(client_id);
-  if (!client && client_id !== 'default') {
-    res.status(400).send('Unknown client_id.');
+  if (!client) {
+    res.status(400).send('Unknown or unregistered client_id.');
     return;
   }
   if (!redirect_uri || !isRedirectAllowed(client_id, redirect_uri)) {
     res.status(400).send('Invalid or unauthorized redirect_uri.');
+    return;
+  }
+  if (!code_challenge || code_challenge_method !== 'S256') {
+    res.status(400).send('PKCE S256 code_challenge and code_challenge_method=S256 are required.');
     return;
   }
 

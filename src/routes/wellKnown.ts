@@ -64,7 +64,6 @@ wellKnownRouter.get('/.well-known/oauth-authorization-server', (req: Request, re
     registration_endpoint: `${baseUrl}/api/auth/oauth/register`,
     revocation_endpoint: `${baseUrl}/api/auth/oauth/revoke`,
     userinfo_endpoint: `${baseUrl}/api/auth/me`,
-    jwks_uri: `${baseUrl}/.well-known/jwks.json`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],

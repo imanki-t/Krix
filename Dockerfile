@@ -35,6 +35,12 @@ COPY public ./public
 COPY src ./src
 COPY policy.md README.md ./
 
+# Create non-root system user for runtime isolation
+RUN groupadd -r krixgroup && useradd -r -g krixgroup -m -d /home/krixuser krixuser \
+    && chown -R krixuser:krixgroup /app /tmp
+
+USER krixuser
+
 # Expose port (Render automatically maps this to 10000 or $PORT)
 EXPOSE 3000
 

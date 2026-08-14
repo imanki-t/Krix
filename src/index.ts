@@ -42,7 +42,7 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "https://accounts.google.com", "https://www.google.com/recaptcha/", "https://www.gstatic.com/recaptcha/"],
+      scriptSrc: ["'self'", "https://accounts.google.com", "https://www.google.com/recaptcha/", "https://www.gstatic.com/recaptcha/"],
       frameSrc: ["'self'", "https://accounts.google.com", "https://www.google.com/recaptcha/"],
       connectSrc: ["'self'", "https://accounts.google.com", "https://www.google.com/recaptcha/", "https://mcp.render.com", "https://api.github.com"],
       imgSrc: ["'self'", "data:", "https:"],
@@ -50,7 +50,7 @@ app.use(helmet({
       fontSrc: ["'self'", "https://fonts.gstatic.com"]
     }
   },
-  crossOriginResourcePolicy: { policy: 'cross-origin' }
+  crossOriginResourcePolicy: { policy: 'same-origin' }
 }));
 
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
@@ -192,6 +192,22 @@ function createMasterServer(githubToken: string, renderToken: string | undefined
   return server;
 }
 
+const keyRateLimitTracker = new Map<string, { count: number; windowStart: number }>();
+
+function checkKeyRateLimit(keyHash: string, limitPerMin: number): boolean {
+  const now = Date.now();
+  const entry = keyRateLimitTracker.get(keyHash);
+  if (!entry || now - entry.windowStart > 60000) {
+    keyRateLimitTracker.set(keyHash, { count: 1, windowStart: now });
+    return true;
+  }
+  if (entry.count >= limitPerMin) {
+    return false;
+  }
+  entry.count++;
+  return true;
+}
+
 app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   const clientKey = (req.headers['x-api-key'] as string)
     || req.headers['authorization']?.toString().replace(/^Bearer\s+/i, '');
@@ -208,6 +224,7 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   let effectiveGithubToken = (req.headers['x-github-token'] as string) || process.env.DEFAULT_GITHUB_PAT || '';
   let effectiveRenderToken = (req.headers['x-render-token'] as string) || process.env.DEFAULT_RENDER_API_KEY;
   let authenticatedUserId: string | undefined;
+  let authenticatedUserTier: any = undefined;
   let keyHash: string | undefined;
 
   const masterDevKey = process.env.MCP_MASTER_API_KEY;
@@ -232,11 +249,21 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    if (!checkKeyRateLimit(keyHash, keyDoc.rateLimitPerMin || 60)) {
+      res.status(429).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: `Per-key rate limit of ${keyDoc.rateLimitPerMin || 60} requests/min exceeded.` },
+        id: req.body?.id || null
+      });
+      return;
+    }
+
     authenticatedUserId = keyDoc.userId;
     ApiKeyRepository.recordUsage(keyHash).catch(() => {});
 
     const user = await UserRepository.findById(keyDoc.userId);
     if (user) {
+      authenticatedUserTier = user.securityTier;
       if (user.encryptedGithubPat && !req.headers['x-github-token']) {
         effectiveGithubToken = decryptSecret(user.encryptedGithubPat);
       }
@@ -262,6 +289,14 @@ app.all('/mcp', async (req: Request, res: Response): Promise<void> => {
   }
 
   const newSessionId = crypto.randomUUID();
+
+  if (authenticatedUserTier) {
+    updateSessionContext(newSessionId, {
+      userId: authenticatedUserId,
+      apiKeyHash: keyHash,
+      securityTier: authenticatedUserTier
+    });
+  }
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => newSessionId,

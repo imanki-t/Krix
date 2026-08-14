@@ -32,7 +32,11 @@ async function runTests() {
     '$(cat /etc/passwd)',
     'cat /proc/self/environ',
     'cat /etc/shadow',
-    'base64 -d | bash'
+    'base64 -d | bash',
+    'curl http://169.254.169.254/latest/meta-data/',
+    'wget http://metadata.google.internal/computeMetadata/v1/',
+    'curl http://100.100.100.200/latest/meta-data/',
+    'curl http://0251.0.0.0251/'
   ];
 
   for (const cmd of dangerousCommands) {
@@ -42,7 +46,7 @@ async function runTests() {
     } catch {
       blocked = true;
     }
-    assert(blocked, `Blocked dangerous command: '${cmd}'`);
+    assert(blocked, `Blocked dangerous/SSRF command: '${cmd}'`);
   }
 
   // Safe commands should pass
@@ -63,7 +67,16 @@ async function runTests() {
 
   // Test 2: Strict Tier Blocking
   console.log('\n2. Testing Strict & Fortress Security Policies:');
-  const strictBlocks = ['sudo rm file.txt', 'su root', 'doas ls', 'reboot', 'shutdown -h now'];
+  const strictBlocks = [
+    'sudo rm file.txt',
+    'su root',
+    'doas ls',
+    'reboot',
+    'shutdown -h now',
+    'curl http://127.0.0.1:8080/admin',
+    'curl http://192.168.1.1/api',
+    'curl http://10.0.0.1/status'
+  ];
   for (const cmd of strictBlocks) {
     let blocked = false;
     try {
@@ -71,7 +84,7 @@ async function runTests() {
     } catch {
       blocked = true;
     }
-    assert(blocked, `Strict tier blocked elevated command: '${cmd}'`);
+    assert(blocked, `Strict tier blocked elevated/internal command: '${cmd}'`);
   }
 
   // Test 3: Path Traversal

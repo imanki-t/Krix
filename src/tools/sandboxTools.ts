@@ -1,12 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { exec, execSync, type ChildProcess } from 'node:child_process';
+import { exec, execFile, execSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { z } from 'zod';
 import {
   formatOptimizedResponse, formatError, getToolAnnotations,
-  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar
+  sanitizeCommand, sanitizePath, getSessionContext, updateSessionContext, deleteSessionContext, makeRegistrar,
+  SecurityTier
 } from '../core/security.js';
 import { loadSettings } from '../config/settings.js';
 
@@ -67,6 +68,43 @@ export function destroySandbox(sessionId: string): void {
     fs.rm(ctx.sandboxDir, { recursive: true, force: true }).catch(() => {});
   }
   deleteSessionContext(sessionId);
+}
+
+function runCommandArgs(
+  executable: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+  sessionId: string
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return new Promise((resolve) => {
+    const table = procTable(sessionId);
+    const child = execFile(executable, args, { cwd, timeout: timeoutMs, ...EXEC_LIMITS }, (err, stdout, stderr) => {
+      if (child.pid) table.delete(child.pid);
+      if (err) {
+        resolve({
+          stdout: (stdout || '').slice(0, OUT_CAP),
+          stderr: (stderr || err.message).slice(0, OUT_CAP),
+          exitCode: typeof (err as any).code === 'number' ? (err as any).code : 1
+        });
+      } else {
+        resolve({
+          stdout: (stdout || '').slice(0, OUT_CAP),
+          stderr: (stderr || '').slice(0, OUT_CAP),
+          exitCode: 0
+        });
+      }
+    });
+
+    if (child.pid) {
+      table.set(child.pid, {
+        pid: child.pid,
+        command: `${executable} ${args.join(' ')}`.slice(0, 80),
+        proc: child,
+        startTime: new Date()
+      });
+    }
+  });
 }
 
 function runCommand(
@@ -153,8 +191,27 @@ export function registerSandboxTools(
   }, async (input) => {
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
+      const ctx = getSessionContext(sessionId);
       const settings = loadSettings();
       const timeout = Math.min(input.timeoutMs || settings.sandbox.defaultTimeoutMs || 15000, 60000);
+
+      // Block SSRF / metadata endpoints and root file access across script execution
+      const dangerousScriptPatterns = [
+        /(?:169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200)/i,
+        /\/etc\/(?:shadow|sudoers|master\.passwd)/i
+      ];
+      for (const pat of dangerousScriptPatterns) {
+        if (pat.test(input.code)) {
+          throw new Error('Dangerous pattern or cloud metadata target detected in script payload.');
+        }
+      }
+
+      if (ctx.securityTier === SecurityTier.FORTRESS) {
+        if (/(\bsocket\b|\burllib\b|\brequests\b|\bhttp\b|\bchild_process\b|\bos\.system\b|\bsubprocess\b)/i.test(input.code)) {
+          throw new Error('Direct network sockets or process spawning blocked under FORTRESS tier policy.');
+        }
+      }
+
       const extMap: Record<string, string> = {
         py: 'py', js: 'js', ts: 'ts', sh: 'sh', go: 'go', java: 'java', cpp: 'cpp'
       };
@@ -273,7 +330,7 @@ export function registerSandboxTools(
   });
 
   register('sandbox_ps', {
-    description: 'List all running processes initiated in this sandbox session.',
+    description: 'List active background and running child processes in the sandbox session.',
     inputSchema: {},
     annotations: getToolAnnotations('sandbox_ps')
   }, async () => {
@@ -281,44 +338,42 @@ export function registerSandboxTools(
     const list = Array.from(table.values()).map(p => ({
       pid: p.pid,
       command: p.command,
-      startTime: p.startTime.toISOString(),
-      uptimeSeconds: Math.round((Date.now() - p.startTime.getTime()) / 1000)
+      runningSeconds: Math.round((Date.now() - p.startTime.getTime()) / 1000)
     }));
     return formatOptimizedResponse({ activeProcesses: list, total: list.length });
   });
 
   register('sandbox_reset', {
-    description: 'Terminate all active processes and delete the ephemeral sandbox directory.',
+    description: 'Terminate all running session processes and wipe the ephemeral sandbox workspace.',
     inputSchema: {},
     annotations: getToolAnnotations('sandbox_reset')
   }, async () => {
     destroySandbox(sessionId);
-    return formatOptimizedResponse({ status: 'Sandbox destroyed and reset.' });
+    return formatOptimizedResponse({ message: 'Sandbox environment reset and sanitized successfully.' });
   });
 
   register('sandbox_status', {
-    description: 'Inspect the status of the current sandbox, including runtime availability and memory.',
+    description: 'Retrieve telemetry on sandbox memory usage, process table status, and available runtimes.',
     inputSchema: {},
     annotations: getToolAnnotations('sandbox_status')
   }, async () => {
     const ctx = getSessionContext(sessionId);
     const table = procTable(sessionId);
+    const runtimes: string[] = [];
 
-    const runtimes: Record<string, boolean> = {};
-    for (const [name, cmd] of Object.entries({
-      python3: 'python3 --version',
-      node: 'node --version',
-      bash: 'bash --version',
+    for (const [rt, cmd] of Object.entries({
+      py: 'python3 --version',
+      js: 'node --version',
+      ts: 'npx --yes tsx --version',
+      sh: 'bash --version',
       go: 'go version',
-      java: 'java -version',
-      gpp: 'g++ --version'
+      java: 'java --version',
+      cpp: 'g++ --version'
     })) {
       try {
-        execSync(cmd, { stdio: 'ignore', timeout: 2000 });
-        runtimes[name] = true;
-      } catch {
-        runtimes[name] = false;
-      }
+        execSync(cmd, { stdio: 'ignore', timeout: 3000 });
+        runtimes.push(rt);
+      } catch {}
     }
 
     return formatOptimizedResponse({
@@ -349,25 +404,40 @@ export function registerSandboxTools(
         throw new Error("Invalid repository URL.");
       }
 
-      let cloneUrl = input.repoUrl;
-      if (githubToken && !cloneUrl.includes('@')) {
-        cloneUrl = cloneUrl.replace('https://', `https://x-access-token:${githubToken}@`);
+      let parsed: URL;
+      try {
+        parsed = new URL(input.repoUrl);
+      } catch {
+        throw new Error("Malformed repository URL.");
       }
 
-      let branchFlag = '';
+      const isGitHub = parsed.hostname === 'github.com' || parsed.hostname === 'www.github.com';
+      if (!isGitHub && githubToken) {
+        throw new Error("Credentials cannot be attached to non-github.com hosts.");
+      }
+
+      const args = ['clone', '--depth', '50'];
+      if (githubToken && isGitHub) {
+        const basicAuth = Buffer.from(`x-access-token:${githubToken}`).toString('base64');
+        args.push('-c', `http.extraHeader=Authorization: Basic ${basicAuth}`);
+      }
+
       if (input.branch) {
         const safeBranch = input.branch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
         if (safeBranch.startsWith('-')) throw new Error("Invalid branch name.");
-        branchFlag = `-b "${safeBranch}"`;
+        args.push('-b', safeBranch);
       }
 
-      const destDir = input.directoryName ? path.basename(input.directoryName).replace(/[^a-zA-Z0-9_.\-]/g, '') : '';
-      if (destDir.startsWith('-')) throw new Error("Invalid destination directory name.");
+      args.push(input.repoUrl);
 
-      const cmd = `git clone --depth 50 ${branchFlag} "${cloneUrl}" ${destDir}`.trim();
+      if (input.directoryName) {
+        const destDir = path.basename(input.directoryName).replace(/[^a-zA-Z0-9_.\-]/g, '');
+        if (destDir.startsWith('-')) throw new Error("Invalid destination directory name.");
+        args.push(destDir);
+      }
 
-      const result = await runCommand(cmd, sandboxDir, 45000, sessionId);
-      const cleanOutput = (result.stdout || result.stderr).replace(/x-access-token:[^@]+@/g, 'x-access-token:[REDACTED]@');
+      const result = await runCommandArgs('git', args, sandboxDir, 45000, sessionId);
+      const cleanOutput = (result.stdout || result.stderr).replace(/x-access-token:[^@\s]+[@\s]/g, '[REDACTED_AUTH]');
       return formatOptimizedResponse({
         repoUrl: input.repoUrl,
         success: result.exitCode === 0,
@@ -390,12 +460,13 @@ export function registerSandboxTools(
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
-      const flag = input.create ? '-b' : '';
+      const args = ['checkout'];
+      if (input.create) args.push('-b');
       const safeBranch = input.branch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
       if (!safeBranch || safeBranch.startsWith('-')) throw new Error('Invalid branch name.');
-      const cmd = `git checkout ${flag} "${safeBranch}"`.trim();
+      args.push(safeBranch);
 
-      const result = await runCommand(cmd, cwd, 10000, sessionId);
+      const result = await runCommandArgs('git', args, cwd, 10000, sessionId);
       return formatOptimizedResponse({
         branch: input.branch,
         success: result.exitCode === 0,
@@ -420,11 +491,14 @@ export function registerSandboxTools(
       const cwd = sanitizePath(input.repoPath, sandboxDir);
       const remote = (input.remote || 'origin').replace(/[^a-zA-Z0-9_.\-]/g, '');
       if (remote.startsWith('-')) throw new Error('Invalid remote name.');
-      const branch = (input.branch || '').replace(/[^a-zA-Z0-9_.\-\/]/g, '');
-      if (branch.startsWith('-')) throw new Error('Invalid branch name.');
-      const cmd = `git pull ${remote} ${branch}`.trim();
+      const args = ['pull', remote];
+      if (input.branch) {
+        const branch = input.branch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
+        if (branch.startsWith('-')) throw new Error('Invalid branch name.');
+        args.push(branch);
+      }
 
-      const result = await runCommand(cmd, cwd, 20000, sessionId);
+      const result = await runCommandArgs('git', args, cwd, 20000, sessionId);
       return formatOptimizedResponse({
         success: result.exitCode === 0,
         output: result.stdout || result.stderr
@@ -442,7 +516,7 @@ export function registerSandboxTools(
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
-      const result = await runCommand('git status --short --branch', cwd, 10000, sessionId);
+      const result = await runCommandArgs('git', ['status', '--short', '--branch'], cwd, 10000, sessionId);
       return formatOptimizedResponse({
         status: result.stdout.trim(),
         success: result.exitCode === 0
@@ -464,9 +538,14 @@ export function registerSandboxTools(
     try {
       const sandboxDir = await getOrCreateSandbox(sessionId);
       const cwd = sanitizePath(input.repoPath, sandboxDir);
-      const safeCommit = (input.commit || '').replace(/[^a-fA-F0-9]/g, '');
-      const flag = input.staged ? '--cached' : safeCommit;
-      const result = await runCommand(`git diff ${flag}`, cwd, 10000, sessionId);
+      const args = ['diff'];
+      if (input.staged) {
+        args.push('--cached');
+      } else if (input.commit) {
+        const safeCommit = input.commit.replace(/[^a-fA-F0-9]/g, '');
+        if (safeCommit) args.push(safeCommit);
+      }
+      const result = await runCommandArgs('git', args, cwd, 10000, sessionId);
       return formatOptimizedResponse({
         diff: result.stdout.slice(0, 5000),
         truncated: result.stdout.length > 5000
@@ -492,18 +571,13 @@ export function registerSandboxTools(
       const branch = rawBranch.replace(/[^a-zA-Z0-9_.\-\/]/g, '');
       if (branch.startsWith('-')) throw new Error('Invalid branch name.');
 
-      const addRes = await runCommand('git add -A', cwd, 10000, sessionId);
+      const addRes = await runCommandArgs('git', ['add', '-A'], cwd, 10000, sessionId);
       if (addRes.exitCode !== 0) return formatError(new Error(`git add failed: ${addRes.stderr}`));
 
-      // Write commit message to temp file to eliminate shell quoting vulnerabilities
-      const msgFile = path.join(sandboxDir, `.commit_msg_${Date.now()}`);
-      await fs.writeFile(msgFile, input.message, 'utf-8');
-      const commitRes = await runCommand(`git commit -F "${msgFile}"`, cwd, 10000, sessionId);
-      await fs.unlink(msgFile).catch(() => {});
-
+      const commitRes = await runCommandArgs('git', ['commit', '-m', input.message], cwd, 10000, sessionId);
       if (commitRes.exitCode !== 0) return formatError(new Error(`git commit failed: ${commitRes.stderr}`));
 
-      const pushRes = await runCommand(`git push origin ${branch}`, cwd, 25000, sessionId);
+      const pushRes = await runCommandArgs('git', ['push', 'origin', branch], cwd, 25000, sessionId);
       return formatOptimizedResponse({
         message: input.message,
         success: pushRes.exitCode === 0,

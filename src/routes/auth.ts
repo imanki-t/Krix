@@ -51,19 +51,23 @@ function generateRefreshToken(user: any): string {
 
 async function verifyRecaptcha(token: string | undefined): Promise<boolean> {
   const secretKey = process.env.RECAPTCHA_SECRET_KEY;
-  if (!secretKey || !token) {
+  if (!secretKey) {
+    // reCAPTCHA is not configured in this deployment
     return true;
+  }
+  if (!token) {
+    return false;
   }
 
   try {
     const res = await axios.post(
       'https://www.google.com/recaptcha/api/siteverify',
       new URLSearchParams({ secret: secretKey, response: token }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 5000 }
     );
-    return res.data.success && (res.data.score === undefined || res.data.score >= 0.5);
+    return Boolean(res.data.success && (res.data.score === undefined || res.data.score >= 0.5));
   } catch (err) {
-    console.error('[reCAPTCHA] Verification error:', (err as Error).message);
+    console.error('[reCAPTCHA] Verification API error (failing closed):', (err as Error).message);
     return false;
   }
 }
@@ -91,7 +95,7 @@ export const requireAuth = async (req: Request, res: Response, next: any): Promi
     (req as any).user = user;
     next();
   } catch (err) {
-    res.status(401).json({ error: 'Invalid or expired authentication token.' });
+    res.status(401).json({ error: 'Invalid or expired session token.' });
   }
 };
 
@@ -121,7 +125,7 @@ authRouter.post('/register', async (req: Request, res: Response): Promise<void> 
 
     const existing = await UserRepository.findByEmail(email);
     if (existing) {
-      res.status(409).json({ error: 'An account with this email address already exists.' });
+      res.status(400).json({ error: 'Registration could not be completed with the provided credentials. If you already have an account, please sign in.' });
       return;
     }
 
